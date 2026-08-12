@@ -1,0 +1,19 @@
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.rs text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+*.dylib binary
+*.icns binary
+*.ico binary
+*.png binary
+*.tar.gz binary
+
+# Keep repository language statistics focused on Burrow's own source.
+src-tauri/resources/clamav/** linguist-vendored
+src-tauri/resources/mole/** linguist-vendored
+third_party/** linguist-vendored

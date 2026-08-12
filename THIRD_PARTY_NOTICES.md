@@ -8,6 +8,7 @@ apply to those components and are not replaced by Burrow's MIT License.
 
 - Project: <https://github.com/Cisco-Talos/clamav>
 - Source release: <https://github.com/Cisco-Talos/clamav/releases/tag/clamav-1.5.4>
+- Corresponding source archive: `third_party/sources/clamav-1.5.4.tar.gz`
 - License: GNU General Public License v2.0 or later, with the OpenSSL exception
 - Bundled files: `src-tauri/resources/clamav/bin` and
   `src-tauri/resources/clamav/lib`
@@ -15,7 +16,9 @@ apply to those components and are not replaced by Burrow's MIT License.
 
 The exact license texts for ClamAV and its bundled runtime dependencies are in
 `src-tauri/resources/clamav/licenses`. Checksums are recorded in
-`src-tauri/resources/clamav/SHA256SUMS`.
+`src-tauri/resources/clamav/SHA256SUMS`. The exact corresponding ClamAV source
+archive distributed with the binaries is recorded in
+`third_party/sources/SHA256SUMS`.
 
 Bundled ClamAV runtime dependencies:
 

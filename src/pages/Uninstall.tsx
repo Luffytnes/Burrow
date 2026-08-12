@@ -321,7 +321,7 @@ function UninstallTab({
     }
     if (!residualCache.has(p)) {
       setLoadingResiduals((prev) => new Set(prev).add(p));
-      invoke<FileEntry[]>("find_app_residuals", { appName: app.name })
+      invoke<FileEntry[]>("find_app_residuals", { appName: app.name, appPath: app.path })
         .then((files) => {
           residualCache.set(p, files);
           setResiduals((prev) => new Map(prev).set(p, files));
@@ -1118,7 +1118,6 @@ interface CaskInfo {
   token: string;
   name: string;
   desc: string;
-  homepage: string;
 }
 
 type ExpCategory =
@@ -1277,7 +1276,6 @@ async function loadTopCasks(
                 token: String(d.token ?? token),
                 name: Array.isArray(d.name) ? String(d.name[0] ?? token) : String(d.name ?? token),
                 desc: String(d.desc ?? ""),
-                homepage: String(d.homepage ?? ""),
               }) as CaskInfo
           )
       )
@@ -1300,35 +1298,15 @@ function CaskCard({
   installing: boolean;
   onInstall: () => void;
 }) {
-  const [iconError, setIconError] = useState(false);
-  let faviconUrl: string | null = null;
-  if (cask.homepage && !iconError) {
-    try {
-      const host = new URL(cask.homepage).hostname;
-      faviconUrl = `https://www.google.com/s2/favicons?domain=${host}&sz=64`;
-    } catch {
-      /* invalid URL */
-    }
-  }
-
   return (
     <div className="card flex flex-col gap-2 p-3">
       <div className="flex items-start gap-2">
-        {faviconUrl ? (
-          <img
-            src={faviconUrl}
-            className="w-8 h-8 rounded-lg object-contain shrink-0 mt-0.5"
-            alt={cask.name}
-            onError={() => setIconError(true)}
-          />
-        ) : (
-          <div
-            className="w-8 h-8 rounded-lg flex items-center justify-center text-xs font-bold shrink-0 mt-0.5"
-            style={{ background: "var(--accent-dim)", color: "var(--accent-text)" }}
-          >
-            {cask.name[0]?.toUpperCase() ?? "?"}
-          </div>
-        )}
+        <div
+          className="w-8 h-8 rounded-lg flex items-center justify-center text-xs font-bold shrink-0 mt-0.5"
+          style={{ background: "var(--accent-dim)", color: "var(--accent-text)" }}
+        >
+          {cask.name[0]?.toUpperCase() ?? "?"}
+        </div>
         <div className="flex-1 min-w-0">
           <div className="text-xs font-semibold truncate" style={{ color: "var(--text-1)" }}>
             {cask.name}

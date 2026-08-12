@@ -8,19 +8,46 @@ extern crate libc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
 
-// ── ClamAV static PID store ───────────────────────────────────────────────────
+// ── ClamAV child-process store ────────────────────────────────────────────────
 
-static SCAN_PID: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
-fn scan_pid_store() -> &'static Mutex<Option<u32>> {
-    SCAN_PID.get_or_init(|| Mutex::new(None))
+// Stores the running ClamAV child so that cancel_clamav_scan can kill it by
+// handle rather than by PID, eliminating the PID-reuse race.
+static SCAN_CHILD: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new();
+fn scan_child_store() -> &'static Mutex<Option<std::process::Child>> {
+    SCAN_CHILD.get_or_init(|| Mutex::new(None))
+}
+
+static SCAN_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SCAN_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+// ── Disk-browse concurrency guard ─────────────────────────────────────────────
+
+// Prevents a compromised frontend from launching unbounded concurrent du(1)
+// processes. Stores true while a get_disk_breakdown call is in progress.
+static DISK_BROWSE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct ActivityGuard(&'static AtomicBool);
+
+impl ActivityGuard {
+    fn try_acquire(flag: &'static AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(flag))
+    }
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 static QUICK_SYS: OnceLock<Mutex<sysinfo::System>> = OnceLock::new();
@@ -293,34 +320,6 @@ fn burrow_tempfile(suffix: &str) -> std::io::Result<tempfile::NamedTempFile> {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| std::env::temp_dir()),
         )
-}
-
-/// Calcule la taille approximative d'un répertoire (profondeur limitée à 8 niveaux
-/// pour éviter les boucles infinies sur les symlinks).
-fn folder_size_approx(path: &std::path::Path) -> u64 {
-    fn inner(path: &std::path::Path, depth: u8) -> u64 {
-        if depth == 0 {
-            return 0;
-        }
-        let Ok(entries) = fs::read_dir(path) else {
-            return 0;
-        };
-        entries
-            .flatten()
-            .map(|e| {
-                let p = e.path();
-                // Ne pas suivre les symlinks (évite les boucles)
-                if p.is_symlink() {
-                    fs::symlink_metadata(&p).map(|m| m.len()).unwrap_or(0)
-                } else if p.is_dir() {
-                    inner(&p, depth - 1)
-                } else {
-                    fs::metadata(&p).map(|m| m.len()).unwrap_or(0)
-                }
-            })
-            .sum()
-    }
-    inner(path, 8)
 }
 
 #[tauri::command]
@@ -966,7 +965,13 @@ fn list_apps() -> Vec<AppInfo> {
 
 #[tauri::command]
 fn get_app_size(app_path: String) -> u64 {
-    du_mb(Path::new(&app_path))
+    let Ok(canonical) = require_path_grant(&app_path, PathGrantPurpose::Uninstall) else {
+        return 0;
+    };
+    if guard::validate_app_uninstall_path(&canonical.to_string_lossy()).is_err() {
+        return 0;
+    }
+    du_mb(&canonical)
 }
 
 // ── Native ICNS → PNG extraction (no sips subprocess) ────────────────────────
@@ -1047,13 +1052,6 @@ fn find_icns_for_app(app_path: &Path) -> Option<std::path::PathBuf> {
 fn b64_encode(data: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(data)
-}
-
-#[tauri::command]
-fn get_app_icon(app_path: String) -> Option<String> {
-    let icns = find_icns_for_app(Path::new(&app_path))?;
-    let png = extract_icon_png(&icns)?;
-    Some(format!("data:image/png;base64,{}", b64_encode(&png)))
 }
 
 // ── Batch icon loading with permanent cache ───────────────────────────────────
@@ -2997,91 +2995,318 @@ fn check_clamav(app: tauri::AppHandle) -> ClamavInfo {
     }
 }
 
+/// Maximum number of scan targets accepted from the frontend.
+const MAX_SCAN_TARGETS: usize = 16;
+/// Maximum number of output lines forwarded to the frontend per scan.
+const MAX_SCAN_OUTPUT_LINES: u64 = 50_000;
+/// Maximum UTF-8 bytes forwarded through scan-line events per scan.
+const MAX_SCAN_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Deduplicate canonical scan paths and remove any path that is a descendant
+/// of another path already in the list (the parent covers it).
+fn dedup_scan_roots(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort();
+    paths.dedup();
+    let mut result: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if !result.iter().any(|parent| path.starts_with(parent)) {
+            result.push(path);
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod scan_coordination_tests {
+    use super::*;
+
+    #[test]
+    fn scan_roots_are_deduplicated_and_descendants_removed() {
+        let roots = dedup_scan_roots(vec![
+            PathBuf::from("/Users/test/Downloads/subdir"),
+            PathBuf::from("/Users/test/Desktop"),
+            PathBuf::from("/Users/test/Downloads"),
+            PathBuf::from("/Users/test/Downloads"),
+        ]);
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/Users/test/Desktop"),
+                PathBuf::from("/Users/test/Downloads")
+            ]
+        );
+    }
+
+    #[test]
+    fn activity_reservation_is_atomic_and_released_on_drop() {
+        let flag = Box::leak(Box::new(AtomicBool::new(false)));
+        let first = ActivityGuard::try_acquire(flag).expect("first reservation");
+        assert!(ActivityGuard::try_acquire(flag).is_none());
+        drop(first);
+        assert!(ActivityGuard::try_acquire(flag).is_some());
+    }
+
+    #[test]
+    fn du_timeout_wrapper_collects_normal_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("sample"), b"sample").expect("sample");
+        let args = vec![
+            std::ffi::OsString::from("-s"),
+            std::ffi::OsString::from("-k"),
+            std::ffi::OsString::from("-P"),
+            std::ffi::OsString::from("--"),
+            temp.path().as_os_str().to_owned(),
+        ];
+        let output = run_du_with_timeout(&args, Duration::from_secs(5)).expect("du output");
+        assert!(output.status.success());
+        assert!(!output.stdout.is_empty());
+    }
+}
+
 #[tauri::command]
 fn start_clamav_scan(app: tauri::AppHandle, paths: Vec<String>) {
+    // Reserve the scan slot before spawning the worker. This makes the
+    // check-and-set atomic and prevents two concurrent WebView calls from
+    // both starting a process before the child handle is stored.
+    let Some(scan_activity) = ActivityGuard::try_acquire(&SCAN_ACTIVE) else {
+        let _ = app.emit("scan-error", "already-scanning");
+        let _ = app.emit("scan-done", 2i32);
+        return;
+    };
+    SCAN_CANCEL_REQUESTED.store(false, Ordering::Release);
+
     let Some(clamscan) = find_clamscan(&app) else {
+        drop(scan_activity);
+        let _ = app.emit("scan-error", "scanner-unavailable");
         let _ = app.emit("scan-done", 2i32);
         return;
     };
     let db_path = find_clamav_database(&app).map(|p| p.to_string_lossy().to_string());
 
     std::thread::spawn(move || {
+        let _scan_activity = scan_activity;
         let home = home_dir();
-        let expanded: Vec<String> = paths
-            .iter()
-            .filter_map(|p| {
-                let expanded = if let Some(stripped) = p.strip_prefix("~/") {
-                    home.join(stripped).to_string_lossy().into_owned()
-                } else if p == "~" {
-                    home.to_string_lossy().into_owned()
-                } else {
-                    p.clone()
-                };
-                // Le frontend ne peut scanner que des chemins autorisés par validate_trash_path.
-                guard::validate_trash_path(&expanded).ok()?;
-                Some(expanded)
-            })
-            .collect();
 
-        let mut cmd = Command::new(&clamscan);
-        cmd.arg("-r").arg("--no-summary");
-        if let Some(ref db) = db_path {
-            cmd.arg(format!("--database={}", db));
+        // Cap the number of targets to prevent frontend abuse.
+        if paths.len() > MAX_SCAN_TARGETS {
+            let _ = app.emit("scan-error", "too-many-targets");
+            let _ = app.emit("scan-done", 2i32);
+            return;
         }
-        cmd.args(&expanded)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = app.emit("scan-line", format!("✗ {}", e));
+        // Expand ~ and validate each path using the ClamAV-specific validator.
+        // The validator returns the canonical path (symlinks resolved + forbidden
+        // zones checked on both lexical and canonical path).
+        let mut scan_roots: Vec<PathBuf> = Vec::new();
+        for raw in &paths {
+            let expanded = if let Some(stripped) = raw.strip_prefix("~/") {
+                home.join(stripped).to_string_lossy().into_owned()
+            } else if raw == "~" {
+                home.to_string_lossy().into_owned()
+            } else {
+                raw.clone()
+            };
+            match guard::validate_clamav_scan_path(&expanded) {
+                Ok(canonical) => scan_roots.push(canonical),
+                Err(_) => {
+                    // Never reflect a rejected path or canonical target to the
+                    // untrusted WebView.
+                    let _ = app.emit(
+                        "scan-line",
+                        "⚠ A scan target was rejected by the security policy",
+                    );
+                }
+            }
+        }
+
+        // Deduplicate and remove redundant descendants.
+        let scan_roots = dedup_scan_roots(scan_roots);
+
+        if scan_roots.is_empty() {
+            let _ = app.emit("scan-error", "no-valid-targets");
+            let _ = app.emit("scan-done", 2i32);
+            return;
+        }
+
+        let identities: Vec<_> = match scan_roots
+            .iter()
+            .map(|path| guard::path_identity(path))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(identities) => identities,
+            Err(_) => {
+                let _ = app.emit("scan-error", "target-changed");
                 let _ = app.emit("scan-done", 2i32);
                 return;
             }
         };
 
-        *scan_pid_store().lock().unwrap() = Some(child.id());
+        // Build the ClamAV command.
+        let mut cmd = Command::new(&clamscan);
+        cmd.arg("-r")
+            .arg("--no-summary")
+            // Do not follow symlinks at any level.
+            .arg("--follow-dir-symlinks=0")
+            .arg("--follow-file-symlinks=0");
+
+        if let Some(ref db) = db_path {
+            cmd.arg(format!("--database={}", db));
+        }
+
+        // Add --exclude-dir arguments for every forbidden subtree that lies
+        // under a scan root (e.g. ~/.ssh when scanning home).
+        // Each argument is passed separately — never interpolated.
+        for root in &scan_roots {
+            for excl in guard::clamav_exclude_args(root) {
+                cmd.arg(excl);
+            }
+        }
+
+        // Pass canonical paths as positional arguments.
+        for root in &scan_roots {
+            cmd.arg(root);
+        }
+
+        // Close the validation/use window as far as possible before launch.
+        if scan_roots
+            .iter()
+            .zip(&identities)
+            .any(|(path, identity)| guard::revalidate_path_identity(path, *identity).is_err())
+        {
+            let _ = app.emit("scan-error", "target-changed");
+            let _ = app.emit("scan-done", 2i32);
+            return;
+        }
+
+        if SCAN_CANCEL_REQUESTED.load(Ordering::Acquire) {
+            let _ = app.emit("scan-done", 130i32);
+            return;
+        }
+
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = app.emit("scan-line", format!("✗ {e}"));
+                let _ = app.emit("scan-done", 2i32);
+                return;
+            }
+        };
 
         let stdout = child.stdout.take().unwrap();
         let stderr_pipe = child.stderr.take().unwrap();
+
+        // Store the child handle so cancel_clamav_scan can kill it by handle
+        // rather than by PID (no PID-reuse race).
+        if let Ok(mut slot) = scan_child_store().lock() {
+            *slot = Some(child);
+            if SCAN_CANCEL_REQUESTED.load(Ordering::Acquire) {
+                if let Some(ref mut child) = *slot {
+                    let _ = child.kill();
+                }
+            }
+        } else {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = app.emit("scan-error", "scanner-state-unavailable");
+            let _ = app.emit("scan-done", 2i32);
+            return;
+        }
+
         let app_out = app.clone();
         let app_err = app.clone();
+        let scan_roots_found = scan_roots.clone();
+        let output_lines = Arc::new(AtomicU64::new(0));
+        let output_bytes = Arc::new(AtomicU64::new(0));
+        let stdout_lines = Arc::clone(&output_lines);
+        let stdout_bytes = Arc::clone(&output_bytes);
+        let stderr_lines = Arc::clone(&output_lines);
+        let stderr_bytes = Arc::clone(&output_bytes);
 
+        // Reader thread: stdout (FOUND results + file paths).
         let t1 = std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let line_count = stdout_lines.fetch_add(1, Ordering::Relaxed);
+                let byte_count = stdout_bytes.fetch_add(line.len() as u64, Ordering::Relaxed);
+                if line_count >= MAX_SCAN_OUTPUT_LINES || byte_count >= MAX_SCAN_OUTPUT_BYTES {
+                    let _ = app_out.emit(
+                        "scan-line",
+                        "⚠ Output truncated (limit reached)".to_string(),
+                    );
+                    break;
+                }
+
                 if line.ends_with(" FOUND") {
-                    if let Some((path, _)) = line.rsplit_once(": ") {
-                        // Valider le chemin avant de l'inscrire dans le registre de grants :
-                        // un fichier hors des zones autorisées ne peut pas être mis en quarantaine.
-                        if guard::validate_trash_path(path).is_ok() {
-                            grant_path(Path::new(path), PathGrantPurpose::Quarantine);
+                    if let Some((raw_path, _)) = line.rsplit_once(": ") {
+                        // Validate the FOUND path:
+                        // - must still exist (canonicalize is the TOCTOU guard)
+                        // - must not be in a forbidden zone
+                        // - must belong to one of the scan roots
+                        match guard::validate_clamav_found_path(raw_path, &scan_roots_found) {
+                            Ok(canonical) => {
+                                grant_path(&canonical, PathGrantPurpose::Quarantine);
+                            }
+                            Err(_) => {
+                                // Do not expose the rejected raw or canonical path.
+                                let _ = app_out.emit(
+                                    "scan-line",
+                                    "⚠ A scan result was rejected by the security policy",
+                                );
+                                continue;
+                            }
                         }
+                    } else {
+                        let _ = app_out.emit("scan-line", "⚠ Malformed ClamAV result rejected");
+                        continue;
                     }
                 }
                 let _ = app_out.emit("scan-line", line);
             }
         });
+
+        // Reader thread: stderr (informational messages).
         let t2 = std::thread::spawn(move || {
             for line in BufReader::new(stderr_pipe).lines().map_while(Result::ok) {
+                let line_count = stderr_lines.fetch_add(1, Ordering::Relaxed);
+                let byte_count = stderr_bytes.fetch_add(line.len() as u64, Ordering::Relaxed);
+                if line_count >= MAX_SCAN_OUTPUT_LINES || byte_count >= MAX_SCAN_OUTPUT_BYTES {
+                    break;
+                }
                 let _ = app_err.emit("scan-line", line);
             }
         });
+
         t1.join().ok();
         t2.join().ok();
 
-        let code = child.wait().map(|s| s.code().unwrap_or(0)).unwrap_or(1);
-        *scan_pid_store().lock().unwrap() = None;
+        // Wait for the child and collect the exit code.
+        let code = {
+            match scan_child_store().lock() {
+                Ok(mut slot) => slot
+                    .as_mut()
+                    .map(|child| child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1))
+                    .unwrap_or(1),
+                Err(_) => 1,
+            }
+        };
+
+        if let Ok(mut slot) = scan_child_store().lock() {
+            *slot = None;
+        }
         let _ = app.emit("scan-done", code);
     });
 }
 
 #[tauri::command]
 fn cancel_clamav_scan() {
-    if let Some(pid) = *scan_pid_store().lock().unwrap() {
-        let _ = Command::new("/bin/kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
+    SCAN_CANCEL_REQUESTED.store(true, Ordering::Release);
+    // Kill by the exact Child handle — no PID-reuse race.
+    if let Ok(mut slot) = scan_child_store().lock() {
+        if let Some(ref mut child) = *slot {
+            let _ = child.kill();
+        }
     }
 }
 
@@ -3315,64 +3540,12 @@ fn pick_folder() -> Option<String> {
     }
 }
 
-// ── 9. Folder top files ───────────────────────────────────────────────────────
-
 #[derive(Serialize)]
 pub struct FileEntry {
     pub name: String,
     pub path: String,
     pub size_bytes: u64,
     pub is_dir: bool,
-}
-
-#[tauri::command]
-fn get_folder_top_files(folder_path: String, limit: u32) -> Vec<FileEntry> {
-    // Expansion de ~ sans shell
-    let home = home_dir();
-    let expanded = if let Some(stripped) = folder_path.strip_prefix("~/") {
-        home.join(stripped)
-    } else if folder_path == "~" {
-        home
-    } else {
-        std::path::PathBuf::from(&folder_path)
-    };
-
-    // Validation du chemin (pas de traversée, pas de zones système)
-    let validated = match guard::validate_trash_path(&expanded.to_string_lossy()) {
-        Ok(p) => p,
-        Err(_) => return vec![],
-    };
-    if !validated.is_dir() {
-        return vec![];
-    }
-
-    // Implémentation Rust pure — aucune interpolation shell
-    let Ok(entries) = fs::read_dir(&validated) else {
-        return vec![];
-    };
-    let mut items: Vec<FileEntry> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let p = entry.path();
-            let name = p.file_name()?.to_str()?.to_string();
-            let is_dir = p.is_dir();
-            let size_bytes = if is_dir {
-                folder_size_approx(&p)
-            } else {
-                fs::metadata(&p).map(|m| m.len()).unwrap_or(0)
-            };
-            Some(FileEntry {
-                name,
-                path: p.to_string_lossy().to_string(),
-                size_bytes,
-                is_dir,
-            })
-        })
-        .collect();
-
-    items.sort_by_key(|k| std::cmp::Reverse(k.size_bytes));
-    items.truncate(limit as usize);
-    items
 }
 
 // ── iCloud / FileProvider safety guard ───────────────────────────────────────
@@ -3980,7 +4153,15 @@ fn clean_dev_caches(ids: Vec<String>) -> Result<u64, String> {
 // ── Find residual files left by an app ───────────────────────────────────────
 
 #[tauri::command]
-fn find_app_residuals(app_name: String) -> Vec<FileEntry> {
+fn find_app_residuals(app_name: String, app_path: String) -> Vec<FileEntry> {
+    let Ok(app_path) = require_path_grant(&app_path, PathGrantPurpose::Uninstall) else {
+        return Vec::new();
+    };
+    if guard::validate_app_uninstall_path(&app_path.to_string_lossy()).is_err()
+        || app_path.file_stem().and_then(|value| value.to_str()) != Some(app_name.as_str())
+    {
+        return Vec::new();
+    }
     let home = home_dir();
     let name_lower = app_name.to_lowercase();
 
@@ -3998,15 +4179,6 @@ fn find_app_residuals(app_name: String) -> Vec<FileEntry> {
         patterns.push(version_stripped.clone());
     }
 
-    // Bundle ID from /Applications/<name>.app or ~/Applications/<name>.app
-    let app_path = [
-        PathBuf::from(format!("/Applications/{}.app", app_name)),
-        home.join(format!("Applications/{}.app", app_name)),
-    ]
-    .iter()
-    .find(|p| p.exists())
-    .cloned()
-    .unwrap_or_else(|| PathBuf::from(format!("/Applications/{}.app", app_name)));
     let bundle_id = app_bundle_id(&app_path);
     if !bundle_id.is_empty() {
         patterns.push(bundle_id.to_lowercase());
@@ -4053,6 +4225,18 @@ fn find_app_residuals(app_name: String) -> Vec<FileEntry> {
         };
         for entry in entries.flatten() {
             let p = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            let Ok(canonical) = fs::canonicalize(&p) else {
+                continue;
+            };
+            if guard::is_forbidden_for_readonly(&canonical) {
+                continue;
+            }
             // Skip iCloud paths
             if is_icloud_path(&p) {
                 continue;
@@ -7502,7 +7686,8 @@ fn detect_image_mime(header: &[u8]) -> Option<&'static str> {
 
 #[tauri::command]
 fn read_image_preview(path: String) -> Option<String> {
-    read_image_preview_from_home(Path::new(&path), &home_dir())
+    let canonical = require_path_grant(&path, PathGrantPurpose::Trash).ok()?;
+    read_image_preview_from_home(&canonical, &home_dir())
 }
 
 fn read_image_preview_from_home(path: &Path, home: &Path) -> Option<String> {
@@ -7669,49 +7854,178 @@ pub struct DiskEntry {
     pub is_dir: bool,
 }
 
-#[tauri::command]
-fn get_disk_breakdown(path: String) -> Vec<DiskEntry> {
-    let base = match guard::validate_trash_path(&path) {
-        Ok(p) => p,
-        Err(_) => return vec![],
-    };
-    let base = base.as_path();
-    let Ok(dir_entries) = fs::read_dir(base) else {
-        return vec![];
-    };
+#[derive(Serialize)]
+pub struct DiskBreakdownResult {
+    pub entries: Vec<DiskEntry>,
+    pub truncated: bool,
+}
 
-    let children: Vec<std::path::PathBuf> = dir_entries
+/// Maximum number of direct children passed to `du` in a single call.
+/// Prevents a large directory from spawning an unbounded argument list.
+const MAX_DISK_CHILDREN: usize = 512;
+const DISK_BROWSE_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_DU_OUTPUT_BYTES: u64 = 1_048_576;
+
+fn run_du_with_timeout(
+    args: &[std::ffi::OsString],
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let mut child = Command::new("/usr/bin/du")
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("system:unable to start disk analysis: {e}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "system:disk analysis stdout unavailable".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "system:disk analysis stderr unavailable".to_string())?;
+    // Drain both pipes while the process runs. Waiting with unread pipes can
+    // otherwise deadlock once a pipe buffer fills.
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout
+            .by_ref()
+            .take(MAX_DU_OUTPUT_BYTES)
+            .read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr
+            .by_ref()
+            .take(MAX_DU_OUTPUT_BYTES)
+            .read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = stdout_reader.join().unwrap_or_default();
+                let stderr = stderr_reader.join().unwrap_or_default();
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err("timeout:disk analysis took too long".to_string());
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("system:unable to monitor disk analysis: {e}"));
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn get_disk_breakdown(path: String) -> Result<DiskBreakdownResult, String> {
+    // Prevent concurrent invocations: a compromised frontend could otherwise
+    // launch unbounded du(1) processes.
+    let Some(_activity) = ActivityGuard::try_acquire(&DISK_BROWSE_ACTIVE) else {
+        return Err("busy:disk browser is already running".to_string());
+    };
+    disk_breakdown_inner(path)
+}
+
+fn disk_breakdown_inner(path: String) -> Result<DiskBreakdownResult, String> {
+    // Validate and canonicalize: uses browse-specific policy (allows home,
+    // rejects system paths and sensitive subtrees, resolves all symlinks).
+    let base = guard::validate_disk_browse_path(&path).map_err(|e| format!("protected:{e}"))?;
+
+    let dir_entries = fs::read_dir(&base).map_err(|e| format!("inaccessible:{e}"))?;
+
+    // Enumerate children:
+    // - skip symlinks (detected on the lexical child path)
+    // - canonicalize each entry and re-check forbidden zones
+    // - cap at MAX_DISK_CHILDREN to bound the du argument list
+    let mut truncated = false;
+    let children: Vec<(PathBuf, guard::PathIdentity)> = dir_entries
         .flatten()
         .filter_map(|e| {
             let p = e.path();
-            if p.is_symlink() {
-                None
-            } else {
-                Some(p)
+            let metadata = fs::symlink_metadata(&p).ok()?;
+            if metadata.file_type().is_symlink() {
+                return None;
             }
+            let canonical = fs::canonicalize(&p).ok()?;
+            if guard::is_forbidden_for_readonly(&canonical) {
+                return None;
+            }
+            let identity = guard::path_identity(&canonical).ok()?;
+            Some((canonical, identity))
         })
+        .take(MAX_DISK_CHILDREN + 1)
         .collect();
+
+    let children = if children.len() > MAX_DISK_CHILDREN {
+        truncated = true;
+        children.into_iter().take(MAX_DISK_CHILDREN).collect()
+    } else {
+        children
+    };
+
     if children.is_empty() {
-        return vec![];
+        return Ok(DiskBreakdownResult {
+            entries: Vec::new(),
+            truncated,
+        });
     }
 
-    // Single du call for all directories → much faster than N separate spawns
-    let dir_paths: Vec<String> = children
-        .iter()
-        .filter(|p| p.is_dir())
-        .map(|p| p.to_string_lossy().to_string())
-        .collect();
-
+    // Pass canonical paths to du(1).
+    // -s : summarize (one line per argument)
+    // -k : kilobytes
+    // -P : do not follow symbolic links (explicit, macOS default is -P but
+    //      we declare it to be safe against future flag changes)
+    // -- : end of options, so paths starting with '-' are not misinterpreted
+    let dir_paths: Vec<&(PathBuf, guard::PathIdentity)> =
+        children.iter().filter(|(path, _)| path.is_dir()).collect();
     let mut size_map: HashMap<String, u64> = HashMap::new();
+
     if !dir_paths.is_empty() {
-        let mut args = vec!["-s".to_string(), "-k".to_string(), "--".to_string()];
-        args.extend(dir_paths);
-        if let Ok(out) = Command::new("/usr/bin/du").args(&args).output() {
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                if let Some((kb_str, path_str)) = line.split_once('\t') {
-                    if let Ok(kb) = kb_str.trim().parse::<u64>() {
-                        size_map.insert(path_str.to_string(), kb.saturating_mul(1024));
-                    }
+        let mut args: Vec<std::ffi::OsString> =
+            vec!["-s".into(), "-k".into(), "-P".into(), "--".into()];
+        // Avoid recursively counting sensitive descendants of an allowed
+        // parent (for example ~/.ssh while calculating the home directory).
+        args.truncate(3);
+        for mask in guard::readonly_exclusion_names() {
+            args.push("-I".into());
+            args.push((*mask).into());
+        }
+        args.push("--".into());
+        for (path, identity) in &dir_paths {
+            guard::revalidate_path_identity(path, *identity)
+                .map_err(|_| "changed:a directory changed during analysis".to_string())?;
+            if guard::is_forbidden_for_readonly(path) {
+                return Err("protected:a directory became protected".to_string());
+            }
+            args.push(path.as_os_str().into());
+        }
+        let out = run_du_with_timeout(&args, DISK_BROWSE_TIMEOUT)?;
+        if !out.status.success() {
+            return Err("system:disk analysis failed".to_string());
+        }
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some((kb_str, path_str)) = line.split_once('\t') {
+                if let Ok(kb) = kb_str.trim().parse::<u64>() {
+                    size_map.insert(path_str.to_string(), kb.saturating_mul(1024));
                 }
             }
         }
@@ -7719,7 +8033,10 @@ fn get_disk_breakdown(path: String) -> Vec<DiskEntry> {
 
     let mut entries: Vec<DiskEntry> = children
         .iter()
-        .filter_map(|p| {
+        .filter_map(|(p, identity)| {
+            if guard::revalidate_path_identity(p, *identity).is_err() {
+                return None;
+            }
             let name = p.file_name()?.to_str()?.to_string();
             let is_dir = p.is_dir();
             let path_str = p.to_string_lossy().to_string();
@@ -7739,8 +8056,9 @@ fn get_disk_breakdown(path: String) -> Vec<DiskEntry> {
             })
         })
         .collect();
+
     entries.sort_by_key(|k| std::cmp::Reverse(k.size_bytes));
-    entries
+    Ok(DiskBreakdownResult { entries, truncated })
 }
 
 // ── Homebrew Cask Browser ─────────────────────────────────────────────────────
@@ -8823,7 +9141,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_apps,
             get_app_size,
-            get_app_icon,
             get_all_app_icons,
             get_mo_path,
             uninstall_app,
@@ -8842,7 +9159,6 @@ pub fn run() {
             get_mo_version,
             get_brew_outdated,
             update_brew_app,
-            get_folder_top_files,
             find_app_residuals,
             get_all_processes,
             kill_process,

@@ -4,7 +4,7 @@ Thanks for helping improve Burrow. 🐾
 
 ## Before you start
 
-- Target Apple Silicon and macOS 12 or later.
+- Target Apple Silicon and macOS 13 or later.
 - Keep pull requests focused and explain user-visible or security-sensitive
   behavior changes.
 - Open an issue first for large product changes.

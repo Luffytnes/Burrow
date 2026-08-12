@@ -1,7 +1,7 @@
 # Releasing Burrow
 
-Burrow releases target Apple Silicon only. Release binaries should be built,
-signed and notarized on macOS with an Apple Developer ID identity.
+Burrow releases target Apple Silicon only (macOS 13 Ventura or later) using
+the `aarch64-apple-darwin` target.
 
 ## Checklist
 
@@ -22,18 +22,21 @@ signed and notarized on macOS with an Apple Developer ID identity.
    cargo audit --file src-tauri/Cargo.lock
    cargo deny --manifest-path src-tauri/Cargo.toml check advisories licenses sources bans
    scripts/verify_bundled_resources.sh
-   npm run tauri build
+   npm run tauri build -- --target aarch64-apple-darwin
    ```
 
 5. Confirm the final `.app` executable and every bundled Mach-O resource are
-   arm64, then verify the application signature with `codesign`.
-6. Test the signed build on a clean Apple Silicon Mac, including first launch,
+   arm64. The release-artifact workflow performs this check automatically on
+   every Mach-O file in the bundle. For local builds run:
+   ```bash
+   file src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Burrow.app/Contents/MacOS/*
+   ```
+   Reject any bundle that contains an `x86_64` or `universal` binary.
+6. Test the build on a clean Apple Silicon Mac, including first launch,
    permission prompts, ClamAV definition updates, quarantine/restore, uninstall,
    app updates and rollback behavior.
-7. Notarize and staple the distributed artifact. Never commit certificates,
-   private keys, notarization credentials or provisioning material.
-8. Publish release notes that call out security fixes, destructive behavior
+7. Publish release notes that call out security fixes, destructive behavior
    changes and third-party binary updates. Attach the CI-generated SBOM.
 
-Tauri's current macOS signing documentation is available at
-<https://v2.tauri.app/distribute/sign/macos/>.
+The workflow prepares reviewed artifacts but never publishes or edits a GitHub
+release automatically.

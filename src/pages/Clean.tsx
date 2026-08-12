@@ -103,6 +103,10 @@ interface DiskEntry {
   size_bytes: number;
   is_dir: boolean;
 }
+interface DiskBreakdownResult {
+  entries: DiskEntry[];
+  truncated: boolean;
+}
 interface UniversalBinaryEntry {
   name: string;
   path: string;
@@ -550,19 +554,32 @@ function GroupRow({
 
 // ── Disk Browser (used in Aperçu) ─────────────────────────────────────────────
 
+type DiskBrowseError = "protected" | "inaccessible" | "busy" | "timeout" | "changed" | "system";
+
 function DiskBrowser() {
   const [stack, setStack] = useState<string[]>([]);
   const [entries, setEntries] = useState<DiskEntry[] | null>(null);
+  const [browseError, setBrowseError] = useState<DiskBrowseError | null>(null);
+  const [truncated, setTruncated] = useState(false);
   const [loading, setLoading] = useState(false);
   const initialized = useRef(false);
 
   const load = useCallback(async (path: string) => {
     if (!path) return;
     setLoading(true);
+    setBrowseError(null);
+    setTruncated(false);
     try {
-      setEntries(await invoke<DiskEntry[]>("get_disk_breakdown", { path }));
-    } catch {
+      const result = await invoke<DiskBreakdownResult>("get_disk_breakdown", { path });
+      setEntries(result.entries);
+      setTruncated(result.truncated);
+    } catch (e) {
       setEntries([]);
+      const msg = typeof e === "string" ? e : "system:unknown";
+      const kind = msg.split(":")[0] as DiskBrowseError;
+      setBrowseError(
+        ["protected", "inaccessible", "busy", "timeout", "changed"].includes(kind) ? kind : "system"
+      );
     }
     setLoading(false);
   }, []);
@@ -669,12 +686,26 @@ function DiskBrowser() {
           <Loader2 size={14} className="animate-spin" />
           <span className="text-xs">Chargement…</span>
         </div>
+      ) : browseError ? (
+        <div className="text-center py-6 text-xs" style={{ color: "var(--text-3)" }}>
+          {browseError === "protected" && "Dossier protégé — accès refusé"}
+          {browseError === "inaccessible" && "Dossier inaccessible"}
+          {browseError === "busy" && "Analyse en cours, réessayez dans un instant"}
+          {browseError === "timeout" && "Analyse trop longue — choisissez un dossier plus précis"}
+          {browseError === "changed" && "Le dossier a changé pendant l’analyse — réessayez"}
+          {browseError === "system" && "Erreur système"}
+        </div>
       ) : entries.length === 0 ? (
         <div className="text-center py-6 text-xs" style={{ color: "var(--text-3)" }}>
           Dossier vide
         </div>
       ) : (
         <div style={{ maxHeight: 280, overflowY: "auto" }}>
+          {truncated && (
+            <div className="px-3 py-2 text-[10px]" style={{ color: "var(--warning)" }}>
+              Affichage limité aux 512 premiers éléments. Ouvrez un sous-dossier pour affiner.
+            </div>
+          )}
           {entries.map((entry, i) => {
             const pct = totalSize > 0 ? (entry.size_bytes / totalSize) * 100 : 0;
             const color = entry.is_dir ? "var(--info)" : fileExtColor(entry.name);
@@ -1730,7 +1761,7 @@ function DoublonsTab({ onToast }: { onToast: (ok: boolean, msg: string) => void 
     setSelected(new Set());
     setExpanded(new Set());
     try {
-      const result = await invoke<DuplicateGroup[]>("find_duplicates", { paths: [] });
+      const result = await invoke<DuplicateGroup[]>("find_duplicates");
       setGroups(result);
       // Auto-select all copies except the shortest-path one per group
       const autoSelect = new Set<string>();

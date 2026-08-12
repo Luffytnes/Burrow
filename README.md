@@ -4,7 +4,7 @@
   <p><strong>A native macOS cleaning and maintenance toolbox.</strong></p>
   <p>Keep your Mac clean, fast and easy to understand — from one friendly app. 🐾</p>
   <p>
-    <img src="https://img.shields.io/badge/macOS-12%2B-111111?logo=apple&logoColor=white" alt="macOS 12+">
+    <img src="https://img.shields.io/badge/macOS-13%2B-111111?logo=apple&logoColor=white" alt="macOS 13+">
     <img src="https://img.shields.io/badge/Apple%20Silicon-arm64-111111?logo=apple&logoColor=white" alt="Apple Silicon arm64">
     <img src="https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white" alt="Tauri 2">
     <img src="https://img.shields.io/badge/Rust-native-000000?logo=rust&logoColor=white" alt="Rust">
@@ -31,10 +31,10 @@
 
 Burrow currently targets:
 
-- **macOS 12.0 or later**
+- **macOS 13 Ventura or later**
 - **Apple Silicon only (`arm64`)**
 
-Intel Macs are not currently supported because the bundled ClamAV, Mole and SMC resources are built for Apple Silicon.
+Intel Macs are not supported. The bundled ClamAV, Mole, SMC and Touch ID resources are compiled exclusively for Apple Silicon, and the build system produces only an `aarch64-apple-darwin` target.
 
 ## 📦 Bundled components
 
@@ -45,9 +45,12 @@ The repository includes the initial arm64 resources required for a standalone bu
 - Burrow's SMC and Touch ID helpers, with their sources
 
 Downloaded ClamAV definition databases, build outputs and local caches are intentionally excluded from Git.
+The exact ClamAV 1.5.4 corresponding source archive is kept in
+[`third_party/sources`](third_party/sources) alongside its SHA-256 checksum.
 Versions, checksums and exact third-party license texts are tracked in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Ongoing changes are summarized in [CHANGELOG.md](CHANGELOG.md).
 
-ClamAV malware definitions can be refreshed from Burrow. Executable and library updates are shipped with a new signed Burrow release rather than modifying the signed application bundle in place.
+ClamAV malware definitions can be refreshed from Burrow. Executable and library updates are delivered with a new Burrow release rather than modifying the application bundle in place.
 
 ## 🔑 macOS permissions
 
@@ -95,11 +98,11 @@ scripts/verify_bundled_resources.sh
 ## 🚀 Build a release bundle
 
 ```bash
-npm run tauri build
+npm run tauri build -- --target aarch64-apple-darwin
 ```
 
 Generated application and disk-image bundles are written under `src-tauri/target/release/bundle`.
-Production artifacts must be signed and notarized; follow [RELEASING.md](RELEASING.md).
+The release checklist and artifact validation steps are documented in [RELEASING.md](RELEASING.md).
 
 ## 🗂️ Project layout
 
@@ -122,6 +125,7 @@ Burrow performs sensitive maintenance operations, so its security model treats f
 Please do not use real personal data when developing or testing destructive operations. Use isolated temporary fixtures instead.
 
 Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+Local data handling and network-backed features are described in [PRIVACY.md](PRIVACY.md).
 
 ## 🤝 Contributing
 

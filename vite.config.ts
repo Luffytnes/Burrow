@@ -15,11 +15,7 @@ export default defineConfig(async () => ({
           "vendor-react": ["react", "react-dom"],
           "vendor-motion": ["framer-motion"],
           "vendor-icons": ["lucide-react"],
-          "vendor-tauri": [
-            "@tauri-apps/api",
-            "@tauri-apps/plugin-opener",
-            "@tauri-apps/plugin-shell",
-          ],
+          "vendor-tauri": ["@tauri-apps/api"],
           "vendor-i18n": ["i18next", "react-i18next"],
         },
       },

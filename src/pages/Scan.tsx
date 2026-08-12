@@ -93,6 +93,7 @@ export default function Scan() {
   const [errorDetail, setErrorDetail] = useState<string | null>(null);
   const threatCountRef = useRef(0);
   const filesCountRef = useRef(0);
+  const scanErrorRef = useRef<string | null>(null);
   const [quarantineList, setQuarantineList] = useState<QuarantineEntry[]>([]);
   const [quarantiningPath, setQuarantiningPath] = useState<string | null>(null);
   const [pickingFolder, setPickingFolder] = useState(false);
@@ -211,18 +212,35 @@ export default function Scan() {
     setTermLines([{ text: `→ Analyse : ${paths.join(", ")}`, kind: "dl" }]);
     threatCountRef.current = 0;
     filesCountRef.current = 0;
+    scanErrorRef.current = null;
 
     const unlisteners: Array<() => void> = [];
     const cleanup = () => unlisteners.forEach((u) => u());
 
     unlisteners.push(await listen<string>("scan-line", (e) => addLine(e.payload)));
     unlisteners.push(
-      await listen<number>("scan-done", () => {
+      await listen<string>("scan-error", (e) => {
+        scanErrorRef.current = e.payload;
+      })
+    );
+    unlisteners.push(
+      await listen<number>("scan-done", (e) => {
         cleanup();
         setScanning(false);
-        setScanDone(true);
-        setScanProgress(100);
-        showScanToast(threatCountRef.current);
+        const succeeded = e.payload === 0 || e.payload === 1;
+        setScanDone(succeeded);
+        setScanProgress(succeeded ? 100 : 0);
+        if (succeeded) {
+          showScanToast(threatCountRef.current);
+        } else if (e.payload === 130) {
+          setToast({ ok: false, msg: "Analyse annulée" });
+        } else {
+          setToast({
+            ok: false,
+            msg: "L’analyse n’a pas pu être terminée",
+            details: scanErrorRef.current ?? undefined,
+          });
+        }
       })
     );
 
@@ -242,18 +260,35 @@ export default function Scan() {
     setTermLines([{ text: `→ Analyse : ${volumePath}`, kind: "dl" }]);
     threatCountRef.current = 0;
     filesCountRef.current = 0;
+    scanErrorRef.current = null;
 
     const unlisteners: Array<() => void> = [];
     const cleanup = () => unlisteners.forEach((u) => u());
 
     unlisteners.push(await listen<string>("scan-line", (e) => addLine(e.payload)));
     unlisteners.push(
-      await listen<number>("scan-done", () => {
+      await listen<string>("scan-error", (e) => {
+        scanErrorRef.current = e.payload;
+      })
+    );
+    unlisteners.push(
+      await listen<number>("scan-done", (e) => {
         cleanup();
         setScanning(false);
-        setScanDone(true);
-        setScanProgress(100);
-        showScanToast(threatCountRef.current);
+        const succeeded = e.payload === 0 || e.payload === 1;
+        setScanDone(succeeded);
+        setScanProgress(succeeded ? 100 : 0);
+        if (succeeded) {
+          showScanToast(threatCountRef.current);
+        } else if (e.payload === 130) {
+          setToast({ ok: false, msg: "Analyse annulée" });
+        } else {
+          setToast({
+            ok: false,
+            msg: "L’analyse n’a pas pu être terminée",
+            details: scanErrorRef.current ?? undefined,
+          });
+        }
       })
     );
 
