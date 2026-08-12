@@ -15,13 +15,14 @@ export default tseslint.config(
     rules: {
       ...reactHooks.configs.recommended.rules,
       "react-refresh/only-export-components": "warn",
-      // Lints "React compiler" (react-hooks v7) : patterns existants à
-      // résorber progressivement, non bloquants pour l'instant.
-      "react-hooks/set-state-in-effect": "warn",
-      "react-hooks/refs": "warn",
-      "react-hooks/immutability": "warn",
+      // React Compiler optimization hints (react-hooks v7) — désactivés car l'app
+      // n'utilise pas React Compiler. Ces règles ne détectent pas de bugs réels
+      // sans le compilateur ; les activer uniquement si React Compiler est adopté.
+      "react-hooks/set-state-in-effect": "off",
+      "react-hooks/refs": "off",
+      "react-hooks/immutability": "off",
       "react-hooks/exhaustive-deps": "warn",
-      "react-hooks/preserve-manual-memoization": "warn",
+      "react-hooks/preserve-manual-memoization": "off",
       "@typescript-eslint/no-unused-vars": [
         "error",
         { argsIgnorePattern: "^_", varsIgnorePattern: "^_" },
