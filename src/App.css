@@ -1,0 +1,275 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ═══════════════════════════════════════════════════════
+   Burrow design tokens
+   Palette neutre (blanc / noir, comme l'icône) + accent
+   rouge carmin, déclinée en clair et sombre. Les composants
+   ne doivent référencer QUE ces variables, jamais de hex.
+   ═══════════════════════════════════════════════════════ */
+
+:root {
+  /* Surfaces */
+  --bg: #f5f4f4;
+  --bg-card: #fdfdfd;
+  --bg-elevated: #ffffff;
+  --bg-nav: rgba(20, 20, 20, 0.05);
+  --border: rgba(20, 20, 20, 0.11);
+  --border-strong: rgba(20, 20, 20, 0.22);
+  --bar-track: rgba(20, 20, 20, 0.08);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.05), 0 3px 12px rgba(0, 0, 0, 0.05);
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.14);
+  --scrollbar: rgba(20, 20, 20, 0.25);
+
+  /* Texte (--text-3 ≥ 4.5:1 sur --bg et --bg-card — WCAG 2.2 AA) */
+  --text-1: #1a1a1a;
+  --text-2: #575757;
+  --text-3: #767676;
+
+  /* Accent — rouge carmin (icône Burrow) */
+  --accent: #c11f2f;
+  --accent-hover: #a81a29;
+  --accent-dim: rgba(193, 31, 47, 0.1);
+  --accent-text: #ad1c2a;
+  --on-accent: #ffffff;
+
+  /* Sémantique */
+  --success: #17914a;
+  --success-text: #0f7a3a;
+  --success-dim: rgba(23, 145, 74, 0.11);
+  --success-soft: rgba(23, 145, 74, 0.24);
+
+  --warning: #d97706;
+  --warning-text: #b45309;
+  --warning-dim: rgba(217, 119, 6, 0.11);
+  --warning-soft: rgba(217, 119, 6, 0.24);
+
+  --danger: #d92d20;
+  --danger-text: #b42318;
+  --danger-dim: rgba(217, 45, 32, 0.1);
+  --danger-soft: rgba(217, 45, 32, 0.24);
+
+  --info: #2563eb;
+  --info-text: #1d4ed8;
+  --info-dim: rgba(37, 99, 235, 0.1);
+
+  /* Teintes de graphiques */
+  --cyan: #0e8ca5;
+  --violet: #7c3aed;
+  --pink: #d6336c;
+
+  /* Terminal — toujours sombre, quel que soit le thème */
+  --term-bg: #0d1117;
+  --term-surface: #161b22;
+  --term-border: #30363d;
+  --term-text: #c9d1d9;
+  --term-muted: #8b949e;
+}
+
+html.dark {
+  /* Surfaces — noir de l'icône */
+  --bg: #121212;
+  --bg-card: #1b1b1b;
+  --bg-elevated: #242424;
+  --bg-nav: rgba(255, 255, 255, 0.07);
+  --border: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.18);
+  --bar-track: rgba(255, 255, 255, 0.1);
+  --shadow: none;
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.5);
+  --scrollbar: rgba(255, 255, 255, 0.22);
+
+  /* Texte (--text-3 ≥ 4.5:1 sur --bg et --bg-card — WCAG 2.2 AA) */
+  --text-1: #f0efee;
+  --text-2: #ababab;
+  --text-3: #919191;
+
+  /* Accent — rouge carmin lumineux */
+  --accent: #e54857;
+  --accent-hover: #ec5f6c;
+  --accent-dim: rgba(229, 72, 87, 0.15);
+  --accent-text: #f0707c;
+  --on-accent: #ffffff;
+
+  /* Sémantique */
+  --success: #34c467;
+  --success-text: #5fd98a;
+  --success-dim: rgba(52, 196, 103, 0.14);
+  --success-soft: rgba(52, 196, 103, 0.3);
+
+  --warning: #eda13d;
+  --warning-text: #f3b56a;
+  --warning-dim: rgba(237, 161, 61, 0.13);
+  --warning-soft: rgba(237, 161, 61, 0.28);
+
+  --danger: #f0654a;
+  --danger-text: #f68f75;
+  --danger-dim: rgba(240, 101, 74, 0.13);
+  --danger-soft: rgba(240, 101, 74, 0.28);
+
+  --info: #5b93ff;
+  --info-text: #8cb2ff;
+  --info-dim: rgba(91, 147, 255, 0.13);
+
+  --cyan: #2cb8d4;
+  --violet: #a78bfa;
+  --pink: #ef6ea8;
+}
+
+/* ── Base ───────────────────────────────────────────── */
+body {
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", sans-serif;
+  overflow: hidden;
+  user-select: none;
+  transition:
+    background 0.2s,
+    color 0.2s;
+}
+
+::selection {
+  background: var(--accent-dim);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ── Scrollbar ──────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 3px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar);
+  border-radius: 2px;
+}
+
+/* ── Cards ───────────────────────────────────────────── */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  transition:
+    background 0.2s,
+    border-color 0.2s;
+}
+
+/* ── Nav pill ────────────────────────────────────────── */
+.nav-pill {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 40px;
+  box-shadow: var(--shadow);
+}
+
+/* ── Badges ──────────────────────────────────────────── */
+.badge {
+  background: var(--accent-dim);
+  color: var(--accent-text);
+  border-radius: 20px;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.badge-neutral {
+  background: var(--bar-track);
+  color: var(--text-3);
+  border-radius: 20px;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* ── Buttons ─────────────────────────────────────────── */
+.btn-primary {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-radius: 40px;
+  padding: 10px 32px;
+  font-size: 14px;
+  font-weight: 600;
+  transition:
+    background 0.15s,
+    transform 0.1s;
+}
+.btn-primary:hover {
+  background: var(--accent-hover);
+}
+.btn-primary:active {
+  transform: scale(0.97);
+}
+.btn-primary:disabled {
+  opacity: 0.4;
+}
+
+/* ── Segmented control ───────────────────────────────── */
+.segmented {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  background: var(--bar-track);
+  border-radius: 10px;
+}
+.segmented > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-2);
+  transition:
+    background 0.15s,
+    color 0.15s,
+    box-shadow 0.15s;
+}
+.segmented > button:hover {
+  color: var(--text-1);
+}
+.segmented > button[data-active="true"] {
+  background: var(--bg-elevated);
+  color: var(--text-1);
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+}
+
+/* ── Table row hover ─────────────────────────────────── */
+.tr-hover:hover {
+  background: var(--bg-card);
+}
+
+/* ── prefers-reduced-motion (WCAG 2.2 §2.3.3) ───────── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  /* Tailwind animate-spin used as loading indicator */
+  .animate-spin {
+    animation: none !important;
+    opacity: 0.6;
+  }
+}
