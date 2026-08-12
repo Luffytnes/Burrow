@@ -3,6 +3,13 @@
   "private": true,
   "version": "0.1.0",
   "description": "macOS cleaning & maintenance toolbox built with Tauri",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Luffytnes/Burrow.git"
+  },
+  "bugs": "https://github.com/Luffytnes/Burrow/issues",
+  "homepage": "https://github.com/Luffytnes/Burrow#readme",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,12 +20,11 @@
     "lint:fix": "eslint src --fix",
     "format": "prettier --write src",
     "format:check": "prettier --check src",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run lint -- --max-warnings=0 && npm run format:check"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-opener": "^2",
-    "@tauri-apps/plugin-shell": "^2.3.5",
     "framer-motion": "^12.40.0",
     "i18next": "^26.2.0",
     "lucide-react": "^1.16.0",

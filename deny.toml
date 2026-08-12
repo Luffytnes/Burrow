@@ -1,7 +1,6 @@
 [graph]
 targets = [
   { triple = "aarch64-apple-darwin" },
-  { triple = "x86_64-apple-darwin" },
 ]
 
 [advisories]
@@ -10,30 +9,13 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/RustSec/advisory-db"]
 yanked = "warn"
 
-# GTK3 crates are Tauri Linux-only transitive deps, unused on macOS
 ignore = [
-  # GTK3 Tauri Linux-only deps — unmaintained, not used on macOS
-  "RUSTSEC-2024-0370", # proc-macro-error
-  "RUSTSEC-2024-0411", # gdkwayland-sys
-  "RUSTSEC-2024-0412", # gdk
-  "RUSTSEC-2024-0413", # atk
-  "RUSTSEC-2024-0414", # gdkx11-sys
-  "RUSTSEC-2024-0415", # gtk
-  "RUSTSEC-2024-0416", # atk-sys
-  "RUSTSEC-2024-0417", # gdkx11
-  "RUSTSEC-2024-0418", # gdk-sys
-  "RUSTSEC-2024-0419", # gtk3-macros
-  "RUSTSEC-2024-0420", # gtk-sys
-  "RUSTSEC-2024-0429", # glib unsound
   # unic-* Unicode crates — unmaintained, Tauri transitive deps
   "RUSTSEC-2025-0075", # unic-char-range
   "RUSTSEC-2025-0080", # unic-common
   "RUSTSEC-2025-0081", # unic-char-property
   "RUSTSEC-2025-0098", # unic-ucd-version
   "RUSTSEC-2025-0100", # unic-ucd-ident
-  # Upstream fixes pending, no direct exposure
-  "RUSTSEC-2026-0190", # anyhow unsound
-  "RUSTSEC-2026-0221", # event-listener unsound (Tauri)
 ]
 
 [licenses]
@@ -43,15 +25,11 @@ allow = [
   "MIT",
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
-  "BSD-2-Clause",
   "BSD-3-Clause",
-  "ISC",
   "Unicode-3.0",
-  "Unicode-DFS-2016",
   "CC0-1.0",
   "MPL-2.0",
   "Zlib",
-  "OpenSSL",
 ]
 
 [bans]

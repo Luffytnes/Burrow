@@ -340,19 +340,6 @@ function UninstallTab({
   };
 
   const handleUninstall = async (app: AppInfo) => {
-    if (localStorage.getItem("burrow_touchid") === "true") {
-      try {
-        await invoke("authenticate_touch_id", { reason: `Désinstaller ${app.name}` });
-      } catch (err) {
-        if (!String(err).includes("non disponible")) {
-          // Annulé ou refusé → on bloque
-          setToast({ ok: false, msg: "Touch ID requis pour désinstaller" });
-          setTimeout(() => setToast(null), 3500);
-          return;
-        }
-        // Touch ID physiquement inaccessible (MacBook fermé) → on laisse passer
-      }
-    }
     setActiveApp(app);
     setExpanded(null);
     mo.reset();
@@ -966,8 +953,7 @@ function UpdatesTab({
                       app.from_store
                         ? () => handleMasUpdate(app)
                         : async () => {
-                            const { open } = await import("@tauri-apps/plugin-shell");
-                            open(app.store_url);
+                            await invoke("open_app_store_url", { url: app.store_url });
                           }
                     }
                     busy={masBusy === app.name}

@@ -135,9 +135,6 @@ export default function Settings() {
   const [moInstalled, setMoInstalled] = useState<boolean | null>(null);
   const [showLangMenu, setShowLangMenu] = useState(false);
   const [moVersion, setMoVersion] = useState<string | null>(null);
-  const [updating, setUpdating] = useState(false);
-  const [updateDone, setUpdateDone] = useState(false);
-  const [moHasUpdate, setMoHasUpdate] = useState<boolean | null>(null);
 
   const [clamavInfo, setClamavInfo] = useState<ClamavInfo | null>(null);
   const [clamavUpdating, setClamavUpdating] = useState(false);
@@ -162,16 +159,15 @@ export default function Settings() {
     invoke<ClamavInfo>("check_clamav")
       .then(setClamavInfo)
       .catch((e) => console.error("check_clamav:", e));
-    invoke<boolean>("check_mo_update_available")
-      .then(setMoHasUpdate)
-      .catch(() => setMoHasUpdate(false));
     invoke<boolean>("check_clamav_defs_outdated")
       .then(setClamavDefsOutdated)
       .catch(() => setClamavDefsOutdated(false));
     invoke<boolean>("get_launch_at_login")
       .then(setStartup)
       .catch(() => setStartup(false));
-    setTouchId(localStorage.getItem("burrow_touchid") === "true");
+    invoke<boolean>("get_touch_id_enabled")
+      .then(setTouchId)
+      .catch(() => setTouchId(false));
     invoke<boolean>("check_touch_id_available")
       .then(setTouchIdAvailable)
       .catch(() => setTouchIdAvailable(false));
@@ -192,21 +188,12 @@ export default function Settings() {
   };
 
   const handleTouchIdChange = async (v: boolean) => {
-    if (v) {
-      try {
-        await invoke("authenticate_touch_id", { reason: "Activer Touch ID pour Burrow" });
-        // Configure pam_tid.so pour que sudo utilise Touch ID (une seule fois)
-        await invoke("setup_pam_touchid");
-        setTouchId(true);
-        localStorage.setItem("burrow_touchid", "true");
-        showToast({ ok: true, msg: "Touch ID activé" });
-      } catch (err) {
-        showToast({ ok: false, msg: String(err) });
-      }
-    } else {
-      setTouchId(false);
-      localStorage.removeItem("burrow_touchid");
-      showToast({ ok: true, msg: "Touch ID désactivé" });
+    try {
+      await invoke("set_touch_id_enabled", { enable: v });
+      setTouchId(v);
+      showToast({ ok: true, msg: v ? "Touch ID activé" : "Touch ID désactivé" });
+    } catch (err) {
+      showToast({ ok: false, msg: String(err) });
     }
   };
 
@@ -237,34 +224,6 @@ export default function Settings() {
       u1();
       u2();
       showToast({ ok: false, msg: "Échec de la mise à jour ClamAV", details: String(err) });
-    });
-  };
-
-  const handleUpdate = async () => {
-    setUpdating(true);
-    setUpdateDone(false);
-    const lines: string[] = [];
-    const { listen } = await import("@tauri-apps/api/event");
-    const u1 = await listen<string>("mo-output", (e) => lines.push(e.payload));
-    const u2 = await listen<number>("mo-done", (e) => {
-      setUpdating(false);
-      u1();
-      u2();
-      if (e.payload === 0) {
-        setUpdateDone(true);
-        showToast({ ok: true, msg: "Mole CLI mis à jour" });
-        invoke<boolean>("check_mo_update_available")
-          .then(setMoHasUpdate)
-          .catch(() => setMoHasUpdate(false));
-      } else {
-        showToast({ ok: false, msg: "Échec de la mise à jour Mole", details: lines.join("\n") });
-      }
-    });
-    invoke("update_mo_cli").catch((err) => {
-      setUpdating(false);
-      u1();
-      u2();
-      showToast({ ok: false, msg: "Échec de la mise à jour Mole", details: String(err) });
     });
   };
 
@@ -426,10 +385,10 @@ export default function Settings() {
                 </div>
               </div>
               <UpdateButton
-                hasUpdate={moHasUpdate}
-                updating={updating}
-                done={updateDone}
-                onUpdate={handleUpdate}
+                hasUpdate={false}
+                updating={false}
+                done={false}
+                onUpdate={() => undefined}
                 labelUpdate={t.settings_update}
                 labelUpdating={t.settings_updating}
                 labelUpToDate={t.settings_mole_uptodate}

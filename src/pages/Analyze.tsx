@@ -12,7 +12,6 @@ import {
   AlertTriangle,
   AlertCircle,
 } from "lucide-react";
-import { Command } from "@tauri-apps/plugin-shell";
 import { invoke } from "@tauri-apps/api/core";
 
 interface DiskCategory {
@@ -128,19 +127,12 @@ function OverviewTab() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [cats, df] = await Promise.all([
+      const [cats, metrics] = await Promise.all([
         invoke<DiskCategory[]>("get_disk_categories"),
-        Command.create("df", ["-k"]).execute(),
+        invoke<{ disk_used: number; disk_total: number }>("get_quick_metrics"),
       ]);
       setCategories(cats);
-      const lines = df.stdout.split("\n");
-      const line = lines.find(
-        (l) => l.includes("/System/Volumes/Data") || (l.includes("%") && l.endsWith("/"))
-      );
-      if (line) {
-        const p = line.trim().split(/\s+/);
-        setDiskInfo({ total: parseInt(p[1] ?? "0") * 1024, used: parseInt(p[2] ?? "0") * 1024 });
-      }
+      setDiskInfo({ total: metrics.disk_total, used: metrics.disk_used });
       const trash = cats.find((c) => c.id === "trash");
       if (trash) setTrashSize(trash.size_bytes);
     } catch (e) {

@@ -1,17 +1,17 @@
 <div align="center">
   <img src="public/logo.png" width="180" alt="Burrow app icon">
-
-  # Burrow
-
-  **A native macOS cleaning and maintenance toolbox.**
-
-  Keep your Mac clean, fast and easy to understand — from one friendly app. 🐾
-
-  ![macOS](https://img.shields.io/badge/macOS-12%2B-111111?logo=apple&logoColor=white)
-  ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-111111?logo=apple&logoColor=white)
-  ![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)
-  ![Rust](https://img.shields.io/badge/Rust-native-000000?logo=rust&logoColor=white)
-  ![React](https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white)
+  <h1>Burrow</h1>
+  <p><strong>A native macOS cleaning and maintenance toolbox.</strong></p>
+  <p>Keep your Mac clean, fast and easy to understand — from one friendly app. 🐾</p>
+  <p>
+    <img src="https://img.shields.io/badge/macOS-12%2B-111111?logo=apple&logoColor=white" alt="macOS 12+">
+    <img src="https://img.shields.io/badge/Apple%20Silicon-arm64-111111?logo=apple&logoColor=white" alt="Apple Silicon arm64">
+    <img src="https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white" alt="Tauri 2">
+    <img src="https://img.shields.io/badge/Rust-native-000000?logo=rust&logoColor=white" alt="Rust">
+    <img src="https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white" alt="React 19">
+    <a href="https://github.com/Luffytnes/Burrow/actions/workflows/ci.yml"><img src="https://github.com/Luffytnes/Burrow/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-22c55e.svg" alt="MIT License"></a>
+  </p>
 </div>
 
 ---
@@ -42,9 +42,12 @@ The repository includes the initial arm64 resources required for a standalone bu
 
 - [ClamAV](https://www.clamav.net) scanner and runtime libraries
 - [Mole](https://github.com/tw93/Mole) maintenance CLI
-- Burrow's SMC helper and its Swift source
+- Burrow's SMC and Touch ID helpers, with their sources
 
 Downloaded ClamAV definition databases, build outputs and local caches are intentionally excluded from Git.
+Versions, checksums and exact third-party license texts are tracked in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+ClamAV malware definitions can be refreshed from Burrow. Executable and library updates are shipped with a new signed Burrow release rather than modifying the signed application bundle in place.
 
 ## 🔑 macOS permissions
 
@@ -77,11 +80,16 @@ npm run tauri dev
 npm run typecheck
 npm run lint
 npm run format:check
+# or run all three:
+npm run check
 
 cd src-tauri
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+
+cd ..
+scripts/verify_bundled_resources.sh
 ```
 
 ## 🚀 Build a release bundle
@@ -91,6 +99,7 @@ npm run tauri build
 ```
 
 Generated application and disk-image bundles are written under `src-tauri/target/release/bundle`.
+Production artifacts must be signed and notarized; follow [RELEASING.md](RELEASING.md).
 
 ## 🗂️ Project layout
 
@@ -111,6 +120,16 @@ scripts/               Resource and packaging helpers
 Burrow performs sensitive maintenance operations, so its security model treats frontend input as untrusted. The project uses backend validation, restricted Tauri capabilities and a Content Security Policy, with additional hardening tracked as development continues.
 
 Please do not use real personal data when developing or testing destructive operations. Use isolated temporary fixtures instead.
+
+Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+
+## 🤝 Contributing
+
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request, and keep security-sensitive changes small and testable.
+
+## 📄 License
+
+Burrow's own source code is available under the [MIT License](LICENSE). Bundled third-party components keep their respective licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details.
 
 ---
 

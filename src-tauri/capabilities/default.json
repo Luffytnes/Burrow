@@ -3,15 +3,5 @@
   "identifier": "default",
   "description": "Capability for the main window",
   "windows": ["main"],
-  "permissions": [
-    "core:default",
-    "opener:default",
-    "shell:allow-open",
-    {
-      "identifier": "shell:allow-execute",
-      "allow": [
-        { "name": "df", "cmd": "df", "args": { "validator": "^-k$" } }
-      ]
-    }
-  ]
+  "permissions": ["core:default"]
 }

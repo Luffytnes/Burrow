@@ -38,6 +38,79 @@ static RAM_POWER_X10: AtomicU32 = AtomicU32::new(0);
 static ANE_POWER_X10: AtomicU32 = AtomicU32::new(0);
 static LAST_NOTIF_PCT: AtomicU8 = AtomicU8::new(0);
 
+#[derive(Clone, Copy)]
+pub(crate) enum PathGrantPurpose {
+    Trash = 1,
+    Quarantine = 2,
+    LaunchItem = 4,
+    Uninstall = 8,
+}
+
+struct PathGrant {
+    device: u64,
+    inode: u64,
+    purposes: u8,
+    issued_at: Instant,
+}
+
+fn path_grants() -> &'static Mutex<HashMap<PathBuf, PathGrant>> {
+    static GRANTS: OnceLock<Mutex<HashMap<PathBuf, PathGrant>>> = OnceLock::new();
+    GRANTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn grant_path(path: &Path, purpose: PathGrantPurpose) {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(canonical) = fs::canonicalize(path) else {
+        return;
+    };
+    let Ok(metadata) = fs::symlink_metadata(&canonical) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    if let Ok(mut grants) = path_grants().lock() {
+        grants.retain(|_, grant| grant.issued_at.elapsed() < Duration::from_secs(30 * 60));
+        grants
+            .entry(canonical)
+            .and_modify(|grant| {
+                grant.device = metadata.dev();
+                grant.inode = metadata.ino();
+                grant.purposes |= purpose as u8;
+                grant.issued_at = Instant::now();
+            })
+            .or_insert(PathGrant {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                purposes: purpose as u8,
+                issued_at: Instant::now(),
+            });
+    }
+}
+
+fn require_path_grant(path: &str, purpose: PathGrantPurpose) -> Result<PathBuf, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let canonical =
+        fs::canonicalize(path).map_err(|e| format!("Chemin autorisé devenu inaccessible : {e}"))?;
+    let metadata = fs::symlink_metadata(&canonical).map_err(|e| e.to_string())?;
+    if metadata.file_type().is_symlink() {
+        return Err("Lien symbolique refusé".to_string());
+    }
+    let grants = path_grants()
+        .lock()
+        .map_err(|_| "Registre d'autorisations indisponible".to_string())?;
+    let grant = grants
+        .get(&canonical)
+        .filter(|grant| grant.issued_at.elapsed() < Duration::from_secs(30 * 60))
+        .filter(|grant| grant.purposes & purpose as u8 != 0)
+        .filter(|grant| grant.device == metadata.dev() && grant.inode == metadata.ino())
+        .ok_or_else(|| "Chemin non autorisé : relancez l'analyse avant cette action".to_string())?;
+    let _ = grant;
+    Ok(canonical)
+}
+
 // ── App info ──────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
@@ -144,10 +217,57 @@ pub struct InstallerFile {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-pub(crate) fn home_dir() -> std::path::PathBuf {
-    std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
+fn current_user_record() -> Result<(String, PathBuf), String> {
+    let uid = unsafe { libc::getuid() };
+    let mut buffer_size = 4096usize;
+
+    loop {
+        let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut buffer = vec![0i8; buffer_size];
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let error = unsafe {
+            libc::getpwuid_r(
+                uid,
+                pwd.as_mut_ptr(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if error == libc::ERANGE && buffer_size < 1_048_576 {
+            buffer_size *= 2;
+            continue;
+        }
+        if error != 0 || result.is_null() {
+            return Err(format!("getpwuid_r failed (errno {error})"));
+        }
+
+        let pwd = unsafe { pwd.assume_init() };
+        let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }
+            .to_str()
+            .map_err(|_| "Nom d'utilisateur non UTF-8".to_string())?
+            .to_string();
+        let home = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }
+            .to_str()
+            .map_err(|_| "Répertoire utilisateur non UTF-8".to_string())
+            .map(PathBuf::from)?;
+
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            || !home.is_absolute()
+        {
+            return Err("Compte utilisateur POSIX invalide".to_string());
+        }
+        return Ok((name, home));
+    }
+}
+
+pub(crate) fn home_dir() -> PathBuf {
+    current_user_record()
+        .map(|(_, home)| home)
+        .unwrap_or_else(|_| PathBuf::from("/nonexistent"))
 }
 
 /// Crée un répertoire temporaire privé (mode 0700) via `tempfile::TempDir`.
@@ -219,20 +339,16 @@ fn get_mo_path_internal(app: &tauri::AppHandle) -> Result<String, String> {
 }
 
 fn which_mo() -> Result<String, String> {
-    let out = Command::new("which")
-        .arg("mo")
-        .output()
-        .map_err(|e| e.to_string())?;
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if path.is_empty() {
-        Err("mo not found".to_string())
-    } else {
-        Ok(path)
+    for path in ["/opt/homebrew/bin/mo", "/usr/local/bin/mo"] {
+        if Path::new(path).is_file() {
+            return Ok(path.to_string());
+        }
     }
+    Err("mo not found".to_string())
 }
 
 fn du_mb(path: &Path) -> u64 {
-    Command::new("du")
+    Command::new("/usr/bin/du")
         .args(["-sk", &path.to_string_lossy()])
         .output()
         .ok()
@@ -267,7 +383,7 @@ fn metrics_cache() -> &'static Mutex<CachedMetrics> {
 // ── Native metrics (no Mole dependency) ──────────────────────────────────────
 
 fn sysctl_string(key: &str) -> String {
-    Command::new("sysctl")
+    Command::new("/usr/sbin/sysctl")
         .args(["-n", key])
         .output()
         .ok()
@@ -323,7 +439,7 @@ fn compute_health_score(cpu: f64, mem_pct: f64, disk_pct: f64, battery_pct: i64)
 
 fn parse_battery_native() -> (i64, String, String, String, i64, i64) {
     // percent, status, time_left, health, cycles, capacity
-    let out = Command::new("ioreg")
+    let out = Command::new("/usr/sbin/ioreg")
         .args(["-n", "AppleSmartBattery", "-r", "-a"])
         .output()
         .unwrap_or_else(|_| std::process::Output {
@@ -377,7 +493,10 @@ fn parse_battery_native() -> (i64, String, String, String, i64, i64) {
 }
 
 fn parse_proxy_native() -> (bool, String, String) {
-    let out = Command::new("scutil").arg("--proxy").output().ok();
+    let out = Command::new("/usr/sbin/scutil")
+        .arg("--proxy")
+        .output()
+        .ok();
     let raw = out
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .unwrap_or_default();
@@ -402,7 +521,7 @@ fn parse_proxy_native() -> (bool, String, String) {
 }
 
 fn parse_net_interfaces_native() -> Vec<NetInterface> {
-    let out = Command::new("ifconfig").output().ok();
+    let out = Command::new("/sbin/ifconfig").output().ok();
     let raw = out
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .unwrap_or_default();
@@ -745,11 +864,18 @@ fn uninstall_app(app: tauri::AppHandle, name: String, app_path: String) -> Resul
     }
     // Validation stricte avant de lancer le thread
     guard::validate_app_uninstall_path(&app_path)?;
-
-    // Canonicaliser et revérifier après résolution des symlinks
-    let canonical = std::fs::canonicalize(&app_path)
-        .map_err(|e| format!("Impossible de résoudre le chemin : {}", e))?;
+    let canonical = require_path_grant(&app_path, PathGrantPurpose::Uninstall)?;
     guard::validate_app_uninstall_path(&canonical.to_string_lossy())?;
+    let expected_name = canonical.file_stem().and_then(|value| value.to_str());
+    if expected_name != Some(name.as_str()) {
+        return Err("Le nom ne correspond pas à l'application analysée".to_string());
+    }
+
+    // La préférence de protection est détenue et appliquée par le backend.
+    // Un frontend compromis ne peut donc pas contourner Touch ID.
+    if touchid_enabled(&app) {
+        run_touchid(&app, &format!("Désinstaller {name}"))?;
+    }
 
     std::thread::spawn(move || {
         let _ = app.emit("mo-output", format!("→ Suppression de {}…", name));
@@ -776,7 +902,7 @@ fn uninstall_app(app: tauri::AppHandle, name: String, app_path: String) -> Resul
 
         // Tentative 2 : privilèges admin — quoting POSIX correct
         let q = guard::posix_shell_quote(&canonical.to_string_lossy());
-        match run_admin_sh(&format!("rm -rf {}", q)) {
+        match run_admin_sh(&format!("/bin/rm -rf {}", q)) {
             Ok(()) => {
                 let _ = app.emit("mo-output", format!("✓ {} désinstallé avec succès", name));
                 let _ = app.emit("mo-done", 0i32);
@@ -832,6 +958,9 @@ fn list_apps() -> Vec<AppInfo> {
     }
 
     apps.sort_by_key(|a| a.name.to_lowercase());
+    for app in &apps {
+        grant_path(Path::new(&app.path), PathGrantPurpose::Uninstall);
+    }
     apps
 }
 
@@ -1004,6 +1133,9 @@ fn list_installer_files() -> Vec<InstallerFile> {
     }
 
     files.sort_by_key(|k| std::cmp::Reverse(k.size_bytes));
+    for file in &files {
+        grant_path(Path::new(&file.path), PathGrantPurpose::Trash);
+    }
     files
 }
 
@@ -1030,16 +1162,12 @@ fn check_full_disk_access() -> bool {
     }
 
     // TCC database — should always exist
-    match std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db") {
-        Ok(_) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => false,
-        Err(_) => true, // can't determine → assume OK
-    }
+    std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
 }
 
 #[tauri::command]
 fn open_full_disk_access_settings() {
-    Command::new("open")
+    Command::new("/usr/bin/open")
         .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
         .spawn()
         .ok();
@@ -1048,12 +1176,15 @@ fn open_full_disk_access_settings() {
 #[tauri::command]
 fn move_to_trash(path: String) -> Result<(), String> {
     guard::validate_trash_path(&path)?;
+    let path = require_path_grant(&path, PathGrantPurpose::Trash)?;
+    guard::validate_trash_path(&path.to_string_lossy())?;
+    let path = path.to_string_lossy().into_owned();
     // Pass the path as an argv value. Never interpolate a frontend-controlled path
     // into AppleScript source: macOS filenames may legally contain quotes/newlines.
     let script = r#"on run argv
 tell application "Finder" to delete POSIX file (item 1 of argv)
 end run"#;
-    let out = Command::new("osascript")
+    let out = Command::new("/usr/bin/osascript")
         .args(["-e", script, "--", &path])
         .output()
         .map_err(|e| e.to_string())?;
@@ -1067,6 +1198,15 @@ end run"#;
             err
         })
     }
+}
+
+fn quit_application(name: &str) {
+    let script = r#"on run argv
+tell application (item 1 of argv) to quit
+end run"#;
+    let _ = Command::new("/usr/bin/osascript")
+        .args(["-e", script, "--", name])
+        .output();
 }
 
 // ── 1. Clean category sizes ───────────────────────────────────────────────────
@@ -1225,7 +1365,7 @@ fn run_clean_selection(
                     ("Caches navigateurs", r)
                 }
                 "trash" => {
-                    let out = Command::new("osascript")
+                    let out = Command::new("/usr/bin/osascript")
                         .args(["-e", "tell application \"Finder\" to empty trash"])
                         .output();
                     let r = match out {
@@ -1271,18 +1411,33 @@ fn run_clean_selection(
         }
 
         for path in &installer_paths {
-            let p = std::path::Path::new(path);
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or(path);
+            let name = Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path);
             let _ = app.emit("mo-output", format!("→ {}", name));
             if let Err(e) = guard::validate_installer_path(path) {
                 any_error = true;
                 let _ = app.emit("mo-output", format!("  ✗ {} : chemin refusé ({})", name, e));
                 continue;
             }
+            let p = match require_path_grant(path, PathGrantPurpose::Trash) {
+                Ok(path) => path,
+                Err(e) => {
+                    any_error = true;
+                    let _ = app.emit("mo-output", format!("  ✗ {} : {}", name, e));
+                    continue;
+                }
+            };
+            if let Err(e) = guard::validate_installer_path(&p.to_string_lossy()) {
+                any_error = true;
+                let _ = app.emit("mo-output", format!("  ✗ {} : chemin refusé ({})", name, e));
+                continue;
+            }
             let result = if p.is_dir() {
-                fs::remove_dir_all(p)
+                fs::remove_dir_all(&p)
             } else {
-                fs::remove_file(p)
+                fs::remove_file(&p)
             };
             match result {
                 Ok(_) => {
@@ -1326,28 +1481,29 @@ fn run_optimize_selection(app: tauri::AppHandle, tasks: Vec<String>) {
                 let _ = app.emit("mo-output", format!("→ {}", label));
 
                 let success = match task_id.as_str() {
-                    "dns" => {
-                        run_admin_sh("dscacheutil -flushcache; killall -HUP mDNSResponder").is_ok()
-                    }
-                    "spotlight" => run_admin_sh("mdutil -E /").is_ok(),
-                    "finder" => Command::new("killall")
+                    "dns" => run_admin_sh(
+                        "/usr/bin/dscacheutil -flushcache; /usr/bin/killall -HUP mDNSResponder",
+                    )
+                    .is_ok(),
+                    "spotlight" => run_admin_sh("/usr/bin/mdutil -E /").is_ok(),
+                    "finder" => Command::new("/usr/bin/killall")
                         .arg("Finder")
                         .output()
                         .map(|o| o.status.success())
                         .unwrap_or(false),
-                    "dock" => Command::new("killall")
+                    "dock" => Command::new("/usr/bin/killall")
                         .arg("Dock")
                         .output()
                         .map(|o| o.status.success())
                         .unwrap_or(false),
-                    "swap" => run_admin_sh("purge").is_ok(),
+                    "swap" => run_admin_sh("/usr/bin/purge").is_ok(),
                     "launchpad" => {
-                        let r1 = Command::new("defaults")
+                        let r1 = Command::new("/usr/bin/defaults")
                             .args(["write", "com.apple.dock", "ResetLaunchPad", "-bool", "true"])
                             .output()
                             .map(|o| o.status.success())
                             .unwrap_or(false);
-                        let r2 = Command::new("killall")
+                        let r2 = Command::new("/usr/bin/killall")
                             .arg("Dock")
                             .output()
                             .map(|o| o.status.success())
@@ -1355,7 +1511,7 @@ fn run_optimize_selection(app: tauri::AppHandle, tasks: Vec<String>) {
                         r1 && r2
                     }
                     "tmutil_thin" => {
-                        run_admin_sh("tmutil thinlocalsnapshots / 999999999999 4").is_ok()
+                        run_admin_sh("/usr/bin/tmutil thinlocalsnapshots / 999999999999 4").is_ok()
                     }
                     "periodic" => run_admin_sh("/usr/sbin/periodic daily weekly monthly").is_ok(),
                     "diskutil_verify" => Command::new("/usr/sbin/diskutil")
@@ -1374,10 +1530,16 @@ fn run_optimize_selection(app: tauri::AppHandle, tasks: Vec<String>) {
                             .map(|o| o.status.success())
                             .unwrap_or(false)
                     }
-                    "docker_prune" => Command::new("docker")
-                        .args(["system", "prune", "-f"])
-                        .output()
-                        .map(|o| o.status.success())
+                    "docker_prune" => ["/opt/homebrew/bin/docker", "/usr/local/bin/docker"]
+                        .iter()
+                        .find(|path| Path::new(path).is_file())
+                        .and_then(|path| {
+                            Command::new(path)
+                                .args(["system", "prune", "-f"])
+                                .output()
+                                .ok()
+                        })
+                        .map(|output| output.status.success())
                         .unwrap_or(false),
                     "mail_speed" => {
                         let home = home_dir();
@@ -1419,7 +1581,7 @@ pub struct NetRateItem {
 
 fn parse_netstat_bytes() -> HashMap<String, (u64, u64)> {
     let mut map: HashMap<String, (u64, u64)> = HashMap::new();
-    let output = match Command::new("netstat").args(["-ib"]).output() {
+    let output = match Command::new("/usr/sbin/netstat").args(["-ib"]).output() {
         Ok(o) => o,
         Err(_) => return map,
     };
@@ -1490,7 +1652,7 @@ fn get_net_rates() -> Vec<NetRateItem> {
 fn free_memory(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         let _ = app.emit("mo-output", "Libération mémoire inactive…");
-        match run_admin_sh("purge") {
+        match run_admin_sh("/usr/bin/purge") {
             Ok(()) => {
                 let _ = app.emit("mo-output", "  ✓ Mémoire inactive libérée");
             }
@@ -1538,45 +1700,6 @@ fn get_mo_version(app: tauri::AppHandle) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-#[tauri::command]
-fn update_mo_cli(app: tauri::AppHandle) {
-    std::thread::spawn(move || {
-        let _ = app.emit("mo-output", "→ Mise à jour de mole via Homebrew…");
-        let child = Command::new("brew")
-            .args(["upgrade", "tw93/tap/mole"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
-
-        match child {
-            Err(e) => {
-                let _ = app.emit("mo-output", format!("  ✗ Erreur : {}", e));
-                let _ = app.emit("mo-done", 1i32);
-            }
-            Ok(mut child) => {
-                let stdout = child.stdout.take().unwrap();
-                let stderr_pipe = child.stderr.take().unwrap();
-                let app_out = app.clone();
-                let app_err = app.clone();
-                let t1 = std::thread::spawn(move || {
-                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                        let _ = app_out.emit("mo-output", line);
-                    }
-                });
-                let t2 = std::thread::spawn(move || {
-                    for line in BufReader::new(stderr_pipe).lines().map_while(Result::ok) {
-                        let _ = app_err.emit("mo-output", line);
-                    }
-                });
-                t1.join().ok();
-                t2.join().ok();
-                let code = child.wait().map(|s| s.code().unwrap_or(0)).unwrap_or(1);
-                let _ = app.emit("mo-done", code);
-            }
-        }
-    });
-}
-
 // ── 8. Brew outdated casks ────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1618,14 +1741,7 @@ fn find_brew() -> Option<String> {
             return Some(path.to_string());
         }
     }
-    Command::new("which")
-        .arg("brew")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    None
 }
 
 struct CaskApiCache {
@@ -1638,10 +1754,14 @@ struct CaskApiCache {
 fn cask_api() -> &'static CaskApiCache {
     static CACHE: OnceLock<CaskApiCache> = OnceLock::new();
     CACHE.get_or_init(|| {
-        let out = Command::new("curl")
+        let out = Command::new("/usr/bin/curl")
             .args([
                 "-s",
                 "-L",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
                 "--compressed",
                 "--max-time",
                 "15",
@@ -1713,6 +1833,49 @@ fn lookup_cask<'a>(
         }
     }
     None
+}
+
+fn brew_list_contains(brew_path: &str, kind: &str, token: &str) -> bool {
+    guard::validate_brew_token(token).is_ok()
+        && Command::new(brew_path)
+            .args(["list", kind])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|stdout| stdout.lines().any(|line| line.trim() == token))
+            .unwrap_or(false)
+}
+
+fn validate_cask_update_request(
+    brew_path: Option<&str>,
+    token: &str,
+    download_url: &str,
+    brew_managed: bool,
+) -> Result<(), String> {
+    guard::validate_brew_token(token)?;
+    if brew_managed {
+        let brew = brew_path.ok_or_else(|| "Homebrew introuvable".to_string())?;
+        if !brew_list_contains(brew, "--cask", token) {
+            return Err("Cask non installé ou non autorisé".to_string());
+        }
+        return Ok(());
+    }
+
+    let api = cask_api();
+    let entry = api
+        .by_token
+        .get(token)
+        .and_then(|index| api.casks.get(*index))
+        .ok_or_else(|| "Cask absent du catalogue Homebrew backend".to_string())?;
+    let expected_url = entry["url"]
+        .as_str()
+        .ok_or_else(|| "URL absente du catalogue Homebrew".to_string())?;
+    guard::validate_update_url(expected_url)?;
+    if download_url != expected_url {
+        return Err("URL de mise à jour différente du catalogue backend".to_string());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2053,7 +2216,15 @@ fn update_brew_app(app: tauri::AppHandle, name: String, download_url: String, br
 
         out!(format!("→ Mise à jour de {}…", name));
 
-        if let Some(brew_path) = find_brew() {
+        let brew_path = find_brew();
+        if let Err(error) =
+            validate_cask_update_request(brew_path.as_deref(), &name, &download_url, brew_managed)
+        {
+            out!(format!("✗ {error}"));
+            done!(1);
+        }
+
+        if let Some(brew_path) = brew_path {
             if brew_managed {
                 // Brew refuse de tourner en root → lancer directement comme utilisateur courant
                 let mut child = match Command::new(&brew_path)
@@ -2157,13 +2328,19 @@ fn update_brew_app(app: tauri::AppHandle, name: String, download_url: String, br
         let tmp = tmp.to_string_lossy().into_owned();
 
         out!(format!("Téléchargement depuis {}…", download_url));
-        let ok_dl = Command::new("curl")
+        let ok_dl = Command::new("/usr/bin/curl")
             .args([
                 "-s",
                 "-L",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
                 "--fail",
                 "--max-time",
                 "120",
+                "--max-filesize",
+                "2147483648",
                 "-A",
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X)",
                 "-o",
@@ -2180,12 +2357,12 @@ fn update_brew_app(app: tauri::AppHandle, name: String, download_url: String, br
 
         let file_size = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
         out!(format!("Taille : {:.1} Mo", file_size as f64 / 1_048_576.0));
-        if file_size < 500_000 {
+        if !(500_000..=2_147_483_648).contains(&file_size) {
             out!("✗ Fichier trop petit — URL invalide ou page d'erreur");
             done!(1);
         }
 
-        let mime = Command::new("file")
+        let mime = Command::new("/usr/bin/file")
             .args(["-b", "--mime-type", &tmp])
             .output()
             .ok()
@@ -2193,7 +2370,7 @@ fn update_brew_app(app: tauri::AppHandle, name: String, download_url: String, br
             .unwrap_or_default();
         let mime = mime.trim().to_string();
         let ext = if mime.contains("bzip2") {
-            let is_dmg = Command::new("hdiutil")
+            let is_dmg = Command::new("/usr/bin/hdiutil")
                 .args(["imageinfo", &tmp])
                 .output()
                 .map(|o| o.status.success())
@@ -2225,39 +2402,48 @@ fn update_brew_app(app: tauri::AppHandle, name: String, download_url: String, br
         let tmp = tmp_ext;
 
         // Quitter l'app si elle tourne
-        if Command::new("pgrep")
+        if Command::new("/usr/bin/pgrep")
             .args(["-x", &name])
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
         {
             out!(format!("Fermeture de {}…", name));
-            let _ = Command::new("osascript")
-                .args(["-e", &format!("quit app \"{}\"", name)])
-                .output();
+            quit_application(&name);
             std::thread::sleep(Duration::from_secs(1));
         }
 
-        // Trouver le dossier d'installation de l'app existante
-        let install_dir = collect_all_apps()
-            .into_iter()
-            .find(|p| {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_lowercase())
-                    .as_deref()
-                    == Some(&name.to_lowercase())
-            })
-            .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
+        // Relier le token du catalogue à l'application réellement installée.
+        let expected_bundle_id = cask_api()
+            .by_token
+            .get(&name)
+            .and_then(|index| cask_api().casks.get(*index))
+            .and_then(|entry| entry["bundle_id"].as_str())
+            .filter(|value| !value.is_empty());
+        let installed_app = collect_all_apps().into_iter().find(|p| {
+            let bundle = plist_str(&p.join("Contents/Info.plist"), "CFBundleIdentifier");
+            expected_bundle_id
+                .map(|expected| bundle.as_deref() == Some(expected))
+                .unwrap_or_else(|| {
+                    p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.eq_ignore_ascii_case(&name))
+                        .unwrap_or(false)
+                })
+        });
+        let Some(installed_app) = installed_app else {
+            out!("✗ Application installée introuvable");
+            done!(1);
+        };
+        let install_dir = installed_app
+            .parent()
+            .map(|directory| directory.to_string_lossy().to_string())
             .unwrap_or_else(|| "/Applications".to_string());
 
         let ok = match ext {
             "pkg" => {
-                out!("Installation du package…");
-                {
-                    let q = guard::posix_shell_quote(&tmp);
-                    run_admin_sh(&format!("installer -pkg {} -target /", q)).is_ok()
-                }
+                out!("✗ Installation directe des packages PKG désactivée pour préserver l'identité de signature");
+                false
             }
             "zip" | "tar.gz" | "tar.bz2" | "tar.xz" => {
                 let tmp_dir = work_dir
@@ -2266,15 +2452,19 @@ fn update_brew_app(app: tauri::AppHandle, name: String, download_url: String, br
                     .to_string_lossy()
                     .into_owned();
                 fs::create_dir_all(&tmp_dir).ok();
+                if let Err(e) = validate_archive_entries(Path::new(&tmp), ext) {
+                    out!(format!("✗ Archive refusée : {e}"));
+                    done!(1);
+                }
                 out!("Extraction…");
                 let ok_x = if ext == "zip" {
-                    Command::new("unzip")
+                    Command::new("/usr/bin/unzip")
                         .args(["-q", "-o", &tmp, "-d", &tmp_dir])
                         .status()
                         .map(|s| s.success())
                         .unwrap_or(false)
                 } else {
-                    Command::new("tar")
+                    Command::new("/usr/bin/tar")
                         .args(["-xf", &tmp, "-C", &tmp_dir])
                         .status()
                         .map(|s| s.success())
@@ -2292,7 +2482,12 @@ fn update_brew_app(app: tauri::AppHandle, name: String, download_url: String, br
                     let _ = fs::remove_file(&tmp);
                     done!(1);
                 }
-                let result = match copy_app(app_src.as_deref().unwrap(), &install_dir) {
+                let app_src = app_src.as_deref().unwrap();
+                if let Err(e) = validate_update_bundle(&installed_app, Path::new(app_src)) {
+                    out!(format!("✗ Mise à jour non authentique : {e}"));
+                    done!(1);
+                }
+                let result = match copy_app(app_src, &installed_app) {
                     Ok(()) => true,
                     Err(e) => {
                         out!(format!("✗ Copie échouée : {}", e));
@@ -2312,8 +2507,8 @@ fn update_brew_app(app: tauri::AppHandle, name: String, download_url: String, br
                     .map(|e| e.path().to_string_lossy().to_string())
                     .collect();
                 out!("Montage du DMG…");
-                let mount_out = Command::new("hdiutil")
-                    .args(["attach", &tmp, "-nobrowse"])
+                let mount_out = Command::new("/usr/bin/hdiutil")
+                    .args(["attach", &tmp, "-readonly", "-nobrowse"])
                     .output();
                 let Ok(mo) = mount_out else {
                     out!("✗ Impossible de lancer hdiutil");
@@ -2359,14 +2554,21 @@ fn update_brew_app(app: tauri::AppHandle, name: String, download_url: String, br
                 let app_src = find_app_bundle(mp);
                 let Some(ref src) = app_src else {
                     out!("✗ Aucune .app dans le volume");
-                    let _ = Command::new("hdiutil")
+                    let _ = Command::new("/usr/bin/hdiutil")
                         .args(["detach", mp, "-quiet"])
                         .status();
                     let _ = fs::remove_file(&tmp);
                     done!(1);
                 };
+                if let Err(e) = validate_update_bundle(&installed_app, Path::new(src)) {
+                    out!(format!("✗ Mise à jour non authentique : {e}"));
+                    let _ = Command::new("/usr/bin/hdiutil")
+                        .args(["detach", mp, "-quiet"])
+                        .status();
+                    done!(1);
+                }
                 out!(format!("Copie → {}…", install_dir));
-                let result = match copy_app(src, &install_dir) {
+                let result = match copy_app(src, &installed_app) {
                     Ok(()) => true,
                     Err(e) => {
                         out!(format!("✗ Copie échouée : {}", e));
@@ -2374,7 +2576,7 @@ fn update_brew_app(app: tauri::AppHandle, name: String, download_url: String, br
                     }
                 };
                 out!("Démontage…");
-                let _ = Command::new("hdiutil")
+                let _ = Command::new("/usr/bin/hdiutil")
                     .args(["detach", mp, "-quiet"])
                     .status();
                 result
@@ -2497,10 +2699,20 @@ fn update_brew_formula(app: tauri::AppHandle, name: String) {
 
         out!(format!("→ Mise à jour de {}…", name));
 
+        if let Err(error) = guard::validate_brew_token(&name) {
+            out!(format!("✗ {error}"));
+            done!(1);
+        }
+
         let Some(brew_path) = find_brew() else {
             out!("✗ Homebrew non trouvé");
             done!(1);
         };
+
+        if !brew_list_contains(&brew_path, "--formula", &name) {
+            out!("✗ Formule non installée ou non autorisée");
+            done!(1);
+        }
 
         let child = Command::new(&brew_path)
             .args(["upgrade", &name])
@@ -2628,14 +2840,7 @@ fn find_clamscan(app: &tauri::AppHandle) -> Option<String> {
             return Some(path.to_string());
         }
     }
-    Command::new("which")
-        .arg("clamscan")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    None
 }
 
 fn find_freshclam(app: &tauri::AppHandle) -> Option<String> {
@@ -2654,14 +2859,7 @@ fn find_freshclam(app: &tauri::AppHandle) -> Option<String> {
             return Some(path.to_string());
         }
     }
-    Command::new("which")
-        .arg("freshclam")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    None
 }
 
 fn clamav_db_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
@@ -2739,12 +2937,22 @@ fn read_quarantine_meta() -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-fn write_quarantine_meta(entries: &[serde_json::Value]) {
-    let _ = fs::create_dir_all(quarantine_dir());
-    let _ = fs::write(
-        quarantine_meta_path(),
-        serde_json::to_string_pretty(entries).unwrap_or_default(),
-    );
+fn write_quarantine_meta(entries: &[serde_json::Value]) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = quarantine_dir();
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+    let json = serde_json::to_vec_pretty(entries).map_err(|e| e.to_string())?;
+    let mut temp = tempfile::NamedTempFile::new_in(&dir).map_err(|e| e.to_string())?;
+    temp.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|e| e.to_string())?;
+    std::io::Write::write_all(&mut temp, &json).map_err(|e| e.to_string())?;
+    temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    temp.persist(quarantine_meta_path())
+        .map_err(|e| e.error.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -2839,6 +3047,11 @@ fn start_clamav_scan(app: tauri::AppHandle, paths: Vec<String>) {
 
         let t1 = std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line.ends_with(" FOUND") {
+                    if let Some((path, _)) = line.rsplit_once(": ") {
+                        grant_path(Path::new(path), PathGrantPurpose::Quarantine);
+                    }
+                }
                 let _ = app_out.emit("scan-line", line);
             }
         });
@@ -2859,7 +3072,7 @@ fn start_clamav_scan(app: tauri::AppHandle, paths: Vec<String>) {
 #[tauri::command]
 fn cancel_clamav_scan() {
     if let Some(pid) = *scan_pid_store().lock().unwrap() {
-        let _ = Command::new("kill")
+        let _ = Command::new("/bin/kill")
             .args(["-TERM", &pid.to_string()])
             .status();
     }
@@ -2952,7 +3165,9 @@ fn list_quarantine() -> Vec<QuarantineEntry> {
 #[tauri::command]
 fn quarantine_file(original_path: String) -> Result<(), String> {
     guard::validate_trash_path(&original_path)?;
-    let src = std::path::Path::new(&original_path);
+    let canonical = require_path_grant(&original_path, PathGrantPurpose::Quarantine)?;
+    guard::validate_trash_path(&canonical.to_string_lossy())?;
+    let src = canonical.as_path();
     let fname = src
         .file_name()
         .and_then(|n| n.to_str())
@@ -2960,13 +3175,15 @@ fn quarantine_file(original_path: String) -> Result<(), String> {
         .to_string();
 
     let dir = quarantine_dir();
-    let _ = fs::create_dir_all(&dir);
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
 
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let unique_name = format!("{}_{}", ts, fname);
+    let unique_name = format!("{}_{}_{}", ts, uuid::Uuid::new_v4(), fname);
     let dest = dir.join(&unique_name);
 
     if fs::rename(src, &dest).is_err() {
@@ -2977,11 +3194,10 @@ fn quarantine_file(original_path: String) -> Result<(), String> {
     let mut meta = read_quarantine_meta();
     meta.push(serde_json::json!({
         "name": unique_name,
-        "original_path": original_path,
+        "original_path": canonical.to_string_lossy(),
         "quarantined_at": ts.to_string()
     }));
-    write_quarantine_meta(&meta);
-    Ok(())
+    write_quarantine_meta(&meta)
 }
 
 #[tauri::command]
@@ -2995,10 +3211,33 @@ fn restore_from_quarantine(name: String) -> Result<(), String> {
     let original_path = entry["original_path"]
         .as_str()
         .ok_or("Chemin original manquant")?;
+    let original = guard::validate_trash_path(original_path)?;
+    if original.exists() {
+        return Err(
+            "Le chemin original existe déjà ; restauration refusée pour éviter tout écrasement"
+                .to_string(),
+        );
+    }
+    let parent = original.parent().ok_or("Dossier d'origine invalide")?;
+    let canonical_parent = fs::canonicalize(parent).map_err(|_| {
+        "Le dossier d'origine n'existe plus ; recréez-le avant de restaurer".to_string()
+    })?;
+    if canonical_parent != parent {
+        return Err(
+            "Le dossier d'origine traverse un lien symbolique ; restauration refusée".to_string(),
+        );
+    }
     let qpath = quarantine_dir().join(&name);
 
-    if fs::rename(&qpath, original_path).is_err() {
-        fs::copy(&qpath, original_path).map_err(|e| e.to_string())?;
+    if fs::rename(&qpath, &original).is_err() {
+        let mut source = fs::File::open(&qpath).map_err(|e| e.to_string())?;
+        let mut destination = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&original)
+            .map_err(|e| e.to_string())?;
+        std::io::copy(&mut source, &mut destination).map_err(|e| e.to_string())?;
+        destination.sync_all().map_err(|e| e.to_string())?;
         fs::remove_file(&qpath).ok();
     }
 
@@ -3006,8 +3245,7 @@ fn restore_from_quarantine(name: String) -> Result<(), String> {
         .into_iter()
         .filter(|m| m["name"].as_str() != Some(&name))
         .collect();
-    write_quarantine_meta(&new_meta);
-    Ok(())
+    write_quarantine_meta(&new_meta)
 }
 
 #[tauri::command]
@@ -3026,37 +3264,7 @@ fn delete_from_quarantine(name: String) -> Result<(), String> {
         .into_iter()
         .filter(|m| m["name"].as_str() != Some(&name))
         .collect();
-    write_quarantine_meta(&new_meta);
-    Ok(())
-}
-
-fn mo_update_cache() -> &'static Mutex<Option<(bool, Instant)>> {
-    static C: OnceLock<Mutex<Option<(bool, Instant)>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(None))
-}
-
-#[tauri::command]
-fn check_mo_update_available() -> bool {
-    // Cache 10 minutes : brew outdated contacte le serveur, c'est lent
-    {
-        let g = mo_update_cache().lock().unwrap();
-        if let Some((v, t)) = *g {
-            if t.elapsed() < Duration::from_secs(600) {
-                return v;
-            }
-        }
-    }
-    let result = {
-        let output = Command::new("brew")
-            .args(["outdated", "--formula", "tw93/tap/mole"])
-            .output();
-        match output {
-            Ok(o) if o.status.success() => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
-            _ => false,
-        }
-    };
-    *mo_update_cache().lock().unwrap() = Some((result, Instant::now()));
-    result
+    write_quarantine_meta(&new_meta)
 }
 
 #[tauri::command]
@@ -3078,7 +3286,7 @@ fn check_clamav_defs_outdated(app: tauri::AppHandle) -> bool {
 
 #[tauri::command]
 fn pick_folder() -> Option<String> {
-    let out = Command::new("osascript")
+    let out = Command::new("/usr/bin/osascript")
         .args([
             "-e",
             "POSIX path of (choose folder with prompt \"Select folder to scan\")",
@@ -3437,6 +3645,12 @@ fn scan_tm_snapshots() -> Vec<TmSnapshot> {
 
 #[tauri::command]
 fn delete_tm_snapshot(date: String) -> Result<(), String> {
+    if !scan_tm_snapshots()
+        .iter()
+        .any(|snapshot| snapshot.date == date)
+    {
+        return Err("Snapshot non autorisé : relancez l'analyse".to_string());
+    }
     let out = Command::new("/usr/bin/tmutil")
         .args(["deletelocalsnapshots", &date])
         .output()
@@ -3522,6 +3736,12 @@ fn scan_simulator_runtimes() -> Vec<SimRuntime> {
 
 #[tauri::command]
 fn delete_simulator_runtime(identifier: String) -> Result<(), String> {
+    if !scan_simulator_runtimes()
+        .iter()
+        .any(|runtime| runtime.identifier == identifier && runtime.deletable)
+    {
+        return Err("Runtime non autorisé ou non supprimable : relancez l'analyse".to_string());
+    }
     let out = Command::new("/usr/bin/xcrun")
         .args(["simctl", "runtime", "delete", &identifier])
         .output()
@@ -3622,27 +3842,28 @@ fn scan_ai_caches() -> Vec<AiCacheItem> {
 
 #[tauri::command]
 fn clean_ai_caches(ids: Vec<String>) -> Result<u64, String> {
-    let home = home_dir();
     let all = scan_ai_caches();
     let mut freed = 0u64;
     for item in all.iter().filter(|i| ids.contains(&i.id)) {
         let p = Path::new(&item.path);
-        freed += if p.is_dir() {
+        let size = if p.is_dir() {
             du_bytes(p)
         } else {
             fs::metadata(p).map(|m| m.len()).unwrap_or(0)
         };
-        if p.is_dir() {
-            let _ = fs::remove_dir_all(p);
+        let deleted = if p.is_dir() {
+            fs::remove_dir_all(p).is_ok()
         } else {
-            let _ = fs::remove_file(p);
+            fs::remove_file(p).is_ok()
+        };
+        if deleted {
+            freed += size;
         }
     }
-    let _ = home; // suppress warning
     Ok(freed)
 }
 
-// ── Dev caches (npm / yarn / pnpm / brew) — dynamic path detection ────────────
+// ── Dev caches (npm / yarn / pnpm / brew) ────────────────────────────────────
 
 #[derive(Serialize, Clone)]
 pub struct DevCacheItem {
@@ -3652,64 +3873,25 @@ pub struct DevCacheItem {
     pub size_bytes: u64,
 }
 
-fn detect_cli_cache(cli_candidates: &[&str], args: &[&str]) -> Option<String> {
-    for cli in cli_candidates {
-        let p = Path::new(cli);
-        if !p.exists() {
-            continue;
-        }
-        let out = Command::new(p).args(args).output().ok()?;
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !s.is_empty() && Path::new(&s).exists() {
-            return Some(s);
-        }
-    }
-    None
-}
-
 #[tauri::command]
 fn scan_dev_caches() -> Vec<DevCacheItem> {
     let home = home_dir();
 
-    let npm_path = detect_cli_cache(
-        &[
-            "/opt/homebrew/bin/npm",
-            "/usr/local/bin/npm",
-            &home.join(".local/bin/npm").to_string_lossy(),
-        ],
-        &["config", "get", "cache"],
-    )
-    .unwrap_or_else(|| home.join(".npm").to_string_lossy().to_string());
-
-    let yarn_path = detect_cli_cache(
-        &["/opt/homebrew/bin/yarn", "/usr/local/bin/yarn"],
-        &["cache", "dir"],
-    )
-    .unwrap_or_else(|| {
-        home.join("Library/Caches/Yarn")
-            .to_string_lossy()
-            .to_string()
-    });
-
-    let pnpm_path = detect_cli_cache(
-        &["/opt/homebrew/bin/pnpm", "/usr/local/bin/pnpm"],
-        &["store", "path"],
-    )
-    .unwrap_or_else(|| {
-        home.join("Library/pnpm/store")
-            .to_string_lossy()
-            .to_string()
-    });
-
-    let brew_path = detect_cli_cache(
-        &["/opt/homebrew/bin/brew", "/usr/local/bin/brew"],
-        &["--cache"],
-    )
-    .unwrap_or_else(|| {
-        home.join("Library/Caches/Homebrew")
-            .to_string_lossy()
-            .to_string()
-    });
+    // Catalogue backend fixe : une configuration locale de npm/yarn ne doit pas
+    // pouvoir rediriger une suppression vers un chemin arbitraire.
+    let npm_path = home.join(".npm").to_string_lossy().to_string();
+    let yarn_path = home
+        .join("Library/Caches/Yarn")
+        .to_string_lossy()
+        .to_string();
+    let pnpm_path = home
+        .join("Library/pnpm/store")
+        .to_string_lossy()
+        .to_string();
+    let brew_path = home
+        .join("Library/Caches/Homebrew")
+        .to_string_lossy()
+        .to_string();
 
     let bun_path = home
         .join("Library/Caches/bun")
@@ -3775,11 +3957,14 @@ fn clean_dev_caches(ids: Vec<String>) -> Result<u64, String> {
     let mut freed = 0u64;
     for item in all.iter().filter(|i| ids.contains(&i.id)) {
         let p = Path::new(&item.path);
-        freed += du_bytes(p);
-        if p.is_dir() {
-            let _ = fs::remove_dir_all(p);
+        let size = du_bytes(p);
+        let deleted = if p.is_dir() {
+            fs::remove_dir_all(p).is_ok()
         } else {
-            let _ = fs::remove_file(p);
+            fs::remove_file(p).is_ok()
+        };
+        if deleted {
+            freed += size;
         }
     }
     Ok(freed)
@@ -3918,16 +4103,6 @@ fn find_app_residuals(app_name: String) -> Vec<FileEntry> {
     results
 }
 
-#[tauri::command]
-fn delete_path(path: String) -> Result<(), String> {
-    let p = guard::validate_delete_path(&path)?;
-    if p.is_dir() {
-        fs::remove_dir_all(&p).map_err(|e| e.to_string())
-    } else {
-        fs::remove_file(&p).map_err(|e| e.to_string())
-    }
-}
-
 // ── 10. All processes (sysinfo-based, grouped by name) ────────────────────────
 
 #[derive(Serialize, Clone)]
@@ -4013,7 +4188,7 @@ pub struct NetworkService {
 
 /// Returns the BSD interface name (e.g. "en0") used for the default route.
 fn default_route_iface() -> Option<String> {
-    let out = Command::new("route")
+    let out = Command::new("/sbin/route")
         .args(["-n", "get", "default"])
         .output()
         .ok()?;
@@ -4026,7 +4201,7 @@ fn default_route_iface() -> Option<String> {
 
 /// Maps a BSD interface name to a networksetup service name (e.g. "en0" → "Wi-Fi").
 fn iface_to_service(iface: &str) -> Option<String> {
-    let out = Command::new("networksetup")
+    let out = Command::new("/usr/sbin/networksetup")
         .arg("-listnetworkserviceorder")
         .output()
         .ok()?;
@@ -4051,7 +4226,7 @@ fn list_network_services() -> Vec<NetworkService> {
     let active_iface = default_route_iface();
     let active_svc_name = active_iface.as_deref().and_then(iface_to_service);
 
-    let out = match Command::new("networksetup")
+    let out = match Command::new("/usr/sbin/networksetup")
         .arg("-listallnetworkservices")
         .output()
     {
@@ -4068,7 +4243,7 @@ fn list_network_services() -> Vec<NetworkService> {
     services
         .into_iter()
         .filter_map(|svc| {
-            let dns_out = Command::new("networksetup")
+            let dns_out = Command::new("/usr/sbin/networksetup")
                 .args(["-getdnsservers", &svc])
                 .output()
                 .ok()?;
@@ -4451,7 +4626,7 @@ fn install_doh_profile(provider_id: String, option_id: String) -> Result<(), Str
     f.write_all(xml.as_bytes()).map_err(|e| e.to_string())?;
     f.flush().map_err(|e| e.to_string())?;
 
-    let opened = Command::new("open")
+    let opened = Command::new("/usr/bin/open")
         .arg(&tmp_path)
         .output()
         .map_err(|e| e.to_string())?;
@@ -4492,7 +4667,7 @@ fn set_dns_servers(service: String, servers: Vec<String>) -> Result<(), String> 
         guard::validate_ip_address(ip).map_err(|e| format!("Serveur DNS invalide : {}", e))?;
     }
     // Utiliser Command::arg() — aucune interpolation shell
-    let mut cmd = Command::new("networksetup");
+    let mut cmd = Command::new("/usr/sbin/networksetup");
     cmd.arg("-setdnsservers").arg(&service);
     for ip in &resolved {
         cmd.arg(ip);
@@ -4515,7 +4690,7 @@ fn set_dns_servers(service: String, servers: Vec<String>) -> Result<(), String> 
                         .join(" ")
                 ))
             );
-            let adm = Command::new("osascript")
+            let adm = Command::new("/usr/bin/osascript")
                 .args(["-e", &script])
                 .output()
                 .map_err(|e| e.to_string())?;
@@ -4524,8 +4699,10 @@ fn set_dns_servers(service: String, servers: Vec<String>) -> Result<(), String> 
             }
         }
     }
-    let _ = Command::new("dscacheutil").arg("-flushcache").output();
-    let _ = Command::new("killall")
+    let _ = Command::new("/usr/bin/dscacheutil")
+        .arg("-flushcache")
+        .output();
+    let _ = Command::new("/usr/bin/killall")
         .args(["-HUP", "mDNSResponder"])
         .output();
     Ok(())
@@ -4534,7 +4711,7 @@ fn set_dns_servers(service: String, servers: Vec<String>) -> Result<(), String> 
 #[tauri::command]
 fn reset_dns(service: String) -> Result<(), String> {
     guard::validate_service_name(&service)?;
-    let out = Command::new("networksetup")
+    let out = Command::new("/usr/sbin/networksetup")
         .args(["-setdnsservers", &service, "Empty"])
         .output()
         .map_err(|e| e.to_string())?;
@@ -4546,7 +4723,7 @@ fn reset_dns(service: String) -> Result<(), String> {
                 posix_shell_quote_value(&service)
             ))
         );
-        let adm = Command::new("osascript")
+        let adm = Command::new("/usr/bin/osascript")
             .args(["-e", &script])
             .output()
             .map_err(|e| e.to_string())?;
@@ -4554,8 +4731,10 @@ fn reset_dns(service: String) -> Result<(), String> {
             return Err(String::from_utf8_lossy(&adm.stderr).trim().to_string());
         }
     }
-    let _ = Command::new("dscacheutil").arg("-flushcache").output();
-    let _ = Command::new("killall")
+    let _ = Command::new("/usr/bin/dscacheutil")
+        .arg("-flushcache")
+        .output();
+    let _ = Command::new("/usr/bin/killall")
         .args(["-HUP", "mDNSResponder"])
         .output();
     Ok(())
@@ -4563,7 +4742,7 @@ fn reset_dns(service: String) -> Result<(), String> {
 
 #[tauri::command]
 fn get_search_domains(service: String) -> Vec<String> {
-    let out = Command::new("networksetup")
+    let out = Command::new("/usr/sbin/networksetup")
         .args(["-getsearchdomains", &service])
         .output()
         .ok();
@@ -4589,7 +4768,7 @@ fn set_search_domains(service: String, domains: Vec<String>) -> Result<(), Strin
         guard::validate_domain_name(d)
             .map_err(|e| format!("Domaine de recherche invalide : {}", e))?;
     }
-    let mut cmd = Command::new("networksetup");
+    let mut cmd = Command::new("/usr/sbin/networksetup");
     cmd.arg("-setsearchdomains").arg(&service);
     if domains.is_empty() {
         cmd.arg("Empty");
@@ -4619,7 +4798,7 @@ fn set_search_domains(service: String, domains: Vec<String>) -> Result<(), Strin
             domain_args
         ))
     );
-    let adm = Command::new("osascript")
+    let adm = Command::new("/usr/bin/osascript")
         .args(["-e", &script])
         .output()
         .map_err(|e| e.to_string())?;
@@ -4677,7 +4856,7 @@ fn kill_process(pid: u64) -> Result<(), String> {
     }
 
     // SIGTERM d'abord (terminaison propre)
-    let _ = Command::new("kill")
+    let _ = Command::new("/bin/kill")
         .args(["-TERM", &pid.to_string()])
         .output();
 
@@ -4688,7 +4867,7 @@ fn kill_process(pid: u64) -> Result<(), String> {
     }
 
     // SIGKILL seulement si le processus résiste
-    let out = Command::new("kill")
+    let out = Command::new("/bin/kill")
         .args(["-KILL", &pid.to_string()])
         .output()
         .map_err(|e| e.to_string())?;
@@ -4707,7 +4886,7 @@ fn kill_process(pid: u64) -> Result<(), String> {
 /// Retourne l'UID Unix du propriétaire d'un PID via `ps`.
 /// Renvoie `None` si le processus n'existe plus.
 fn get_process_uid(pid: u64) -> Option<u32> {
-    Command::new("ps")
+    Command::new("/bin/ps")
         .args(["-o", "uid=", "-p", &pid.to_string()])
         .output()
         .ok()
@@ -4927,6 +5106,7 @@ fn sparkle_feed_update(
     name: &str,
     feed_url: &str,
 ) -> Option<SparkleUpdate> {
+    guard::validate_update_url(feed_url).ok()?;
     let plist = path.join("Contents/Info.plist");
     let installed_short = plist_str(&plist, "CFBundleShortVersionString").unwrap_or_default();
     let installed_build = plist_str(&plist, "CFBundleVersion").unwrap_or_default();
@@ -4935,10 +5115,14 @@ fn sparkle_feed_update(
         return None;
     }
 
-    let out = Command::new("curl")
+    let out = Command::new("/usr/bin/curl")
         .args([
             "-s",
             "-L",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
             "--max-time",
             "8",
             "-A",
@@ -5047,10 +5231,14 @@ fn check_electron_update(path: std::path::PathBuf) -> Option<SparkleUpdate> {
                 owner, repo
             );
 
-            let out = Command::new("curl")
+            let out = Command::new("/usr/bin/curl")
                 .args([
                     "-s",
                     "-L",
+                    "--proto",
+                    "=https",
+                    "--proto-redir",
+                    "=https",
                     "--max-time",
                     "8",
                     "-H",
@@ -5073,7 +5261,7 @@ fn check_electron_update(path: std::path::PathBuf) -> Option<SparkleUpdate> {
             }
 
             // Architecture de la machine
-            let arch = Command::new("uname")
+            let arch = Command::new("/usr/bin/uname")
                 .arg("-m")
                 .output()
                 .ok()
@@ -5127,11 +5315,16 @@ fn check_electron_update(path: std::path::PathBuf) -> Option<SparkleUpdate> {
             let base_url = yml_value(&yml, "url")?;
             let base_url = base_url.trim_end_matches('/').to_string();
             let manifest_url = format!("{}/latest-mac.yml", base_url);
+            guard::validate_update_url(&manifest_url).ok()?;
 
-            let out = Command::new("curl")
+            let out = Command::new("/usr/bin/curl")
                 .args([
                     "-s",
                     "-L",
+                    "--proto",
+                    "=https",
+                    "--proto-redir",
+                    "=https",
                     "--max-time",
                     "8",
                     "-A",
@@ -5150,7 +5343,7 @@ fn check_electron_update(path: std::path::PathBuf) -> Option<SparkleUpdate> {
                 return None;
             }
 
-            let arch = Command::new("uname")
+            let arch = Command::new("/usr/bin/uname")
                 .arg("-m")
                 .output()
                 .ok()
@@ -5286,6 +5479,29 @@ fn check_sparkle_updates() -> SparkleResult {
     }
 }
 
+fn authorize_sparkle_update(
+    name: &str,
+    download_url: &str,
+    app_path: &str,
+) -> Result<PathBuf, String> {
+    guard::validate_update_url(download_url)?;
+    guard::validate_update_app_path(app_path)?;
+    let canonical = fs::canonicalize(app_path)
+        .map_err(|e| format!("Application installée introuvable : {e}"))?;
+    guard::validate_update_app_path(&canonical.to_string_lossy())?;
+
+    let update = check_one_app(canonical.clone())
+        .or_else(|| check_electron_update(canonical.clone()))
+        .ok_or_else(|| "Mise à jour non confirmée par la source backend".to_string())?;
+    if update.name != name
+        || update.download_url != download_url
+        || Path::new(&update.path) != canonical
+    {
+        return Err("La demande de mise à jour ne correspond pas au catalogue backend".to_string());
+    }
+    Ok(canonical)
+}
+
 // ── Mac App Store update checking ─────────────────────────────────────────────
 
 fn check_app_store_app(path: std::path::PathBuf) -> Option<AppStoreUpdate> {
@@ -5311,7 +5527,7 @@ fn check_app_store_app(path: std::path::PathBuf) -> Option<AppStoreUpdate> {
     }
 
     // Détecter le pays depuis les préférences système (comme Latest)
-    let country = Command::new("defaults")
+    let country = Command::new("/usr/bin/defaults")
         .args(["read", "-g", "AppleLocale"])
         .output()
         .ok()
@@ -5331,8 +5547,20 @@ fn check_app_store_app(path: std::path::PathBuf) -> Option<AppStoreUpdate> {
                 "https://itunes.apple.com/lookup?bundleId={}&entity={}&country={}",
                 bundle_id, entity, country
             );
-            let out = Command::new("curl")
-                .args(["-s", "-L", "--max-time", "8", "-A", "Mozilla/5.0", &url])
+            let out = Command::new("/usr/bin/curl")
+                .args([
+                    "-s",
+                    "-L",
+                    "--proto",
+                    "=https",
+                    "--proto-redir",
+                    "=https",
+                    "--max-time",
+                    "8",
+                    "-A",
+                    "Mozilla/5.0",
+                    &url,
+                ])
                 .output()
                 .ok()?;
             if out.stdout.is_empty() {
@@ -5500,6 +5728,24 @@ fn update_mas_app(app: tauri::AppHandle, track_id: u64, _name: String) -> Result
     Ok(())
 }
 
+#[tauri::command]
+fn open_app_store_url(url: String) -> Result<(), String> {
+    let allowed =
+        url.starts_with("https://apps.apple.com/") || url.starts_with("https://itunes.apple.com/");
+    if !allowed || url.len() > 2048 || url.chars().any(char::is_whitespace) || url.contains('\0') {
+        return Err("URL App Store refusée".to_string());
+    }
+    let status = Command::new("/usr/bin/open")
+        .arg(&url)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Impossible d'ouvrir l'App Store".to_string())
+    }
+}
+
 // ── Sparkle update installation ───────────────────────────────────────────────
 
 fn find_app_bundle(dir: &str) -> Option<String> {
@@ -5530,25 +5776,243 @@ fn find_app_bundle(dir: &str) -> Option<String> {
     None
 }
 
-fn copy_app(src: &str, dest_dir: &str) -> Result<(), String> {
-    let dest = std::path::Path::new(dest_dir)
-        .join(std::path::Path::new(src).file_name().unwrap_or_default());
-    let dest_s = dest.to_string_lossy();
+fn signing_field(output: &str, field: &str) -> Option<String> {
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(field))
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "not set")
+        .map(str::to_string)
+}
 
-    // Try without admin first
-    let _ = fs::remove_dir_all(&dest);
-    let out = Command::new("ditto")
-        .args([src, dest_s.as_ref()])
+fn app_signing_identity(path: &Path) -> Result<(String, String), String> {
+    let verified = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--deep", "--strict", "--verbose=2"])
+        .arg(path)
         .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        return Ok(());
+        .map_err(|e| format!("Impossible de vérifier la signature : {e}"))?;
+    if !verified.status.success() {
+        return Err(format!(
+            "Signature de l'application invalide : {}",
+            String::from_utf8_lossy(&verified.stderr).trim()
+        ));
     }
 
-    // Retry: rm -rf then ditto, with admin — quoting POSIX correct
-    let q_dest = guard::posix_shell_quote(dest_s.as_ref());
-    let q_src = guard::posix_shell_quote(src);
-    run_admin_sh(&format!("rm -rf {} && ditto {} {}", q_dest, q_src, q_dest))
+    let details = Command::new("/usr/bin/codesign")
+        .args(["-d", "--verbose=4"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("Impossible de lire la signature : {e}"))?;
+    let stderr = String::from_utf8_lossy(&details.stderr);
+    let identifier = signing_field(&stderr, "Identifier=")
+        .ok_or_else(|| "Identifiant de signature absent".to_string())?;
+    let team = signing_field(&stderr, "TeamIdentifier=")
+        .ok_or_else(|| "Team ID absent : application signée ad hoc refusée".to_string())?;
+    Ok((identifier, team))
+}
+
+fn validate_update_bundle(current: &Path, replacement: &Path) -> Result<(), String> {
+    guard::validate_update_app_path(&current.to_string_lossy())?;
+    if replacement
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("app")
+    {
+        return Err("Le téléchargement ne contient pas une application macOS".to_string());
+    }
+
+    let current_bundle = plist_str(&current.join("Contents/Info.plist"), "CFBundleIdentifier")
+        .ok_or_else(|| "Bundle ID de l'application installée absent".to_string())?;
+    let replacement_bundle = plist_str(
+        &replacement.join("Contents/Info.plist"),
+        "CFBundleIdentifier",
+    )
+    .ok_or_else(|| "Bundle ID de la mise à jour absent".to_string())?;
+    if current_bundle != replacement_bundle {
+        return Err(format!(
+            "Bundle ID différent : {current_bundle} → {replacement_bundle}"
+        ));
+    }
+
+    let (current_identifier, current_team) = app_signing_identity(current)?;
+    let (replacement_identifier, replacement_team) = app_signing_identity(replacement)?;
+    if current_identifier != replacement_identifier || current_team != replacement_team {
+        return Err(
+            "La signature de la mise à jour ne correspond pas à l'application installée"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_archive_listing(listing: &str) -> Result<(), String> {
+    use std::path::Component;
+
+    let mut count = 0usize;
+    for entry in listing.lines() {
+        count += 1;
+        if count > 50_000
+            || entry.is_empty()
+            || entry.len() > 4096
+            || entry.contains('\\')
+            || entry.chars().any(char::is_control)
+        {
+            return Err("Structure d'archive refusée".to_string());
+        }
+        let path = Path::new(entry);
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir
+                        | Component::RootDir
+                        | Component::Prefix(_)
+                        | Component::CurDir
+                )
+            })
+        {
+            return Err(format!("Chemin dangereux dans l'archive : {entry}"));
+        }
+    }
+    if count == 0 {
+        return Err("Archive vide".to_string());
+    }
+    Ok(())
+}
+
+fn validate_archive_entries(archive: &Path, format: &str) -> Result<(), String> {
+    let output = if format == "zip" {
+        Command::new("/usr/bin/unzip")
+            .arg("-Z1")
+            .arg(archive)
+            .output()
+    } else {
+        Command::new("/usr/bin/tar")
+            .arg("-tf")
+            .arg(archive)
+            .output()
+    }
+    .map_err(|e| format!("Impossible d'inspecter l'archive : {e}"))?;
+    if !output.status.success() {
+        return Err("Archive illisible ou corrompue".to_string());
+    }
+    if output.stdout.len() > 8_000_000 {
+        return Err("Archive contenant trop d'entrées".to_string());
+    }
+
+    let listing = String::from_utf8(output.stdout)
+        .map_err(|_| "Noms de fichiers non UTF-8 dans l'archive".to_string())?;
+    validate_archive_listing(&listing)?;
+
+    let metadata = if format == "zip" {
+        Command::new("/usr/bin/unzip")
+            .arg("-ZTs")
+            .arg(archive)
+            .output()
+    } else {
+        Command::new("/usr/bin/tar")
+            .arg("-tvf")
+            .arg(archive)
+            .output()
+    }
+    .map_err(|e| format!("Impossible d'inspecter les types d'entrées : {e}"))?;
+    if !metadata.status.success() || metadata.stdout.len() > 16_000_000 {
+        return Err("Métadonnées d'archive invalides".to_string());
+    }
+    for line in String::from_utf8_lossy(&metadata.stdout).lines() {
+        if matches!(
+            line.as_bytes().first(),
+            Some(b'l' | b'h' | b'b' | b'c' | b'p' | b's')
+        ) {
+            return Err("Liens et fichiers spéciaux refusés dans les archives".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod update_security_tests {
+    use super::{signing_field, validate_archive_listing};
+
+    #[test]
+    fn parses_codesign_identity_fields() {
+        let output = "Executable=/Applications/App.app\nIdentifier=com.example.app\nTeamIdentifier=ABCDE12345\n";
+        assert_eq!(
+            signing_field(output, "Identifier=").as_deref(),
+            Some("com.example.app")
+        );
+        assert_eq!(
+            signing_field(output, "TeamIdentifier=").as_deref(),
+            Some("ABCDE12345")
+        );
+    }
+
+    #[test]
+    fn rejects_archive_traversal_and_backslashes() {
+        assert!(validate_archive_listing("App.app/Contents/MacOS/App\n").is_ok());
+        assert!(validate_archive_listing("../escape\n").is_err());
+        assert!(validate_archive_listing("App.app/../../escape\n").is_err());
+        assert!(validate_archive_listing("..\\escape\n").is_err());
+        assert!(validate_archive_listing("/absolute/path\n").is_err());
+    }
+}
+
+fn copy_app(src: &str, destination: &Path) -> Result<(), String> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "Destination de mise à jour invalide".to_string())?;
+    let nonce = uuid::Uuid::new_v4();
+    let staging = parent.join(format!(".burrow-update-{nonce}.app"));
+    let backup = parent.join(format!(".burrow-backup-{nonce}.app"));
+
+    let copy = Command::new("/usr/bin/ditto")
+        .arg(src)
+        .arg(&staging)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !copy.status.success() {
+        let _ = fs::remove_dir_all(&staging);
+        let command = format!(
+            "/bin/rm -rf {stage} && /usr/bin/ditto {source} {stage}",
+            stage = guard::posix_shell_quote(&staging.to_string_lossy()),
+            source = guard::posix_shell_quote(src),
+        );
+        run_admin_sh(&command)?;
+    }
+
+    if let Err(error) = validate_update_bundle(destination, &staging) {
+        let cleanup = format!(
+            "/bin/rm -rf {}",
+            guard::posix_shell_quote(&staging.to_string_lossy())
+        );
+        if fs::remove_dir_all(&staging).is_err() {
+            let _ = run_admin_sh(&cleanup);
+        }
+        return Err(error);
+    }
+
+    if fs::rename(destination, &backup).is_ok() {
+        if fs::rename(&staging, destination).is_ok() {
+            let _ = fs::remove_dir_all(&backup);
+            return Ok(());
+        }
+        let _ = fs::rename(&backup, destination);
+        let _ = fs::remove_dir_all(&staging);
+        return Err("Remplacement atomique échoué ; application d'origine restaurée".to_string());
+    }
+
+    let destination_q = guard::posix_shell_quote(&destination.to_string_lossy());
+    let staging_q = guard::posix_shell_quote(&staging.to_string_lossy());
+    let backup_q = guard::posix_shell_quote(&backup.to_string_lossy());
+    let command = format!(
+        "/bin/mv {destination_q} {backup_q} && \
+         if /bin/mv {staging_q} {destination_q}; then \
+           /bin/rm -rf {backup_q}; \
+         else \
+           /bin/mv {backup_q} {destination_q}; exit 1; \
+         fi"
+    );
+    run_admin_sh(&command)
 }
 
 #[tauri::command]
@@ -5571,15 +6035,15 @@ fn install_sparkle_update(
             };
         }
 
-        // Valider les entrées avant toute opération
-        if let Err(e) = guard::validate_update_url(&download_url) {
-            out!(format!("✗ URL refusée : {}", e));
-            done!(false);
-        }
-        if let Err(e) = guard::validate_update_app_path(&app_path) {
-            out!(format!("✗ Chemin d'application refusé : {}", e));
-            done!(false);
-        }
+        // Recalculer la mise à jour côté backend. Le frontend ne peut pas
+        // substituer une URL ou une application arbitraire.
+        let app_path = match authorize_sparkle_update(&name, &download_url, &app_path) {
+            Ok(path) => path,
+            Err(e) => {
+                out!(format!("✗ Mise à jour refusée : {e}"));
+                done!(false);
+            }
+        };
 
         let work_dir = match burrow_tempdir() {
             Ok(d) => d,
@@ -5597,13 +6061,19 @@ fn install_sparkle_update(
         out!(format!("Téléchargement de {}…", name));
 
         // --fail : curl retourne une erreur si le serveur répond 4xx/5xx
-        let ok_dl = Command::new("curl")
+        let ok_dl = Command::new("/usr/bin/curl")
             .args([
                 "-s",
                 "-L",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
                 "--fail",
                 "--max-time",
                 "120",
+                "--max-filesize",
+                "2147483648",
                 "-A",
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X)",
                 "-o",
@@ -5622,14 +6092,14 @@ fn install_sparkle_update(
         // Vérification de taille — une app Mac fait au moins 500 Ko
         let file_size = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
         out!(format!("Taille : {:.1} Mo", file_size as f64 / 1_048_576.0));
-        if file_size < 500_000 {
+        if !(500_000..=2_147_483_648).contains(&file_size) {
             out!("✗ Fichier trop petit — probable page d'erreur ou redirect invalide");
             let _ = fs::remove_file(&tmp);
             done!(false);
         }
 
         // Détecter le format depuis le contenu réel du fichier (pas l'URL)
-        let mime = Command::new("file")
+        let mime = Command::new("/usr/bin/file")
             .args(["-b", "--mime-type", &tmp])
             .output()
             .ok()
@@ -5640,7 +6110,7 @@ fn install_sparkle_update(
         // Les DMG UDBZ sont compressés en bzip2 et signalés comme application/x-bzip2 :
         // hdiutil imageinfo le détecte correctement.
         let ext = if mime.contains("bzip2") {
-            let is_dmg = Command::new("hdiutil")
+            let is_dmg = Command::new("/usr/bin/hdiutil")
                 .args(["imageinfo", &tmp])
                 .output()
                 .map(|o| o.status.success())
@@ -5676,31 +6146,26 @@ fn install_sparkle_update(
         let tmp = tmp_ext;
 
         // Quit app if running
-        if Command::new("pgrep")
+        if Command::new("/usr/bin/pgrep")
             .args(["-x", &name])
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
         {
             out!(format!("Fermeture de {}…", name));
-            let _ = Command::new("osascript")
-                .args(["-e", &format!("quit app \"{}\"", name)])
-                .output();
+            quit_application(&name);
             std::thread::sleep(Duration::from_secs(1));
         }
 
-        let install_dir = std::path::Path::new(&app_path)
+        let install_dir = app_path
             .parent()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "/Applications".to_string());
 
         let ok = match ext {
             "pkg" => {
-                out!("Installation du package…");
-                {
-                    let q = guard::posix_shell_quote(&tmp);
-                    run_admin_sh(&format!("installer -pkg {} -target /", q)).is_ok()
-                }
+                out!("✗ Les packages PKG ne peuvent pas être reliés de façon sûre à l'application installée");
+                false
             }
             "zip" | "tar.gz" | "tar.bz2" | "tar.xz" => {
                 let tmp_dir = work_dir
@@ -5709,15 +6174,19 @@ fn install_sparkle_update(
                     .to_string_lossy()
                     .into_owned();
                 fs::create_dir_all(&tmp_dir).ok();
+                if let Err(e) = validate_archive_entries(Path::new(&tmp), ext) {
+                    out!(format!("✗ Archive refusée : {e}"));
+                    done!(false);
+                }
                 out!("Extraction de l'archive…");
                 let ok_x = if ext == "zip" {
-                    Command::new("unzip")
+                    Command::new("/usr/bin/unzip")
                         .args(["-q", "-o", &tmp, "-d", &tmp_dir])
                         .status()
                         .map(|s| s.success())
                         .unwrap_or(false)
                 } else {
-                    Command::new("tar")
+                    Command::new("/usr/bin/tar")
                         .args(["-xf", &tmp, "-C", &tmp_dir])
                         .status()
                         .map(|s| s.success())
@@ -5739,7 +6208,12 @@ fn install_sparkle_update(
                     "Installation de {}…",
                     app_src.as_deref().unwrap_or("")
                 ));
-                let result = match copy_app(app_src.as_deref().unwrap(), &install_dir) {
+                let app_src = app_src.as_deref().unwrap();
+                if let Err(e) = validate_update_bundle(&app_path, Path::new(app_src)) {
+                    out!(format!("✗ Mise à jour non authentique : {e}"));
+                    done!(false);
+                }
+                let result = match copy_app(app_src, &app_path) {
                     Ok(()) => true,
                     Err(e) => {
                         out!(format!("✗ Copie échouée : {}", e));
@@ -5763,8 +6237,8 @@ fn install_sparkle_update(
                 out!("Montage du DMG…");
                 // Sans -plist/-quiet : la sortie texte contient le point de montage
                 // sous la forme "/dev/diskN\ttype\t/Volumes/..."
-                let mount_out = Command::new("hdiutil")
-                    .args(["attach", &tmp, "-nobrowse"])
+                let mount_out = Command::new("/usr/bin/hdiutil")
+                    .args(["attach", &tmp, "-readonly", "-nobrowse"])
                     .output();
 
                 let Ok(mo) = mount_out else {
@@ -5816,15 +6290,22 @@ fn install_sparkle_update(
                 let app_src = find_app_bundle(mp);
                 let Some(ref src) = app_src else {
                     out!("✗ Aucune .app trouvée dans le volume");
-                    let _ = Command::new("hdiutil")
+                    let _ = Command::new("/usr/bin/hdiutil")
                         .args(["detach", mp, "-quiet"])
                         .status();
                     let _ = fs::remove_file(&tmp);
                     done!(false);
                 };
+                if let Err(e) = validate_update_bundle(&app_path, Path::new(src)) {
+                    out!(format!("✗ Mise à jour non authentique : {e}"));
+                    let _ = Command::new("/usr/bin/hdiutil")
+                        .args(["detach", mp, "-quiet"])
+                        .status();
+                    done!(false);
+                }
                 out!(format!("Copie de {} → {}…", src, install_dir));
 
-                let result = match copy_app(src, &install_dir) {
+                let result = match copy_app(src, &app_path) {
                     Ok(()) => true,
                     Err(e) => {
                         out!(format!("✗ Copie échouée : {}", e));
@@ -5833,7 +6314,7 @@ fn install_sparkle_update(
                 };
 
                 out!("Démontage…");
-                let _ = Command::new("hdiutil")
+                let _ = Command::new("/usr/bin/hdiutil")
                     .args(["detach", mp, "-quiet"])
                     .status();
                 result
@@ -5863,7 +6344,7 @@ pub struct VolumeInfo {
 }
 
 fn volume_space(path: &str) -> (f64, f64) {
-    let out = Command::new("df").args(["-k", path]).output().ok();
+    let out = Command::new("/bin/df").args(["-k", path]).output().ok();
     let out = match out {
         Some(o) => o,
         None => return (0.0, 0.0),
@@ -5915,7 +6396,7 @@ fn burrow_smc_apply(app: &tauri::AppHandle, mode: u8, percent: u8) -> Result<(),
 
     // Try with sudo -n (passwordless via sudoers)
     if std::path::Path::new(SUDOERS_PATH).exists() {
-        let out = Command::new("sudo")
+        let out = Command::new("/usr/bin/sudo")
             .args([
                 "-n",
                 &smc_path,
@@ -5935,7 +6416,7 @@ fn burrow_smc_apply(app: &tauri::AppHandle, mode: u8, percent: u8) -> Result<(),
 fn pmset_run(args: &[&str]) -> Result<(), String> {
     // Passwordless si sudoers est configuré (fan mode setup)
     if std::path::Path::new(SUDOERS_PATH).exists() {
-        let mut cmd = Command::new("sudo");
+        let mut cmd = Command::new("/usr/bin/sudo");
         cmd.arg("-n").arg("/usr/bin/pmset").args(args);
         if cmd.output().map(|o| o.status.success()).unwrap_or(false) {
             return Ok(());
@@ -5954,39 +6435,7 @@ fn check_system_permissions() -> bool {
 /// Obtient le nom d'utilisateur courant via l'API POSIX (pas $USER).
 /// $USER peut être forgé par le frontend — on utilise getpwuid(getuid()).
 fn current_username() -> Result<String, String> {
-    // SAFETY: getuid() et getpwuid_r() sont thread-safe sur macOS.
-    let uid = unsafe { libc::getuid() };
-    let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
-    let mut buf = vec![0i8; 1024];
-    let mut result: *mut libc::passwd = std::ptr::null_mut();
-    let ret = unsafe {
-        libc::getpwuid_r(
-            uid,
-            pwd.as_mut_ptr(),
-            buf.as_mut_ptr(),
-            buf.len(),
-            &mut result,
-        )
-    };
-    if ret != 0 || result.is_null() {
-        return Err(format!("getpwuid_r échoué (errno {})", ret));
-    }
-    let pw = unsafe { &*result };
-    let name = unsafe { std::ffi::CStr::from_ptr(pw.pw_name) }
-        .to_str()
-        .map_err(|_| "Nom d'utilisateur non-UTF-8".to_string())?
-        .to_string();
-    if name.is_empty() {
-        return Err("Nom d'utilisateur vide".to_string());
-    }
-    // Validation : uniquement alphanumériques + _ + - (noms macOS standard)
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err(format!("Nom d'utilisateur suspect : {:?}", name));
-    }
-    Ok(name)
+    current_user_record().map(|(name, _)| name)
 }
 
 /// One-time setup: admin dialog installs burrow-smc to fixed path + writes sudoers for
@@ -5995,12 +6444,11 @@ fn current_username() -> Result<String, String> {
 fn setup_system_permissions(app: tauri::AppHandle) -> Result<(), String> {
     let username = current_username()?;
 
-    // Find bundled burrow-smc binary
     let bundled = find_burrow_smc_bundled(&app).unwrap_or_else(|| BURROW_SMC_INSTALL.to_string());
-
     let mole_line = if std::path::Path::new(MOLE_SMC).exists() {
         format!(
-            "{u} ALL=(root) NOPASSWD: {s}\\n",
+            "{u} ALL=(root) NOPASSWD: {s} apply 0 0\\n\
+{u} ALL=(root) NOPASSWD: {s} apply 1 60\\n",
             u = username,
             s = MOLE_SMC
         )
@@ -6008,25 +6456,30 @@ fn setup_system_permissions(app: tauri::AppHandle) -> Result<(), String> {
         String::new()
     };
 
-    // Quoting POSIX correct via guard::posix_shell_quote
     let q_bundled = guard::posix_shell_quote(&bundled);
-
-    // In the admin shell: copy burrow-smc to fixed location, write sudoers, run pmset to test
+    let temp_sudoers = "/etc/sudoers.d/.burrow-pmset.tmp";
     let shell_cmd = format!(
-        "mkdir -p /usr/local/lib && \
-         cp -f {bundled} {smc} && \
-         chmod 755 {smc} && \
-         printf '{u} ALL=(root) NOPASSWD: /usr/bin/pmset\\n\
-{u} ALL=(root) NOPASSWD: /usr/bin/powermetrics\\n\
-{u} ALL=(root) NOPASSWD: {smc}\\n\
-{mole}' > {p} && \
-         chmod 440 {p} && \
+        "/bin/mkdir -p /usr/local/lib && \
+         /bin/cp -f {bundled} {smc} && \
+         /bin/chmod 755 {smc} && \
+         /bin/rm -f {tmp} && \
+         /usr/bin/printf '{u} ALL=(root) NOPASSWD: /usr/bin/pmset -a lowpowermode 0\\n\
+{u} ALL=(root) NOPASSWD: /usr/bin/pmset -a lowpowermode 1\\n\
+{u} ALL=(root) NOPASSWD: /usr/bin/pmset -a lowpowermode 0 disksleep 0 sleep 0\\n\
+{u} ALL=(root) NOPASSWD: /usr/bin/powermetrics -n 1 -i 200 --samplers smc\\n\
+{u} ALL=(root) NOPASSWD: {smc} apply 0 0\\n\
+{u} ALL=(root) NOPASSWD: {smc} apply 1 60\\n\
+{mole}' > {tmp} && \
+         /bin/chmod 440 {tmp} && \
+         /usr/sbin/visudo -cf {tmp} && \
+         /bin/mv -f {tmp} {p} && \
          /usr/bin/pmset -a lowpowermode 0",
         bundled = q_bundled,
         smc = BURROW_SMC_INSTALL,
         u = username,
         mole = mole_line,
         p = SUDOERS_PATH,
+        tmp = temp_sudoers,
     );
 
     run_admin_sh(&shell_cmd).map_err(|e| {
@@ -6044,7 +6497,7 @@ fn mole_smc_apply(mode: u8, percent: u8) -> Result<(), String> {
     if !std::path::Path::new(MOLE_SMC).exists() {
         return Err("mole-smc not found".to_string());
     }
-    let out = Command::new("sudo")
+    let out = Command::new("/usr/bin/sudo")
         .args([
             "-n",
             MOLE_SMC,
@@ -6105,7 +6558,7 @@ fn list_volumes() -> Vec<VolumeInfo> {
             continue;
         }
         // skip DMG/disk image mounts (Protocol: Disk Image)
-        let is_dmg = Command::new("diskutil")
+        let is_dmg = Command::new("/usr/sbin/diskutil")
             .args(["info", &path])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("Disk Image"))
@@ -6127,7 +6580,7 @@ fn list_volumes() -> Vec<VolumeInfo> {
 // Read fan speed from powermetrics SMC sampler (requires sudoers), or fall back to mo cache.
 fn sample_fan_rpm() -> u32 {
     if std::path::Path::new(SUDOERS_PATH).exists() {
-        if let Ok(out) = Command::new("sudo")
+        if let Ok(out) = Command::new("/usr/bin/sudo")
             .args([
                 "-n",
                 "/usr/bin/powermetrics",
@@ -6331,7 +6784,7 @@ fn get_quick_metrics() -> QuickMetrics {
 // ── Storage analysis (Stockage) ───────────────────────────────────────────────
 
 fn du_bytes(path: &Path) -> u64 {
-    Command::new("du")
+    Command::new("/usr/bin/du")
         .args(["-sk", &path.to_string_lossy()])
         .output()
         .ok()
@@ -6619,6 +7072,9 @@ fn get_dev_caches() -> Vec<DevCache> {
         .filter_map(|h| h.join().ok().flatten())
         .collect();
     result.sort_by_key(|k| std::cmp::Reverse(k.size_bytes));
+    for cache in &result {
+        grant_path(Path::new(&cache.path), PathGrantPurpose::Trash);
+    }
     result
 }
 
@@ -6764,6 +7220,9 @@ fn get_project_artifacts() -> Vec<ProjectArtifact> {
         .collect();
     all.sort_by_key(|k| std::cmp::Reverse(k.size_bytes));
     all.truncate(150);
+    for artifact in &all {
+        grant_path(Path::new(&artifact.artifact_path), PathGrantPurpose::Trash);
+    }
     all
 }
 
@@ -6796,7 +7255,7 @@ fn get_large_files() -> Vec<LargeFile> {
     }
     let mut args: Vec<String> = dirs;
     args.extend(["-type".into(), "f".into(), "-size".into(), "+100M".into()]);
-    let Ok(out) = Command::new("find").args(&args).output() else {
+    let Ok(out) = Command::new("/usr/bin/find").args(&args).output() else {
         return vec![];
     };
     let text = String::from_utf8_lossy(&out.stdout);
@@ -6827,12 +7286,15 @@ fn get_large_files() -> Vec<LargeFile> {
         .collect();
     files.sort_by_key(|k| std::cmp::Reverse(k.size_bytes));
     files.truncate(100);
+    for file in &files {
+        grant_path(Path::new(&file.path), PathGrantPurpose::Trash);
+    }
     files
 }
 
 #[tauri::command]
 fn empty_trash() -> Result<(), String> {
-    let out = Command::new("osascript")
+    let out = Command::new("/usr/bin/osascript")
         .args(["-e", r#"tell application "Finder" to empty trash"#])
         .output()
         .map_err(|e| e.to_string())?;
@@ -6919,7 +7381,7 @@ fn get_derived_data_projects() -> Vec<DerivedDataProject> {
 
 #[tauri::command]
 fn is_xcode_running() -> bool {
-    Command::new("pgrep")
+    Command::new("/usr/bin/pgrep")
         .args(["-x", "Xcode"])
         .output()
         .map(|o| o.status.success())
@@ -7233,7 +7695,7 @@ fn get_disk_breakdown(path: String) -> Vec<DiskEntry> {
     if !dir_paths.is_empty() {
         let mut args = vec!["-s".to_string(), "-k".to_string(), "--".to_string()];
         args.extend(dir_paths);
-        if let Ok(out) = Command::new("du").args(&args).output() {
+        if let Ok(out) = Command::new("/usr/bin/du").args(&args).output() {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 if let Some((kb_str, path_str)) = line.split_once('\t') {
                     if let Ok(kb) = kb_str.trim().parse::<u64>() {
@@ -7275,12 +7737,15 @@ fn get_disk_breakdown(path: String) -> Vec<DiskEntry> {
 #[tauri::command]
 async fn get_installed_casks() -> Vec<String> {
     tauri::async_runtime::spawn_blocking(|| {
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = home_dir().to_string_lossy().into_owned();
+        let Some(brew) = find_brew() else {
+            return Vec::new();
+        };
 
         // `brew info --installed --cask --json=v2` returns metadata for every installed cask,
         // including the exact artifact (.app) names. We cross-check with the filesystem so
         // that apps deleted outside of brew (e.g. via UninstallTab) no longer appear.
-        let info = Command::new("brew")
+        let info = Command::new(&brew)
             .args(["info", "--installed", "--cask", "--json=v2"])
             .output();
 
@@ -7335,7 +7800,7 @@ async fn get_installed_casks() -> Vec<String> {
         }
 
         // Fallback: plain list (no filesystem check)
-        Command::new("brew")
+        Command::new(&brew)
             .args(["list", "--cask"])
             .output()
             .map(|o| {
@@ -7353,8 +7818,13 @@ async fn get_installed_casks() -> Vec<String> {
 
 #[tauri::command]
 async fn install_brew_cask(token: String) -> Result<(), String> {
+    guard::validate_brew_token(&token)?;
+    if !cask_api().by_token.contains_key(&token) {
+        return Err("Cask absent du catalogue Homebrew backend".to_string());
+    }
+    let brew = find_brew().ok_or_else(|| "Homebrew introuvable".to_string())?;
     let result = tauri::async_runtime::spawn_blocking(move || {
-        Command::new("brew")
+        Command::new(brew)
             .args(["reinstall", "--cask", &token])
             .output()
             .map_err(|e| format!("Impossible d'exécuter brew: {}", e))
@@ -7384,7 +7854,7 @@ pub struct UniversalBinaryEntry {
 }
 
 fn is_universal_binary(path: &Path) -> bool {
-    let Ok(out) = Command::new("file").arg(path).output() else {
+    let Ok(out) = Command::new("/usr/bin/file").arg(path).output() else {
         return false;
     };
     let s = String::from_utf8_lossy(&out.stdout);
@@ -7450,39 +7920,6 @@ async fn scan_universal_binaries() -> Vec<UniversalBinaryEntry> {
     })
     .await
     .unwrap_or_default()
-}
-
-#[tauri::command]
-async fn thin_binary(binary_path: String) -> Result<u64, String> {
-    // Validation : uniquement les binaires dans /Applications
-    guard::validate_thin_binary_path(&binary_path)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let original_size = fs::metadata(&binary_path).map(|m| m.len()).unwrap_or(0);
-        let tmp_path = format!("{}.burrow_thin", binary_path);
-        // lipo utilise Command::arg() — aucune interpolation shell
-        let out = Command::new("lipo")
-            .args(["-remove", "x86_64", &binary_path, "-output", &tmp_path])
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-        }
-        if fs::rename(&tmp_path, &binary_path).is_ok() {
-            let new_size = fs::metadata(&binary_path).map(|m| m.len()).unwrap_or(0);
-            return Ok(original_size.saturating_sub(new_size));
-        }
-        // Fallback admin copy avec quoting POSIX correct
-        let q_tmp = guard::posix_shell_quote(&tmp_path);
-        let q_bin = guard::posix_shell_quote(&binary_path);
-        let script = format!("cp {} {} && chmod 755 {}", q_tmp, q_bin, q_bin);
-        run_admin_sh(&script)?;
-        let _ = fs::remove_file(&tmp_path);
-        let new_size = fs::metadata(&binary_path).map(|m| m.len()).unwrap_or(0);
-        Ok(original_size.saturating_sub(new_size))
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 // ── Login Items / LaunchAgents ─────────────────────────────────────────────────
@@ -7606,6 +8043,9 @@ fn scan_login_items() -> Vec<LoginItemEntry> {
             .cmp(&a.is_suspicious)
             .then(b.is_broken.cmp(&a.is_broken))
     });
+    for entry in &results {
+        grant_path(Path::new(&entry.plist_path), PathGrantPurpose::LaunchItem);
+    }
     results
 }
 
@@ -7626,6 +8066,9 @@ fn bundle_prefix(plist_path: &str) -> String {
 
 #[tauri::command]
 fn find_related_launch_items(plist_path: String) -> Vec<String> {
+    if require_path_grant(&plist_path, PathGrantPurpose::LaunchItem).is_err() {
+        return vec![];
+    }
     let prefix = bundle_prefix(&plist_path);
     if prefix.is_empty() {
         return vec![];
@@ -7652,6 +8095,7 @@ fn find_related_launch_items(plist_path: String) -> Vec<String> {
             }
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             if stem.starts_with(&prefix) {
+                grant_path(&path, PathGrantPurpose::LaunchItem);
                 results.push(path_str);
             }
         }
@@ -7668,16 +8112,28 @@ fn delete_launch_items(plist_paths: Vec<String>) -> Result<(), String> {
 
     for p in &plist_paths {
         // Valider chaque chemin contre les répertoires LaunchAgents/LaunchDaemons connus
-        if let Err(e) = guard::validate_launch_item_path(p) {
+        let canonical = match require_path_grant(p, PathGrantPurpose::LaunchItem) {
+            Ok(path) => path,
+            Err(e) => {
+                errors.push(format!("{}: {}", p, e));
+                continue;
+            }
+        };
+        let canonical_str = canonical.to_string_lossy().into_owned();
+        if let Err(e) = guard::validate_launch_item_path(&canonical_str) {
             errors.push(format!("{}: {}", p, e));
             continue;
         }
-        if p.starts_with(&home_str) {
+        if canonical_str.starts_with(&home_str) {
             // User-level: pas besoin d'admin, Command::arg() — aucune interpolation
-            let _ = Command::new("launchctl").args(["unload", "-w", p]).output();
-            let _ = fs::remove_file(p);
+            let _ = Command::new("/bin/launchctl")
+                .args(["unload", "-w", &canonical_str])
+                .output();
+            if let Err(e) = fs::remove_file(&canonical) {
+                errors.push(format!("{}: {}", canonical.display(), e));
+            }
         } else {
-            sys_paths.push(p.clone());
+            sys_paths.push(canonical_str);
         }
     }
 
@@ -7693,7 +8149,10 @@ fn delete_launch_items(plist_paths: Vec<String>) -> Result<(), String> {
         .iter()
         .map(|p| {
             let q = guard::posix_shell_quote(p);
-            format!("launchctl unload -w {} 2>/dev/null; rm -f {}", q, q)
+            format!(
+                "/bin/launchctl unload -w {} 2>/dev/null; /bin/rm -f {}",
+                q, q
+            )
         })
         .collect();
     run_admin_sh(&sys_cmds.join("; "))
@@ -7706,10 +8165,12 @@ fn delete_login_item(plist_path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn toggle_login_item(plist_path: String, enable: bool) -> Result<(), String> {
+    let canonical = require_path_grant(&plist_path, PathGrantPurpose::LaunchItem)?;
+    let plist_path = canonical.to_string_lossy().into_owned();
     guard::validate_launch_item_path(&plist_path)?;
     let action = if enable { "load" } else { "unload" };
     // Command::arg() — aucune interpolation shell
-    let out = Command::new("launchctl")
+    let out = Command::new("/bin/launchctl")
         .args([action, "-w", &plist_path])
         .output()
         .map_err(|e| e.to_string())?;
@@ -7718,7 +8179,7 @@ fn toggle_login_item(plist_path: String, enable: bool) -> Result<(), String> {
     }
     // Fallback admin avec quoting POSIX correct
     let q = guard::posix_shell_quote(&plist_path);
-    run_admin_sh(&format!("launchctl {} -w {}", action, q))
+    run_admin_sh(&format!("/bin/launchctl {} -w {}", action, q))
 }
 
 // ── Deleted Users ──────────────────────────────────────────────────────────────
@@ -7732,7 +8193,7 @@ pub struct DeletedUserEntry {
 
 #[tauri::command]
 fn scan_deleted_users() -> Vec<DeletedUserEntry> {
-    let dscl_out = Command::new("dscl")
+    let dscl_out = Command::new("/usr/bin/dscl")
         .args([".", "list", "/Users"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
@@ -8043,8 +8504,8 @@ fn posix_applescript_string(shell_cmd: &str) -> String {
 fn run_admin_sh(script: &str) -> Result<(), String> {
     // -n : non-interactif — réussit uniquement si Touch ID / sudo_local est configuré,
     // échoue immédiatement sinon (pas de prompt terminal depuis une app GUI)
-    let sudo_ok = Command::new("sudo")
-        .args(["-n", "sh", "-c", script])
+    let sudo_ok = Command::new("/usr/bin/sudo")
+        .args(["-n", "/bin/sh", "-c", script])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
@@ -8055,7 +8516,7 @@ fn run_admin_sh(script: &str) -> Result<(), String> {
     // Fallback : dialog mot de passe via osascript
     let esc = script.replace('\\', "\\\\").replace('"', "\\\"");
     let applescript = format!("do shell script \"{}\" with administrator privileges", esc);
-    let output = Command::new("osascript")
+    let output = Command::new("/usr/bin/osascript")
         .args(["-e", &applescript])
         .output()
         .map_err(|e| e.to_string())?;
@@ -8066,187 +8527,125 @@ fn run_admin_sh(script: &str) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-fn setup_pam_touchid() -> Result<(), String> {
-    // Configure /etc/pam.d/sudo_local pour activer Touch ID avec sudo (macOS Ventura+)
-    let pam_local = "/etc/pam.d/sudo_local";
-    let pam_tid_line = "auth       sufficient     pam_tid.so";
+// ── Touch ID (helper arm64 précompilé et signé avec le bundle) ───────────────
 
-    // Vérifier si pam_tid.so est déjà présent dans le fichier — no-op si c'est le cas
-    if std::path::Path::new(pam_local).exists() {
-        let content = std::fs::read_to_string(pam_local).unwrap_or_default();
-        if content.lines().any(|l| {
-            let l = l.trim();
-            !l.starts_with('#') && l.contains("pam_tid.so")
-        }) {
-            return Ok(());
-        }
-        // Fichier existant sans pam_tid.so : préfixer pour que la règle soit évaluée en premier
-        // (auth sufficient arrête l'évaluation si Touch ID réussit)
-        let new_content = format!(
-            "# Burrow : Touch ID pour sudo (ajouté automatiquement)\n{}\n{}",
-            pam_tid_line, content
-        );
-        // Écriture atomique via fichier temporaire dans /etc/pam.d
-        let tmp = "/etc/pam.d/sudo_local.burrow_tmp";
-        let shell_cmd = format!(
-            "printf %s {} > {} && mv {} {}",
-            guard::posix_shell_quote(&new_content),
-            tmp,
-            tmp,
-            pam_local
-        );
-        let applescript = format!(
-            "do shell script {} with administrator privileges",
-            posix_applescript_string(&shell_cmd)
-        );
-        let out = Command::new("osascript")
-            .args(["-e", &applescript])
-            .output()
-            .map_err(|e| e.to_string())?;
-        return if out.status.success() {
-            Ok(())
-        } else {
-            Err("Échec de la mise à jour de /etc/pam.d/sudo_local".to_string())
+fn touchid_binary(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let resource = app
+        .path()
+        .resource_dir()
+        .map_err(|e| e.to_string())?
+        .join("burrow-touchid");
+    if resource.is_file() {
+        return Ok(resource);
+    }
+
+    // Fallback de développement lorsque Tauri n'a pas encore copié les ressources.
+    let development = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join("burrow-touchid");
+    if development.is_file() {
+        Ok(development)
+    } else {
+        Err("Helper Touch ID embarqué introuvable".to_string())
+    }
+}
+
+fn validate_touchid_reason(reason: &str) -> Result<(), String> {
+    if reason.trim().is_empty() || reason.chars().count() > 200 || reason.contains('\0') {
+        return Err("Motif Touch ID invalide".to_string());
+    }
+    Ok(())
+}
+
+fn run_touchid(app: &tauri::AppHandle, reason: &str) -> Result<(), String> {
+    validate_touchid_reason(reason)?;
+    let output = Command::new(touchid_binary(app)?)
+        .arg(reason)
+        .output()
+        .map_err(|e| format!("Erreur d'exécution Touch ID : {e}"))?;
+    match output.status.code() {
+        Some(0) => Ok(()),
+        Some(2) => Err("Touch ID non disponible sur cet appareil".to_string()),
+        _ => Err("Authentification refusée ou annulée".to_string()),
+    }
+}
+
+fn touchid_setting_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|dir| dir.join("security").join("touchid-enabled"))
+        .map_err(|e| e.to_string())
+}
+
+fn touchid_enabled(app: &tauri::AppHandle) -> bool {
+    touchid_setting_path(app)
+        .ok()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|value| value.trim() == "enabled")
+        .unwrap_or(false)
+}
+
+fn write_touchid_setting(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = touchid_setting_path(app)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Chemin de configuration Touch ID invalide".to_string())?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+
+    if !enabled {
+        return match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
         };
     }
 
-    // Fichier inexistant : créer avec le contenu minimal recommandé
-    let new_content = format!(
-        "# sudo_local: local config file which survives system update\n# Burrow : Touch ID pour sudo\n{}\n",
-        pam_tid_line
-    );
-    let shell_cmd = format!(
-        "printf %s {} > {}",
-        guard::posix_shell_quote(&new_content),
-        pam_local
-    );
-    let applescript = format!(
-        "do shell script {} with administrator privileges",
-        posix_applescript_string(&shell_cmd)
-    );
-    let output = Command::new("osascript")
-        .args(["-e", &applescript])
-        .output()
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|e| e.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err("Échec de la configuration PAM Touch ID — mot de passe requis".to_string())
-    }
-}
-
-// ── Touch ID (LocalAuthentication via ObjC helper) ──────────────────────────
-//
-// TODO(P0.5): Ce helper est compilé depuis une source ObjC à l'exécution (nécessite clang/Xcode CLT).
-// La solution propre est de pré-compiler, signer et embarquer le binaire au build.
-// En attendant, on utilise un répertoire temporaire aléatoire (RAII via TempDir).
-// Le binaire est recréé à chaque lancement (le TempDir est supprimé à la destruction).
-
-static TOUCHID_DIR: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
-
-fn touchid_dir() -> &'static Mutex<Option<std::path::PathBuf>> {
-    TOUCHID_DIR.get_or_init(|| Mutex::new(None))
-}
-
-fn get_or_build_touchid_binary() -> Option<std::path::PathBuf> {
-    // Double-checked lock : on compile une seule fois par processus.
-    {
-        let guard = touchid_dir().lock().unwrap();
-        if let Some(ref dir) = *guard {
-            let bin = dir.join("touchid");
-            if bin.exists() {
-                return Some(bin);
-            }
-        }
-    }
-
-    // Créer un dossier temporaire privé pour la compilation
-    let tmp_dir = burrow_tempdir().ok()?;
-    let src_path = tmp_dir.path().join("touchid.m");
-    let bin_path = tmp_dir.path().join("touchid");
-
-    let src = r#"#import <Foundation/Foundation.h>
-#import <LocalAuthentication/LocalAuthentication.h>
-
-int main(int argc, char *argv[]) {
-    @autoreleasepool {
-        BOOL check_only = (argc > 1 && strcmp(argv[1], "--check") == 0);
-        NSString *reason = (!check_only && argc > 1)
-            ? [NSString stringWithUTF8String:argv[1]]
-            : @"Burrow demande votre autorisation";
-        LAContext *ctx = [[LAContext alloc] init];
-        NSError *err = nil;
-        if (![ctx canEvaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics error:&err]) {
-            return 2; /* Touch ID indisponible */
-        }
-        if (check_only) { return 0; }
-        dispatch_semaphore_t sema = dispatch_semaphore_create(0);
-        __block BOOL ok = NO;
-        [ctx evaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics
-            localizedReason:reason
-                      reply:^(BOOL result, NSError *e) {
-            ok = result;
-            dispatch_semaphore_signal(sema);
-        }];
-        dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
-        return ok ? 0 : 1;
-    }
-}
-"#;
-    std::fs::write(&src_path, src).ok()?;
-    let status = Command::new("clang")
-        .args([
-            "-framework",
-            "Foundation",
-            "-framework",
-            "LocalAuthentication",
-            "-fobjc-arc",
-        ])
-        .arg(&src_path)
-        .arg("-o")
-        .arg(&bin_path)
-        .status()
-        .ok()?;
-    let _ = std::fs::remove_file(&src_path);
-    if !status.success() {
-        return None;
-    }
-
-    // Mémoriser le chemin du binaire; conserver le TempDir via son chemin
-    // (on convertit en PathBuf pour éviter de dropper tmp_dir)
-    let dir_path = tmp_dir.keep(); // keep() → ne supprime plus le dossier à la destruction
-    *touchid_dir().lock().unwrap() = Some(dir_path.clone());
-    Some(dir_path.join("touchid"))
+    temporary
+        .write_all(b"enabled\n")
+        .map_err(|e| e.to_string())?;
+    temporary.as_file().sync_all().map_err(|e| e.to_string())?;
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|e| e.error.to_string())
 }
 
 #[tauri::command]
-fn check_touch_id_available() -> bool {
-    let Some(bin) = get_or_build_touchid_binary() else {
-        return false;
-    };
-    Command::new(bin)
-        .arg("--check")
-        .status()
-        .map(|s| s.success())
+fn check_touch_id_available(app: tauri::AppHandle) -> bool {
+    touchid_binary(&app)
+        .ok()
+        .and_then(|binary| Command::new(binary).arg("--check").status().ok())
+        .map(|status| status.success())
         .unwrap_or(false)
 }
 
 #[tauri::command]
-async fn authenticate_touch_id(reason: String) -> Result<(), String> {
+fn get_touch_id_enabled(app: tauri::AppHandle) -> bool {
+    touchid_enabled(&app)
+}
+
+#[tauri::command]
+async fn set_touch_id_enabled(app: tauri::AppHandle, enable: bool) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let bin = get_or_build_touchid_binary().ok_or_else(|| {
-            "Impossible de préparer l'outil Touch ID (Xcode CLT requis)".to_string()
-        })?;
-        let output = Command::new(bin)
-            .arg(&reason)
-            .output()
-            .map_err(|e| format!("Erreur d'exécution : {}", e))?;
-        match output.status.code() {
-            Some(0) => Ok(()),
-            Some(2) => Err("Touch ID non disponible sur cet appareil".to_string()),
-            _ => Err("Authentification refusée ou annulée".to_string()),
+        if touchid_enabled(&app) == enable {
+            return Ok(());
         }
+        let reason = if enable {
+            "Activer la protection Touch ID de Burrow"
+        } else {
+            "Désactiver la protection Touch ID de Burrow"
+        };
+        run_touchid(&app, reason)?;
+        write_touchid_setting(&app, enable)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -8256,21 +8655,30 @@ async fn authenticate_touch_id(reason: String) -> Result<(), String> {
 
 #[tauri::command]
 fn get_launch_at_login() -> bool {
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::path::Path::new(&format!(
-        "{}/Library/LaunchAgents/com.burrow.app.plist",
-        home
-    ))
-    .exists()
+    home_dir()
+        .join("Library/LaunchAgents/com.burrow.app.plist")
+        .exists()
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 #[tauri::command]
 fn set_launch_at_login(enable: bool) -> Result<(), String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME non défini".to_string())?;
-    let plist_path = format!("{}/Library/LaunchAgents/com.burrow.app.plist", home);
+    use std::os::unix::fs::PermissionsExt;
+
+    let launch_agents = home_dir().join("Library/LaunchAgents");
+    fs::create_dir_all(&launch_agents).map_err(|e| e.to_string())?;
+    let plist_path = launch_agents.join("com.burrow.app.plist");
     if enable {
         let exe = std::env::current_exe().map_err(|e| format!("Chemin introuvable : {}", e))?;
-        let exe_str = exe.to_string_lossy();
+        let exe_str = xml_escape(&exe.to_string_lossy());
         let plist = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
              <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
@@ -8292,19 +8700,31 @@ fn set_launch_at_login(enable: bool) -> Result<(), String> {
              </dict>\n\
              </plist>"
         );
-        std::fs::write(&plist_path, plist)
-            .map_err(|e| format!("Écriture plist échouée : {}", e))?;
-        let _ = Command::new("launchctl")
-            .args(["load", "-w", &plist_path])
-            .output();
-    } else {
-        if std::path::Path::new(&plist_path).exists() {
-            let _ = Command::new("launchctl")
-                .args(["unload", "-w", &plist_path])
-                .output();
-            std::fs::remove_file(&plist_path)
-                .map_err(|e| format!("Suppression plist échouée : {}", e))?;
+        let mut temp = tempfile::NamedTempFile::new_in(&launch_agents)
+            .map_err(|e| format!("Création plist échouée : {e}"))?;
+        std::io::Write::write_all(&mut temp, plist.as_bytes())
+            .map_err(|e| format!("Écriture plist échouée : {e}"))?;
+        temp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+        temp.persist(&plist_path).map_err(|e| e.error.to_string())?;
+        let output = Command::new("/bin/launchctl")
+            .arg("load")
+            .arg("-w")
+            .arg(&plist_path)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
+    } else if plist_path.exists() {
+        let _ = Command::new("/bin/launchctl")
+            .arg("unload")
+            .arg("-w")
+            .arg(&plist_path)
+            .output();
+        std::fs::remove_file(&plist_path)
+            .map_err(|e| format!("Suppression plist échouée : {}", e))?;
     }
     Ok(())
 }
@@ -8312,8 +8732,6 @@ fn set_launch_at_login(enable: bool) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             start_sysinfo_daemon();
             start_process_daemon(app.handle().clone());
@@ -8333,7 +8751,6 @@ pub fn run() {
             std::thread::spawn(|| {
                 cask_api();           // OnceLock → une seule initialisation
                 get_brew_outdated();  // pré-chauffe le cache brew cask
-                check_mo_update_available(); // pré-chauffe le cache mole update
             });
 
             // ── Menu bar (tray icon) ──────────────────────────────────────────
@@ -8375,12 +8792,12 @@ pub fn run() {
 
                     let last = LAST_NOTIF_PCT.load(Ordering::Relaxed);
                     if pct >= 90 && last < 90 {
-                        let _ = Command::new("osascript")
+                        let _ = Command::new("/usr/bin/osascript")
                             .args(["-e", "display notification \"Votre disque est rempli à plus de 90 %. Nettoyez maintenant.\" with title \"Burrow\""])
                             .output();
                         LAST_NOTIF_PCT.store(90, Ordering::Relaxed);
                     } else if pct >= 80 && last < 80 {
-                        let _ = Command::new("osascript")
+                        let _ = Command::new("/usr/bin/osascript")
                             .args(["-e", "display notification \"Votre disque est rempli à 80 %.\" with title \"Burrow\""])
                             .output();
                         LAST_NOTIF_PCT.store(80, Ordering::Relaxed);
@@ -8412,18 +8829,17 @@ pub fn run() {
             get_low_power_mode,
             set_low_power_mode,
             get_mo_version,
-            update_mo_cli,
             get_brew_outdated,
             update_brew_app,
             get_folder_top_files,
             find_app_residuals,
-            delete_path,
             get_all_processes,
             kill_process,
             gpu::get_gpu_info,
             check_sparkle_updates,
             check_app_store_updates,
             update_mas_app,
+            open_app_store_url,
             install_sparkle_update,
             check_clamav,
             start_clamav_scan,
@@ -8434,7 +8850,6 @@ pub fn run() {
             restore_from_quarantine,
             delete_from_quarantine,
             pick_folder,
-            check_mo_update_available,
             check_clamav_defs_outdated,
             list_volumes,
             get_quick_metrics,
@@ -8463,13 +8878,12 @@ pub fn run() {
             install_doh_profile,
             get_installed_casks,
             install_brew_cask,
-            setup_pam_touchid,
             check_touch_id_available,
-            authenticate_touch_id,
+            get_touch_id_enabled,
+            set_touch_id_enabled,
             get_launch_at_login,
             set_launch_at_login,
             scan_universal_binaries,
-            thin_binary,
             scan_login_items,
             scan_deleted_users,
             scan_privacy_items,

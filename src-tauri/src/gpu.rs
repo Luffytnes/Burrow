@@ -16,7 +16,7 @@ pub fn get_gpu_info() -> GpuInfo {
         vendor: String::new(),
     };
 
-    let out = match Command::new("system_profiler")
+    let out = match Command::new("/usr/sbin/system_profiler")
         .args(["SPDisplaysDataType", "-json"])
         .output()
     {

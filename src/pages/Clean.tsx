@@ -2233,10 +2233,9 @@ function PrivacyTab({ onToast }: { onToast: (ok: boolean, msg: string) => void }
 
 // ── Tab 6: Binaires universels ────────────────────────────────────────────────
 
-function BinairesTab({ onToast }: { onToast: (ok: boolean, msg: string) => void }) {
+function BinairesTab() {
   const [entries, setEntries] = useState<UniversalBinaryEntry[] | null>(_cache.binaries ?? null);
   const [scanning, setScanning] = useState(!_cache.binaries);
-  const [thinning, setThinning] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setScanning(true);
@@ -2253,28 +2252,6 @@ function BinairesTab({ onToast }: { onToast: (ok: boolean, msg: string) => void 
   useEffect(() => {
     if (!_cache.binaries) load();
   }, [load]);
-
-  const handleThin = async (entry: UniversalBinaryEntry) => {
-    setThinning(entry.path);
-    try {
-      const freed = await invoke<number>("thin_binary", { binaryPath: entry.path });
-      setEntries((prev) =>
-        prev
-          ? prev
-              .map((e) =>
-                e.path === entry.path
-                  ? { ...e, reclaimable_bytes: 0, total_size_bytes: e.total_size_bytes - freed }
-                  : e
-              )
-              .filter((e) => e.reclaimable_bytes > 0)
-          : null
-      );
-      onToast(true, `${fmtBytes(freed)} libérés — ${entry.name}`);
-    } catch (e) {
-      onToast(false, String(e));
-    }
-    setThinning(null);
-  };
 
   const totalReclaimable = (entries ?? []).reduce((s, e) => s + e.reclaimable_bytes, 0);
 
@@ -2319,8 +2296,8 @@ function BinairesTab({ onToast }: { onToast: (ok: boolean, msg: string) => void 
           <strong>Intel x86_64</strong>
           (hérité, exécuté via Rosetta 2). Les apps "universelles" embarquent les deux dans un seul
           fichier — ce qui prend deux fois plus de place. Sur un Mac Apple Silicon, la tranche Intel
-          ne sert jamais et peut être supprimée en toute sécurité pour la grande majorité des
-          applications.
+          ne sert généralement pas sur cette machine. Burrow affiche ici l'espace correspondant à
+          titre informatif.
         </div>
         <div className="flex items-start gap-2.5 pt-1">
           <AlertTriangle
@@ -2328,11 +2305,9 @@ function BinairesTab({ onToast }: { onToast: (ok: boolean, msg: string) => void 
             style={{ color: "var(--warning)", flexShrink: 0, marginTop: 1 }}
           />
           <div className="text-[11px] leading-relaxed" style={{ color: "var(--text-3)" }}>
-            <strong style={{ color: "var(--warning)" }}>Risque faible mais réel</strong> — certaines
-            apps vérifient l'intégrité de leur propre bundle au démarrage (DRM, signature Apple Team
-            ID dans des ressources imbriquées). Dans de rares cas, supprimer la tranche x86_64 peut
-            les empêcher de démarrer. Conseil : testez d'abord sur une app peu critique, et
-            conservez une sauvegarde Time Machine à jour.
+            <strong style={{ color: "var(--warning)" }}>Modification désactivée</strong> — retirer
+            une tranche invalide la signature de l'application et peut l'empêcher de démarrer ou de
+            se mettre à jour. Burrow ne modifie donc pas automatiquement ces binaires.
           </div>
         </div>
       </div>
@@ -2372,22 +2347,9 @@ function BinairesTab({ onToast }: { onToast: (ok: boolean, msg: string) => void 
               >
                 ~{fmtBytes(entry.reclaimable_bytes)}
               </span>
-              <button
-                onClick={() => handleThin(entry)}
-                disabled={thinning !== null || entry.reclaimable_bytes === 0}
-                className="shrink-0 flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all disabled:opacity-40"
-                style={{ background: "var(--accent)", color: "#fff" }}
-              >
-                {thinning === entry.path ? (
-                  <>
-                    <Loader2 size={11} className="animate-spin" /> Alléger…
-                  </>
-                ) : (
-                  <>
-                    <Trash2 size={11} /> Alléger
-                  </>
-                )}
-              </button>
+              <span className="text-[10px]" style={{ color: "var(--text-3)" }}>
+                Informatif
+              </span>
             </div>
           ))}
         </div>
@@ -3429,7 +3391,7 @@ export default function Clean() {
           {mounted.has(5) && <PrivacyTab onToast={showToast} />}
         </div>
         <div style={{ display: tab === 6 ? "block" : "none" }}>
-          {mounted.has(6) && <BinairesTab onToast={showToast} />}
+          {mounted.has(6) && <BinairesTab />}
         </div>
         <div style={{ display: tab === 7 ? "block" : "none" }}>
           {mounted.has(7) && <LoginItemsTab onToast={showToast} />}

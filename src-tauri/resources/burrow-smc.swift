@@ -1,5 +1,6 @@
-// burrow-smc — SMC fan controller for Burrow (Apple Silicon + Intel)
-// Build: swiftc burrow-smc.swift -o burrow-smc
+// SPDX-License-Identifier: MIT
+// burrow-smc — SMC fan controller for Burrow (Apple Silicon)
+// Build: scripts/build_native_helpers.sh
 // Usage (requires sudo): burrow-smc apply <0|1> <0-100>
 //   apply 0 0   → auto (release SMC override)
 //   apply 1 60  → manual at 60% of max fan speed

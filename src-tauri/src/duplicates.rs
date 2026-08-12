@@ -225,5 +225,10 @@ pub fn find_duplicates(paths: Vec<String>) -> Vec<DuplicateGroup> {
         .collect();
     groups.sort_by_key(|k| std::cmp::Reverse(k.wasted_bytes));
     groups.truncate(500);
+    for group in &groups {
+        for path in &group.paths {
+            crate::grant_path(Path::new(path), crate::PathGrantPurpose::Trash);
+        }
+    }
     groups
 }

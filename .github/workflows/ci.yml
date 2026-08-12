@@ -53,13 +53,25 @@ jobs:
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
       - name: cargo clippy
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
 
       - name: cargo fmt
         run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 
       - name: cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  bundled-resources:
+    name: Bundled resources (arm64 + checksums)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate shell scripts
+        run: bash -n scripts/*.sh
+
+      - name: Verify bundled resources
+        run: scripts/verify_bundled_resources.sh
 
   security:
     name: Security audit
@@ -97,6 +109,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
@@ -105,10 +124,14 @@ jobs:
         run: cargo install cargo-cyclonedx --version 0.5.9 --locked
 
       - name: Generate SBOM
-        run: cargo cyclonedx --manifest-path src-tauri/Cargo.toml --format json
+        run: |
+          cargo cyclonedx --manifest-path src-tauri/Cargo.toml --format json
+          npm sbom --sbom-format cyclonedx > npm.cdx.json
 
       - name: Upload SBOM
         uses: actions/upload-artifact@v7
         with:
           name: sbom
-          path: src-tauri/*.cdx.json
+          path: |
+            src-tauri/*.cdx.json
+            npm.cdx.json

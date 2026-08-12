@@ -5,9 +5,7 @@
 //!
 //! Niveaux :
 //! - `validate_trash_path`      : mise à la corbeille (réversible)
-//! - `validate_delete_path`     : suppression définitive (zones utilisateur seulement)
 //! - `validate_launch_item_path`: chemins LaunchAgent/LaunchDaemon uniquement
-//! - `validate_thin_binary_path`: amincissement limité à /Applications
 //! - `validate_installer_path`  : installateurs dans zones connues
 //! - `validate_app_uninstall_path`: désinstallation, applications seulement
 //! - `validate_service_name`    : noms de service réseau
@@ -20,9 +18,7 @@ use std::path::{Component, Path, PathBuf};
 // ── Helpers internes ──────────────────────────────────────────────────────────
 
 fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/nonexistent"))
+    crate::home_dir()
 }
 
 fn protected_exact_paths() -> Vec<PathBuf> {
@@ -139,6 +135,7 @@ pub fn validate_trash_path(path: &str) -> Result<PathBuf, String> {
 }
 
 /// Validation pour la suppression définitive.
+#[cfg(test)]
 pub fn validate_delete_path(path: &str) -> Result<PathBuf, String> {
     let p = validate_trash_path(path)?;
     let home = home_dir();
@@ -180,23 +177,6 @@ pub fn validate_launch_item_path(path: &str) -> Result<PathBuf, String> {
     let rel = p.strip_prefix(root).unwrap();
     if rel.components().count() != 1 {
         return Err("Profondeur de chemin invalide dans les répertoires LaunchAgents".to_string());
-    }
-    Ok(p)
-}
-
-// ── Binaires universels ───────────────────────────────────────────────────────
-
-/// Valide un chemin pour l'amincissement lipo : doit être sous /Applications.
-pub fn validate_thin_binary_path(path: &str) -> Result<PathBuf, String> {
-    let p = basic_checks(path)?;
-    if p == std::path::Path::new("/Applications") {
-        return Err("Refus de traiter /Applications lui-même".to_string());
-    }
-    if !p.starts_with("/Applications") {
-        return Err(format!(
-            "Amincissement limité aux applications dans /Applications : {}",
-            p.display()
-        ));
     }
     Ok(p)
 }
@@ -366,6 +346,29 @@ pub fn validate_kill_pid(pid: u64) -> Result<(), String> {
     }
     if pid == std::process::id() as u64 {
         return Err("Refus de tuer le processus Burrow lui-même".to_string());
+    }
+    Ok(())
+}
+
+/// Valide un token Homebrew (cask ou formule) comme un identifiant, jamais
+/// comme une option de ligne de commande. Les tokens officiels utilisent des
+/// lettres minuscules, chiffres et séparateurs simples.
+pub fn validate_brew_token(token: &str) -> Result<(), String> {
+    if token.is_empty()
+        || token.len() > 128
+        || token.starts_with(['-', '/'])
+        || token.ends_with('/')
+        || token.contains("..")
+        || token.contains("//")
+    {
+        return Err("Token Homebrew invalide".to_string());
+    }
+    if !token.chars().all(|c| {
+        c.is_ascii_lowercase()
+            || c.is_ascii_digit()
+            || matches!(c, '-' | '_' | '+' | '.' | '@' | '/')
+    }) {
+        return Err("Token Homebrew invalide".to_string());
     }
     Ok(())
 }
@@ -569,26 +572,6 @@ mod tests {
         // Our fix is to use Command::arg() rather than to reject those characters in filenames.
     }
 
-    // ── validate_thin_binary_path ──
-
-    #[test]
-    fn thin_binary_accepts_applications() {
-        assert!(validate_thin_binary_path("/Applications/Foo.app/Contents/MacOS/Foo").is_ok());
-        assert!(
-            validate_thin_binary_path("/Applications/Foo.app/Contents/MacOS/Foo Helper").is_ok()
-        );
-    }
-
-    #[test]
-    fn thin_binary_rejects_outside_applications() {
-        assert!(validate_thin_binary_path("/usr/bin/python3").is_err());
-        assert!(validate_thin_binary_path("/System/Library/Foo").is_err());
-        assert!(validate_thin_binary_path("/Applications").is_err());
-        assert!(validate_thin_binary_path(&home("Applications/Foo.app/Foo")).is_err());
-        // Traversal
-        assert!(validate_thin_binary_path("/Applications/../usr/bin/sudo").is_err());
-    }
-
     // ── validate_installer_path ──
 
     #[test]
@@ -717,6 +700,33 @@ mod tests {
         assert!(validate_kill_pid(1).is_err());
         assert!(validate_kill_pid(std::process::id() as u64).is_err());
         assert!(validate_kill_pid(99999).is_ok());
+    }
+
+    #[test]
+    fn brew_tokens_are_identifiers_not_options() {
+        for token in [
+            "firefox",
+            "visual-studio-code",
+            "python@3.13",
+            "tw93/tap/mole",
+        ] {
+            assert!(validate_brew_token(token).is_ok(), "should accept {token}");
+        }
+        for token in [
+            "--debug",
+            "-f",
+            "Firefox",
+            "foo bar",
+            "foo;rm",
+            "../evil",
+            "tap//formula",
+            "",
+        ] {
+            assert!(
+                validate_brew_token(token).is_err(),
+                "should reject {token:?}"
+            );
+        }
     }
 
     // ── validate_quarantine_name ──
