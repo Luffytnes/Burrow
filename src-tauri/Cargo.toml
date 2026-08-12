@@ -1,6 +1,7 @@
 [package]
 name = "burrow"
 version = "0.1.0"
+publish = false
 description = "macOS cleaning & maintenance toolbox"
 authors = ["karimachi"]
 edition = "2021"
