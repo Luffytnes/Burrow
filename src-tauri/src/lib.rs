@@ -1048,13 +1048,13 @@ fn open_full_disk_access_settings() {
 #[tauri::command]
 fn move_to_trash(path: String) -> Result<(), String> {
     guard::validate_trash_path(&path)?;
-    // Use osascript to move file to Trash safely (preserves filename collisions)
-    let script = format!(
-        r#"tell application "Finder" to delete POSIX file "{}""#,
-        path.replace('"', "\\\"")
-    );
+    // Pass the path as an argv value. Never interpolate a frontend-controlled path
+    // into AppleScript source: macOS filenames may legally contain quotes/newlines.
+    let script = r#"on run argv
+tell application "Finder" to delete POSIX file (item 1 of argv)
+end run"#;
     let out = Command::new("osascript")
-        .args(["-e", &script])
+        .args(["-e", script, "--", &path])
         .output()
         .map_err(|e| e.to_string())?;
     if out.status.success() {
@@ -4194,39 +4194,78 @@ struct DohEntry {
     doh_url: &'static str,
     /// IPs statiques (déjà validées — pas de résolution DNS à l'exécution pour ce catalogue)
     servers: &'static [&'static str],
-    /// URL Mullvad à télécharger (None → on génère le plist localement)
-    mullvad_url: Option<&'static str>,
 }
 
 fn doh_catalog() -> std::collections::HashMap<(&'static str, &'static str), DohEntry> {
     use std::collections::HashMap;
     let mut m: HashMap<(&str, &str), DohEntry> = HashMap::new();
 
-    // Mullvad — profils officiels signés, commit épinglé (5a06b0cd)
-    m.insert(("mullvad", "std"),      DohEntry { display_name: "Mullvad — Standard",  doh_url: "https://dns.mullvad.net/dns-query",          servers: &["194.242.2.2","193.19.108.2","2a07:e340::2","2001:67c:2208::2"], mullvad_url: Some("https://raw.githubusercontent.com/mullvad/encrypted-dns-profiles/5a06b0cd/vanilla/mullvad-encrypted-dns-https-vanilla.mobileconfig") });
-    m.insert(("mullvad", "adblock"),  DohEntry { display_name: "Mullvad — Adblock",   doh_url: "https://adblock.dns.mullvad.net/dns-query",  servers: &["194.242.2.3","193.19.108.3","2a07:e340::3","2001:67c:2208::3"], mullvad_url: Some("https://raw.githubusercontent.com/mullvad/encrypted-dns-profiles/5a06b0cd/adblock/mullvad-encrypted-dns-https-adblock.mobileconfig") });
-    m.insert(("mullvad", "base"),     DohEntry { display_name: "Mullvad — Base",       doh_url: "https://base.dns.mullvad.net/dns-query",     servers: &["194.242.2.9","2a07:e340::9"],                                   mullvad_url: Some("https://raw.githubusercontent.com/mullvad/encrypted-dns-profiles/5a06b0cd/base/mullvad-encrypted-dns-https-base.mobileconfig") });
-    m.insert(("mullvad", "extended"), DohEntry { display_name: "Mullvad — Extended",   doh_url: "https://extended.dns.mullvad.net/dns-query", servers: &["194.242.2.5","2a07:e340::5"],                                   mullvad_url: Some("https://raw.githubusercontent.com/mullvad/encrypted-dns-profiles/5a06b0cd/extended/mullvad-encrypted-dns-https-extended.mobileconfig") });
-    m.insert(("mullvad", "family"),   DohEntry { display_name: "Mullvad — Family",     doh_url: "https://family.dns.mullvad.net/dns-query",   servers: &["194.242.2.6","2a07:e340::6"],                                   mullvad_url: Some("https://raw.githubusercontent.com/mullvad/encrypted-dns-profiles/5a06b0cd/family/mullvad-encrypted-dns-https-family.mobileconfig") });
-    m.insert(("mullvad", "all"),      DohEntry { display_name: "Mullvad — All",        doh_url: "https://all.dns.mullvad.net/dns-query",      servers: &["194.242.2.7","2a07:e340::7"],                                   mullvad_url: Some("https://raw.githubusercontent.com/mullvad/encrypted-dns-profiles/5a06b0cd/all/mullvad-encrypted-dns-https-all.mobileconfig") });
+    // Mullvad — valeurs publiées dans la documentation officielle.
+    // Les profils sont générés localement : aucune URL de téléchargement n'est acceptée.
+    m.insert(
+        ("mullvad", "std"),
+        DohEntry {
+            display_name: "Mullvad — Standard",
+            doh_url: "https://dns.mullvad.net/dns-query",
+            servers: &["194.242.2.2", "2a07:e340::2"],
+        },
+    );
+    m.insert(
+        ("mullvad", "adblock"),
+        DohEntry {
+            display_name: "Mullvad — Adblock",
+            doh_url: "https://adblock.dns.mullvad.net/dns-query",
+            servers: &["194.242.2.3", "2a07:e340::3"],
+        },
+    );
+    m.insert(
+        ("mullvad", "base"),
+        DohEntry {
+            display_name: "Mullvad — Base",
+            doh_url: "https://base.dns.mullvad.net/dns-query",
+            servers: &["194.242.2.4", "2a07:e340::4"],
+        },
+    );
+    m.insert(
+        ("mullvad", "extended"),
+        DohEntry {
+            display_name: "Mullvad — Extended",
+            doh_url: "https://extended.dns.mullvad.net/dns-query",
+            servers: &["194.242.2.5", "2a07:e340::5"],
+        },
+    );
+    m.insert(
+        ("mullvad", "family"),
+        DohEntry {
+            display_name: "Mullvad — Family",
+            doh_url: "https://family.dns.mullvad.net/dns-query",
+            servers: &["194.242.2.6", "2a07:e340::6"],
+        },
+    );
+    m.insert(
+        ("mullvad", "all"),
+        DohEntry {
+            display_name: "Mullvad — All",
+            doh_url: "https://all.dns.mullvad.net/dns-query",
+            servers: &["194.242.2.9", "2a07:e340::9"],
+        },
+    );
 
     // Quad9
     m.insert(
-        ("quad9", "secure"),
+        ("quad9", "sec"),
         DohEntry {
             display_name: "Quad9 — Secure",
             doh_url: "https://dns.quad9.net/dns-query",
             servers: &["9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9"],
-            mullvad_url: None,
         },
     );
     m.insert(
-        ("quad9", "unsecure"),
+        ("quad9", "unf"),
         DohEntry {
             display_name: "Quad9 — Unsecure",
             doh_url: "https://dns10.quad9.net/dns-query",
             servers: &["9.9.9.10", "149.112.112.10"],
-            mullvad_url: None,
         },
     );
     m.insert(
@@ -4235,7 +4274,6 @@ fn doh_catalog() -> std::collections::HashMap<(&'static str, &'static str), DohE
             display_name: "Quad9 — EDNS",
             doh_url: "https://dns11.quad9.net/dns-query",
             servers: &["9.9.9.11", "149.112.112.11"],
-            mullvad_url: None,
         },
     );
 
@@ -4246,7 +4284,6 @@ fn doh_catalog() -> std::collections::HashMap<(&'static str, &'static str), DohE
             display_name: "LibreDNS — Standard",
             doh_url: "https://doh.libredns.gr/dns-query",
             servers: &["116.202.176.26"],
-            mullvad_url: None,
         },
     );
 
@@ -4262,7 +4299,6 @@ fn doh_catalog() -> std::collections::HashMap<(&'static str, &'static str), DohE
                 "2a10:50c0::1:ff",
                 "2a10:50c0::2:ff",
             ],
-            mullvad_url: None,
         },
     );
     m.insert(
@@ -4276,11 +4312,10 @@ fn doh_catalog() -> std::collections::HashMap<(&'static str, &'static str), DohE
                 "2a10:50c0::bad1:ff",
                 "2a10:50c0::bad2:ff",
             ],
-            mullvad_url: None,
         },
     );
     m.insert(
-        ("adguard", "unfiltered"),
+        ("adguard", "unf"),
         DohEntry {
             display_name: "AdGuard — Unfiltered",
             doh_url: "https://unfiltered.adguard-dns.com/dns-query",
@@ -4290,7 +4325,6 @@ fn doh_catalog() -> std::collections::HashMap<(&'static str, &'static str), DohE
                 "2a10:50c0::1:ff",
                 "2a10:50c0::2:ff",
             ],
-            mullvad_url: None,
         },
     );
 
@@ -4306,11 +4340,10 @@ fn doh_catalog() -> std::collections::HashMap<(&'static str, &'static str), DohE
                 "2606:4700:4700::1111",
                 "2606:4700:4700::1001",
             ],
-            mullvad_url: None,
         },
     );
     m.insert(
-        ("cloudflare", "security"),
+        ("cloudflare", "mal"),
         DohEntry {
             display_name: "Cloudflare — Security",
             doh_url: "https://security.cloudflare-dns.com/dns-query",
@@ -4320,7 +4353,6 @@ fn doh_catalog() -> std::collections::HashMap<(&'static str, &'static str), DohE
                 "2606:4700:4700::1112",
                 "2606:4700:4700::1002",
             ],
-            mullvad_url: None,
         },
     );
     m.insert(
@@ -4334,11 +4366,56 @@ fn doh_catalog() -> std::collections::HashMap<(&'static str, &'static str), DohE
                 "2606:4700:4700::1113",
                 "2606:4700:4700::1003",
             ],
-            mullvad_url: None,
         },
     );
 
     m
+}
+
+#[cfg(test)]
+mod doh_catalog_tests {
+    use super::doh_catalog;
+
+    #[test]
+    fn contains_every_frontend_doh_option() {
+        let catalog = doh_catalog();
+        let expected = [
+            ("mullvad", "std"),
+            ("mullvad", "adblock"),
+            ("mullvad", "base"),
+            ("mullvad", "extended"),
+            ("mullvad", "family"),
+            ("mullvad", "all"),
+            ("quad9", "sec"),
+            ("quad9", "unf"),
+            ("quad9", "edns"),
+            ("libredns", "std"),
+            ("adguard", "std"),
+            ("adguard", "family"),
+            ("adguard", "unf"),
+            ("cloudflare", "std"),
+            ("cloudflare", "mal"),
+            ("cloudflare", "family"),
+        ];
+
+        assert_eq!(catalog.len(), expected.len());
+        for key in expected {
+            assert!(catalog.contains_key(&key), "missing DoH entry: {key:?}");
+        }
+    }
+
+    #[test]
+    fn uses_current_mullvad_addresses() {
+        let catalog = doh_catalog();
+        assert_eq!(
+            catalog.get(&("mullvad", "base")).expect("base").servers,
+            &["194.242.2.4", "2a07:e340::4"]
+        );
+        assert_eq!(
+            catalog.get(&("mullvad", "all")).expect("all").servers,
+            &["194.242.2.9", "2a07:e340::9"]
+        );
+    }
 }
 
 /// Installe un profil DoH à partir du catalogue backend.
@@ -4358,46 +4435,34 @@ fn install_doh_profile(provider_id: String, option_id: String) -> Result<(), Str
     // keep tmp_file alive until after `open` so the file isn't deleted prematurely
     let _guard = tmp_file;
 
-    if let Some(url) = entry.mullvad_url {
-        // Téléchargement depuis une URL statique du catalogue (commit épinglé)
-        let out = Command::new("curl")
-            .args([
-                "-sSL",
-                "--fail",
-                "--max-time",
-                "30",
-                "-o",
-                &tmp_path.to_string_lossy(),
-                url,
-            ])
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            return Err(format!(
-                "Téléchargement échoué: {}",
-                String::from_utf8_lossy(&out.stderr)
-            ));
-        }
-    } else {
-        let servers: Vec<String> = entry.servers.iter().map(|s| s.to_string()).collect();
-        let xml = generate_doh_mobileconfig(
-            &provider_id,
-            &option_id,
-            entry.display_name,
-            entry.doh_url,
-            &servers,
-        );
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&tmp_path)
-            .map_err(|e| e.to_string())?;
-        f.write_all(xml.as_bytes()).map_err(|e| e.to_string())?;
-    }
+    let servers: Vec<String> = entry.servers.iter().map(|s| s.to_string()).collect();
+    let xml = generate_doh_mobileconfig(
+        &provider_id,
+        &option_id,
+        entry.display_name,
+        entry.doh_url,
+        &servers,
+    );
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&tmp_path)
+        .map_err(|e| e.to_string())?;
+    f.write_all(xml.as_bytes()).map_err(|e| e.to_string())?;
+    f.flush().map_err(|e| e.to_string())?;
 
-    Command::new("open")
+    let opened = Command::new("open")
         .arg(&tmp_path)
         .output()
         .map_err(|e| e.to_string())?;
+    if !opened.status.success() {
+        let stderr = String::from_utf8_lossy(&opened.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "macOS n'a pas pu ouvrir le profil DoH".to_string()
+        } else {
+            stderr
+        });
+    }
     // _guard dropped here → temp file deleted after macOS has opened it
     Ok(())
 }
@@ -6968,51 +7033,96 @@ fn detect_image_mime(header: &[u8]) -> Option<&'static str> {
 
 #[tauri::command]
 fn read_image_preview(path: String) -> Option<String> {
-    use base64::Engine;
-    use std::os::unix::fs::MetadataExt;
+    read_image_preview_from_home(Path::new(&path), &home_dir())
+}
 
-    // Validation de chemin : doit être sous $HOME uniquement
-    let home = home_dir();
+fn read_image_preview_from_home(path: &Path, home: &Path) -> Option<String> {
+    use base64::Engine;
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::Component;
+
+    const MAX_IMAGE_BYTES: u64 = 4_000_000;
+
     if home.as_os_str().is_empty() {
         return None;
     }
-    let p = std::path::Path::new(&path);
-    if !p.is_absolute() {
+    if !path.is_absolute() || !path.starts_with(home) {
         return None;
     }
-    // Refus des symlinks : on lit la cible réelle pour éviter un TOCTOU
-    let sym_meta = fs::symlink_metadata(p).ok()?;
-    if sym_meta.file_type().is_symlink() {
-        return None;
-    }
-    // Doit être sous $HOME
-    if !p.starts_with(&home) {
-        return None;
-    }
-    // Limite de taille : 4 Mo max
-    let meta = fs::metadata(p).ok()?;
-    if meta.len() > 4_000_000 || meta.len() < 4 {
-        return None;
-    }
-    // Capturer l'inode + taille pour revalidation TOCTOU
-    let inode_before = meta.ino();
-    let size_before = meta.len();
 
-    // Lire uniquement les 12 premiers octets pour détecter le type
-    let mut header = [0u8; 12];
+    // Refuser `..` et chaque symlink sous HOME, y compris dans un répertoire parent.
+    // Vérifier une seconde fois après la lecture réduit la fenêtre de remplacement.
+    let validate_components = || -> Option<()> {
+        let relative = path.strip_prefix(home).ok()?;
+        if relative.as_os_str().is_empty() {
+            return None;
+        }
+        let mut current = home.to_path_buf();
+        for component in relative.components() {
+            let Component::Normal(part) = component else {
+                return None;
+            };
+            current.push(part);
+            if fs::symlink_metadata(&current)
+                .ok()?
+                .file_type()
+                .is_symlink()
+            {
+                return None;
+            }
+        }
+        Some(())
+    };
+    validate_components()?;
+
+    let canonical_home = fs::canonicalize(home).ok()?;
+    let canonical_path = fs::canonicalize(path).ok()?;
+    if canonical_path == canonical_home || !canonical_path.starts_with(&canonical_home) {
+        return None;
+    }
+
+    // O_NOFOLLOW protège aussi le dernier composant au moment exact de l'ouverture.
+    // Une seule ouverture est utilisée pour la détection et la lecture complète.
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&canonical_path)
+        .ok()?;
+    let metadata_before = file.metadata().ok()?;
+    if !metadata_before.is_file()
+        || metadata_before.len() < 4
+        || metadata_before.len() > MAX_IMAGE_BYTES
     {
-        use std::io::Read;
-        let mut f = fs::File::open(p).ok()?;
-        f.read_exact(&mut header).ok()?;
+        return None;
     }
-    let mime = detect_image_mime(&header)?;
 
-    // Lire le contenu complet
-    let bytes = fs::read(p).ok()?;
+    let mut bytes = Vec::with_capacity(metadata_before.len() as usize);
+    file.by_ref()
+        .take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 != metadata_before.len() || bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let mime = detect_image_mime(&bytes)?;
 
-    // Revalidation TOCTOU : même inode + même taille ?
-    let meta2 = fs::metadata(p).ok()?;
-    if meta2.ino() != inode_before || meta2.len() != size_before {
+    // Revalidation TOCTOU sur le descripteur puis sur le chemin visible.
+    let metadata_after = file.metadata().ok()?;
+    if metadata_after.dev() != metadata_before.dev()
+        || metadata_after.ino() != metadata_before.ino()
+        || metadata_after.len() != metadata_before.len()
+    {
+        return None;
+    }
+    validate_components()?;
+    let canonical_after = fs::canonicalize(path).ok()?;
+    let path_metadata = fs::metadata(&canonical_after).ok()?;
+    if canonical_after != canonical_path
+        || path_metadata.dev() != metadata_before.dev()
+        || path_metadata.ino() != metadata_before.ino()
+        || path_metadata.len() != metadata_before.len()
+    {
         return None;
     }
 
@@ -7021,6 +7131,63 @@ fn read_image_preview(path: String) -> Option<String> {
         mime,
         base64::engine::general_purpose::STANDARD.encode(&bytes)
     ))
+}
+
+#[cfg(test)]
+mod image_preview_tests {
+    use super::read_image_preview_from_home;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn accepts_a_real_image_below_home() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        fs::create_dir(&home).expect("home");
+        let image = home.join("preview.bin");
+        fs::write(&image, b"\x89PNG\r\n\x1a\ncontent").expect("image");
+
+        let preview = read_image_preview_from_home(&image, &home).expect("valid preview");
+        assert!(preview.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn rejects_a_final_symlink() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        fs::create_dir(&home).expect("home");
+        let real = home.join("real.png");
+        let link = home.join("link.png");
+        fs::write(&real, b"\x89PNG\r\n\x1a\ncontent").expect("image");
+        symlink(&real, &link).expect("symlink");
+
+        assert!(read_image_preview_from_home(&link, &home).is_none());
+    }
+
+    #[test]
+    fn rejects_a_symlinked_parent_that_escapes_home() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        let outside = root.path().join("outside");
+        fs::create_dir(&home).expect("home");
+        fs::create_dir(&outside).expect("outside");
+        fs::write(outside.join("secret.png"), b"\x89PNG\r\n\x1a\nsecret").expect("image");
+        symlink(&outside, home.join("alias")).expect("symlink");
+
+        assert!(read_image_preview_from_home(&home.join("alias/secret.png"), &home).is_none());
+    }
+
+    #[test]
+    fn enforces_the_size_limit_during_read() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        fs::create_dir(&home).expect("home");
+        let image = home.join("large.png");
+        let file = fs::File::create(&image).expect("image");
+        file.set_len(4_000_001).expect("size");
+
+        assert!(read_image_preview_from_home(&image, &home).is_none());
+    }
 }
 
 // ── Disk browser ──────────────────────────────────────────────────────────────
