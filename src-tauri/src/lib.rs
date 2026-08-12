@@ -3009,14 +3009,17 @@ fn start_clamav_scan(app: tauri::AppHandle, paths: Vec<String>) {
         let home = home_dir();
         let expanded: Vec<String> = paths
             .iter()
-            .map(|p| {
-                if let Some(stripped) = p.strip_prefix("~/") {
-                    format!("{}/{}", home.to_string_lossy(), stripped)
+            .filter_map(|p| {
+                let expanded = if let Some(stripped) = p.strip_prefix("~/") {
+                    home.join(stripped).to_string_lossy().into_owned()
                 } else if p == "~" {
-                    home.to_string_lossy().to_string()
+                    home.to_string_lossy().into_owned()
                 } else {
                     p.clone()
-                }
+                };
+                // Le frontend ne peut scanner que des chemins autorisés par validate_trash_path.
+                guard::validate_trash_path(&expanded).ok()?;
+                Some(expanded)
             })
             .collect();
 
@@ -3049,7 +3052,11 @@ fn start_clamav_scan(app: tauri::AppHandle, paths: Vec<String>) {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 if line.ends_with(" FOUND") {
                     if let Some((path, _)) = line.rsplit_once(": ") {
-                        grant_path(Path::new(path), PathGrantPurpose::Quarantine);
+                        // Valider le chemin avant de l'inscrire dans le registre de grants :
+                        // un fichier hors des zones autorisées ne peut pas être mis en quarantaine.
+                        if guard::validate_trash_path(path).is_ok() {
+                            grant_path(Path::new(path), PathGrantPurpose::Quarantine);
+                        }
                     }
                 }
                 let _ = app_out.emit("scan-line", line);
@@ -7664,7 +7671,11 @@ pub struct DiskEntry {
 
 #[tauri::command]
 fn get_disk_breakdown(path: String) -> Vec<DiskEntry> {
-    let base = Path::new(&path);
+    let base = match guard::validate_trash_path(&path) {
+        Ok(p) => p,
+        Err(_) => return vec![],
+    };
+    let base = base.as_path();
     let Ok(dir_entries) = fs::read_dir(base) else {
         return vec![];
     };
