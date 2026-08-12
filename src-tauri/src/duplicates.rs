@@ -42,7 +42,14 @@ fn hash_file(path: &Path) -> Option<String> {
             Err(_) => return None,
         }
     }
-    Some(format!("{:x}", hasher.finalize()))
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = hasher.finalize();
+    let mut hash = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hash.push(HEX[(byte >> 4) as usize] as char);
+        hash.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Some(hash)
 }
 
 fn hash_file_partial(path: &Path) -> Option<u64> {
