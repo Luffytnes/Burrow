@@ -122,7 +122,7 @@ jobs:
           tool: cargo-audit
           fallback: none
       - run: cargo audit --file src-tauri/Cargo.lock
-      - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           manifest-path: src-tauri/Cargo.toml
           command: check advisories licenses sources bans
