@@ -73,11 +73,14 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: cargo audit
-        uses: rustsec/audit-check@v2
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2.85.12
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: src-tauri
+          tool: cargo-audit
+          fallback: none
+
+      - name: cargo audit
+        run: cargo audit --file src-tauri/Cargo.lock
 
       - name: cargo deny
         uses: EmbarkStudios/cargo-deny-action@v2
