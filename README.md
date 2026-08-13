@@ -1,89 +1,146 @@
 <div align="center">
-  <img src="public/logo.png" width="180" alt="Burrow app icon">
+  <img src="public/logo.png" width="168" alt="Burrow app icon">
   <h1>Burrow</h1>
-  <p><strong>A native macOS cleaning and maintenance toolbox.</strong></p>
-  <p>Keep your Mac clean, fast and easy to understand — from one friendly app. 🐾</p>
+  <p><strong>Your Mac, understood and under control.</strong></p>
   <p>
-    <img src="https://img.shields.io/badge/macOS-13%2B-111111?logo=apple&logoColor=white" alt="macOS 13+">
+    A local-first cleaning, security and maintenance toolbox<br>
+    designed from the ground up for Apple Silicon. 🐾
+  </p>
+  <p>
+    <a href="https://github.com/Luffytnes/Burrow/actions/workflows/ci.yml"><img src="https://github.com/Luffytnes/Burrow/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+    <img src="https://img.shields.io/badge/macOS-13%2B-111111?logo=apple&logoColor=white" alt="macOS 13 or later">
     <img src="https://img.shields.io/badge/Apple%20Silicon-arm64-111111?logo=apple&logoColor=white" alt="Apple Silicon arm64">
     <img src="https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white" alt="Tauri 2">
     <img src="https://img.shields.io/badge/Rust-native-000000?logo=rust&logoColor=white" alt="Rust">
-    <img src="https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white" alt="React 19">
-    <a href="https://github.com/Luffytnes/Burrow/actions/workflows/ci.yml"><img src="https://github.com/Luffytnes/Burrow/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-22c55e.svg" alt="MIT License"></a>
+  </p>
+  <p>
+    <a href="#-everything-your-mac-needs-in-one-place">Features</a> ·
+    <a href="#-get-burrow">Get Burrow</a> ·
+    <a href="PRIVACY.md">Privacy</a> ·
+    <a href="SECURITY.md">Security</a> ·
+    <a href="CONTRIBUTING.md">Contribute</a>
   </p>
 </div>
 
+<br>
+
+<p align="center">
+  <img src="docs/images/burrow-dashboard.png" width="1100" alt="Burrow system dashboard on macOS">
+</p>
+<p align="center">
+  <sub>Live system health, hardware telemetry, storage, network activity and processes — in one glance.</sub>
+</p>
+
 ---
 
-## ✨ What Burrow can do
+## ✨ Everything your Mac needs, in one place
 
-- **📊 Dashboard** — follow CPU/GPU/SoC temperatures, fan speed, power, memory, network activity and running processes.
-- **🧹 Clean** — remove caches, logs, crash reports, browser data, developer caches, old installers and duplicate files.
-- **🛡️ Scan** — scan files with the bundled ClamAV engine, refresh malware definitions and quarantine suspicious files.
-- **⬆️ Update** — discover updates from Homebrew casks, Sparkle feeds and the Mac App Store.
-- **🗑️ Uninstall** — remove applications together with their associated preferences, caches and launch items.
-- **🔎 Analyze** — explore disk usage, large files, developer artifacts and estimated storage growth.
-- **⚡ Optimize** — manage Low Power Mode, memory maintenance and supported fan controls.
-- **🔐 Private DNS** — configure encrypted DNS profiles and manage DNS/search-domain settings.
+Burrow brings the tools you would normally collect across several apps and command-line utilities into one focused interface. No subscription, no ads, no Burrow account and no first-party telemetry.
 
-## 🍎 Compatibility
+|                         | What you can do                                                                                                                  |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| **📊 Live Status**      | Track CPU and GPU activity, memory pressure, temperatures, power, fans, battery, storage, network traffic and running processes. |
+| **🧹 Smart Cleanup**    | Review and remove caches, logs, crash reports, browser data, developer artifacts, old installers and other reclaimable files.    |
+| **🛡️ Malware Scan**     | Scan with the bundled ClamAV engine, refresh definitions and quarantine suspicious files.                                        |
+| **📦 App Management**   | Find application updates and uninstall apps together with their associated preferences, caches and launch items.                 |
+| **🔎 Storage Analysis** | Explore disk usage, large files, duplicates, developer projects and estimated storage growth.                                    |
+| **⚡ Maintenance**      | Run selected macOS maintenance tasks, manage Low Power Mode and use supported Apple Silicon fan controls.                        |
+| **🔐 Private DNS**      | Install encrypted DNS profiles from a curated provider catalogue and manage DNS or search-domain settings.                       |
 
-Burrow currently targets:
+## 🐹 Why Burrow feels different
 
-- **macOS 13 Ventura or later**
-- **Apple Silicon only (`arm64`)**
+- **Built specifically for Apple Silicon.** Burrow targets `arm64` from the UI down to its bundled helpers and release artifacts.
+- **Local by default.** Scans, hardware monitoring, cleanup analysis and application inventory stay on your Mac.
+- **Useful before destructive.** Results are presented for review, sensitive paths are guarded in the Rust backend and privileged actions require explicit approval.
+- **One coherent toolbox.** System health, cleanup, security, applications, storage and networking share the same fast interface.
+- **Open and inspectable.** Burrow's source is MIT-licensed, with third-party components and exact license texts documented separately.
 
-Intel Macs are not supported. The bundled ClamAV, Mole, SMC and Touch ID resources are compiled exclusively for Apple Silicon, and the build system produces only an `aarch64-apple-darwin` target.
+> **Privacy note:** network access is limited to features that need it, such as app-update discovery, ClamAV definition updates and provider-backed encrypted DNS. See [PRIVACY.md](PRIVACY.md) for the complete data-flow summary.
 
-## 📦 Bundled components
+## 🧭 A focused macOS experience
 
-The repository includes the initial arm64 resources required for a standalone build:
+Burrow is organized around five everyday workflows:
 
-- [ClamAV](https://www.clamav.net) scanner and runtime libraries
-- [Mole](https://github.com/tw93/Mole) maintenance CLI
-- Burrow's SMC and Touch ID helpers, with their sources
+1. **Status** — understand what your Mac is doing right now.
+2. **Analyze** — find where storage is going before removing anything.
+3. **Clean** — select reclaimable data and review the operation.
+4. **Apps** — update, inspect or completely uninstall applications.
+5. **Optimize** — run deliberate maintenance actions from one place.
 
-Downloaded ClamAV definition databases, build outputs and local caches are intentionally excluded from Git.
-The exact ClamAV 1.5.4 corresponding source archive is kept in
-[`third_party/sources`](third_party/sources) alongside its SHA-256 checksum.
-Versions, checksums and exact third-party license texts are tracked in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-Ongoing changes are summarized in [CHANGELOG.md](CHANGELOG.md).
+Private DNS and settings remain one click away without crowding the main navigation. The interface is available in English, French, Spanish, German and Simplified Chinese.
 
-ClamAV malware definitions can be refreshed from Burrow. Executable and library updates are delivered with a new Burrow release rather than modifying the application bundle in place.
+## 🛡️ Designed for sensitive operations
 
-## 🔑 macOS permissions
+Maintenance software works close to personal data, so Burrow treats every frontend value as untrusted.
 
-Some features request additional permissions only when macOS requires them:
+- sensitive paths are canonicalized and checked again before use;
+- protected macOS and user-security locations are blocked;
+- cleanup and uninstall commands expose typed operations instead of arbitrary arguments;
+- image previews are size-limited and validated by their real file format;
+- encrypted-DNS profiles come from a fixed backend catalogue;
+- temporary files use unpredictable, private locations;
+- Tauri capabilities and the Content Security Policy keep the frontend surface narrow.
 
-- **Full Disk Access** — needed to inspect or clean protected locations.
-- **Administrator approval** — needed for selected system, power, DNS and hardware operations.
-- **Touch ID or password** — may be requested by macOS for privileged actions.
+Security issues should be reported privately using the process in [SECURITY.md](SECURITY.md).
 
-Always review an operation before confirming a destructive or privileged action.
+## 🚀 Get Burrow
 
-## 🛠️ Development
+> **Early preview:** Burrow is under active development. Prebuilt Apple Silicon releases will be published on the [Releases page](https://github.com/Luffytnes/Burrow/releases). Until then, build it from source and use test data when exercising destructive features.
 
-### Prerequisites
+### Requirements
 
-- [Rust](https://rustup.rs), stable toolchain
-- [Node.js](https://nodejs.org) 20 or later
-- Xcode Command Line Tools
+- macOS 13 Ventura or later
+- Apple Silicon (`arm64`)
+- Node.js 20 or later, Rust stable and Xcode Command Line Tools when building locally
 
-### Run locally
+### Build from source
 
 ```bash
+git clone https://github.com/Luffytnes/Burrow.git
+cd Burrow
 npm install
 npm run tauri dev
 ```
 
-### Useful checks
+Create an Apple Silicon application and DMG with:
 
 ```bash
-npm run typecheck
-npm run lint
-npm run format:check
-# or run all three:
+npm run tauri build -- --target aarch64-apple-darwin
+```
+
+Build outputs are written under `src-tauri/target/aarch64-apple-darwin/release/bundle`.
+
+## 🔑 macOS permissions
+
+Burrow requests additional access only when a feature requires it:
+
+| Permission                 | Why it is needed                                                                     |
+| -------------------------- | ------------------------------------------------------------------------------------ |
+| **Full Disk Access**       | Inspect protected caches, logs and other locations selected for analysis or cleanup. |
+| **Administrator approval** | Perform selected system, power, DNS and hardware operations.                         |
+| **Touch ID or password**   | Confirm privileged or destructive actions through macOS.                             |
+
+Always review the selected items and operation before confirming a cleanup or uninstall.
+
+## 🧩 Under the hood
+
+```text
+Burrow
+├── React + TypeScript        polished, multilingual interface
+├── Tauri 2                   narrow desktop bridge and capabilities
+├── Rust                      validation, scanning and system operations
+├── ClamAV                    bundled malware-scanning engine
+├── Mole                      bundled maintenance primitives
+└── Apple Silicon helpers     SMC and Touch ID integrations
+```
+
+The initial standalone `arm64` resources are versioned with the repository so builds are reproducible. ClamAV databases, generated bundles and local caches remain excluded. Component versions, checksums, source references and license texts are tracked in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+<details>
+<summary><strong>Development checks</strong></summary>
+
+```bash
 npm run check
 
 cd src-tauri
@@ -95,48 +152,33 @@ cd ..
 scripts/verify_bundled_resources.sh
 ```
 
-## 🚀 Build a release bundle
+</details>
 
-```bash
-npm run tauri build -- --target aarch64-apple-darwin
-```
-
-Generated application and disk-image bundles are written under `src-tauri/target/release/bundle`.
-The release checklist and artifact validation steps are documented in [RELEASING.md](RELEASING.md).
-
-## 🗂️ Project layout
+<details>
+<summary><strong>Project layout</strong></summary>
 
 ```text
-src/                   React frontend (pages, components, hooks, i18n)
+src/                   React pages, components, hooks and translations
 src-tauri/src/         Rust backend and Tauri commands
-  duplicates.rs        Duplicate-file scanner
-  gpu.rs               GPU information
-  guard.rs             Safety validation for sensitive operations
-  ior.rs               IOReport and SMC bindings
-  lib.rs               Application commands and orchestration
-src-tauri/resources/   Bundled Apple Silicon resources
-scripts/               Resource and packaging helpers
+src-tauri/resources/   bundled Apple Silicon resources
+scripts/               resource, verification and packaging helpers
+docs/images/           project screenshots and README media
 ```
 
-## 🔒 Security
-
-Burrow performs sensitive maintenance operations, so its security model treats frontend input as untrusted. The project uses backend validation, restricted Tauri capabilities and a Content Security Policy, with additional hardening tracked as development continues.
-
-Please do not use real personal data when developing or testing destructive operations. Use isolated temporary fixtures instead.
-
-Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
-Local data handling and network-backed features are described in [PRIVACY.md](PRIVACY.md).
+</details>
 
 ## 🤝 Contributing
 
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request, and keep security-sensitive changes small and testable.
+Thoughtful bug reports, security reviews, translations and focused pull requests are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), keep security-sensitive changes small and include tests for behavior that touches the filesystem.
 
 ## 📄 License
 
-Burrow's own source code is available under the [MIT License](LICENSE). Bundled third-party components keep their respective licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details.
+Burrow's own source code is available under the [MIT License](LICENSE). Bundled third-party components retain their respective licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ---
 
 <div align="center">
-  Made for Apple Silicon with Rust, Tauri and a very determined little mole. 🐹
+  <strong>Built for Apple Silicon with Rust, Tauri and a very determined little mole.</strong> 🐹
+  <br><br>
+  If Burrow helps you understand your Mac, consider giving the project a ⭐
 </div>
