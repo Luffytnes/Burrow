@@ -28,14 +28,14 @@ body:
     id: version
     attributes:
       label: Burrow version or commit
-      placeholder: v0.2.0 or a commit hash
+      placeholder: v0.2.1 or a later version/commit
     validations:
       required: true
   - type: input
     id: macos
     attributes:
       label: macOS version
-      placeholder: macOS 15.6
+      placeholder: macOS 26.5 or macOS 15.7
     validations:
       required: true
   - type: dropdown

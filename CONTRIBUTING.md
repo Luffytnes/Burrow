@@ -7,13 +7,14 @@ Thanks for helping improve Burrow. 🐾
 - Target Apple Silicon and macOS 13 or later.
 - Keep pull requests focused and explain user-visible or security-sensitive
   behavior changes.
-- Open an issue first for large product changes.
+- Open an issue first for large product changes. A maintainer may close a
+  proposal that does not fit Burrow's scope or safety model.
 - Never commit secrets, signing certificates, malware samples, personal files,
   downloaded virus databases or generated build output.
 
 ## Local checks
 
-Install Node.js 20+, the stable Rust toolchain and Xcode Command Line Tools,
+Install Node.js 22, the stable Rust toolchain and Xcode Command Line Tools,
 then run:
 
 ```bash
@@ -41,3 +42,7 @@ Contributions are accepted under the repository's MIT License. New third-party
 code or binaries must have a compatible, documented license. Update
 `THIRD_PARTY_NOTICES.md` and include the exact license text, version and
 checksums when applicable.
+
+Submitting a contribution does not guarantee that it will be merged. Burrow's
+maintainer makes the final decision based on product scope, safety,
+maintainability and licensing.
