@@ -143,6 +143,13 @@ jobs:
       - name: Verify bundled resources
         run: scripts/verify_bundled_resources.sh
 
+      - name: Compile the macOS icon generator
+        run: |
+          clang -fobjc-arc -fmodules -Wall -Wextra -Werror \
+            -framework AppKit -framework ImageIO \
+            scripts/generate_macos_icon.m \
+            -o "$RUNNER_TEMP/burrow-macos-icon-generator"
+
   security:
     name: Security audit
     runs-on: ubuntu-latest

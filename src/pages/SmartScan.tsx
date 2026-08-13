@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   CheckCircle2,
+  CheckSquare2,
   Circle,
   Gauge,
   Loader2,
@@ -72,6 +73,13 @@ export default function SmartScan() {
   const [securityDone, setSecurityDone] = useState(false);
   const [threats, setThreats] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [selectedCleanCategories, setSelectedCleanCategories] = useState<Set<string>>(new Set());
+  const [selectedMaintenanceTasks, setSelectedMaintenanceTasks] = useState<Set<string>>(new Set());
+  const [completedCleanCategories, setCompletedCleanCategories] = useState<Set<string>>(new Set());
+  const [completedMaintenanceTasks, setCompletedMaintenanceTasks] = useState<Set<string>>(
+    new Set()
+  );
 
   const safeCategories = useMemo(
     () =>
@@ -82,12 +90,44 @@ export default function SmartScan() {
     [result]
   );
 
+  const remainingCleanCategories = safeCategories.filter(
+    (category) => !completedCleanCategories.has(category.id)
+  );
+  const remainingMaintenanceTasks = (result?.maintenance_recommendations ?? []).filter(
+    (task) => !completedMaintenanceTasks.has(task)
+  );
+  const selectedCleanCount = remainingCleanCategories.filter((category) =>
+    selectedCleanCategories.has(category.id)
+  ).length;
+  const selectedMaintenanceCount = remainingMaintenanceTasks.filter((task) =>
+    selectedMaintenanceTasks.has(task)
+  ).length;
+  const selectedActionCount = selectedCleanCount + selectedMaintenanceCount;
+  const remainingActionCount = remainingCleanCategories.length + remainingMaintenanceTasks.length;
+
+  const toggleSelection = (
+    id: string,
+    setter: React.Dispatch<React.SetStateAction<Set<string>>>
+  ) => {
+    setter((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
   const scan = async () => {
     setStage("running");
     setResult(null);
     setSecurityDone(false);
     setThreats(0);
     setError(null);
+    setNotice(null);
+    setSelectedCleanCategories(new Set());
+    setSelectedMaintenanceTasks(new Set());
+    setCompletedCleanCategories(new Set());
+    setCompletedMaintenanceTasks(new Set());
 
     let found = 0;
     let stopLines: (() => void) | undefined;
@@ -99,7 +139,13 @@ export default function SmartScan() {
       const analysisPromise = invoke<SmartScanResult>("run_smart_scan");
       await invoke("start_smart_security_scan");
       const [analysis, scanCode] = await Promise.all([analysisPromise, securityWait.promise]);
+      const cleanCategories = analysis.clean_categories.filter(
+        (category) =>
+          category.size_mb > 0 && category.id !== "trash" && category.id !== "ios_backups"
+      );
       setResult(analysis);
+      setSelectedCleanCategories(new Set(cleanCategories.map((category) => category.id)));
+      setSelectedMaintenanceTasks(new Set(analysis.maintenance_recommendations));
       setThreats(found);
       setSecurityDone(scanCode === 0 || scanCode === 1);
       setStage("ready");
@@ -112,28 +158,61 @@ export default function SmartScan() {
   };
 
   const fix = async () => {
-    if (!result) return;
+    if (!result || selectedActionCount === 0) return;
     setStage("fixing");
     setError(null);
+    setNotice(null);
+    const cleanIds = remainingCleanCategories
+      .map((category) => category.id)
+      .filter((id) => selectedCleanCategories.has(id));
+    const taskIds = remainingMaintenanceTasks.filter((task) => selectedMaintenanceTasks.has(task));
+    const nextCompletedClean = new Set(completedCleanCategories);
+    const nextCompletedMaintenance = new Set(completedMaintenanceTasks);
     try {
-      if (safeCategories.length > 0) {
+      if (cleanIds.length > 0) {
         const cleanWait = await prepareEvent("mo-done");
         await invoke("run_clean_selection", {
-          categories: safeCategories.map((category) => category.id),
+          categories: cleanIds,
           installerPaths: [],
         });
         const cleanCode = await cleanWait.promise;
         if (cleanCode !== 0) throw new Error("Le nettoyage n'a pas pu être entièrement réalisé");
+        cleanIds.forEach((id) => nextCompletedClean.add(id));
+        setCompletedCleanCategories(new Set(nextCompletedClean));
+        setSelectedCleanCategories((current) => {
+          const next = new Set(current);
+          cleanIds.forEach((id) => next.delete(id));
+          return next;
+        });
       }
-      if (result.maintenance_recommendations.length > 0) {
+      if (taskIds.length > 0) {
         const optimizeWait = await prepareEvent("mo-done");
         await invoke("run_optimize_selection", {
-          tasks: result.maintenance_recommendations,
+          tasks: taskIds,
         });
         const optimizeCode = await optimizeWait.promise;
         if (optimizeCode !== 0) throw new Error("Certaines optimisations ont échoué");
+        taskIds.forEach((task) => nextCompletedMaintenance.add(task));
+        setCompletedMaintenanceTasks(new Set(nextCompletedMaintenance));
+        setSelectedMaintenanceTasks((current) => {
+          const next = new Set(current);
+          taskIds.forEach((task) => next.delete(task));
+          return next;
+        });
       }
-      setStage("done");
+      const remaining =
+        safeCategories.filter((category) => !nextCompletedClean.has(category.id)).length +
+        result.maintenance_recommendations.filter((task) => !nextCompletedMaintenance.has(task))
+          .length;
+      if (remaining > 0) {
+        const completed = cleanIds.length + taskIds.length;
+        setNotice(
+          `${completed} action${completed === 1 ? " exécutée" : "s exécutées"}. Vous pouvez maintenant sélectionner les actions restantes.`
+        );
+        setStage("ready");
+      } else {
+        setStage("done");
+      }
     } catch (reason) {
       setError(String(reason));
       setStage("ready");
@@ -144,8 +223,6 @@ export default function SmartScan() {
     await invoke("cancel_clamav_scan");
     setError("Analyse de sécurité annulée — les résultats déjà calculés restent disponibles.");
   };
-
-  const running = stage === "running" || stage === "fixing";
 
   return (
     <div className="flex flex-col h-full px-6 pb-5 gap-4 overflow-y-auto">
@@ -186,9 +263,12 @@ export default function SmartScan() {
           <div className="text-xl font-bold" style={{ color: "var(--text-1)" }}>
             {stage === "idle" && "Un diagnostic complet, sans automatisme risqué"}
             {stage === "running" && "Analyse des trois piliers…"}
-            {stage === "ready" && "Votre diagnostic est prêt"}
+            {stage === "ready" &&
+              (remainingActionCount === 0
+                ? "Aucune correction nécessaire"
+                : "Choisissez les actions à exécuter")}
             {stage === "fixing" && "Corrections en cours…"}
-            {stage === "done" && "Optimisation terminée"}
+            {stage === "done" && "Actions sélectionnées terminées"}
           </div>
           <p className="text-xs mt-1 max-w-xl" style={{ color: "var(--text-3)" }}>
             Burrow analyse les éléments récupérables, lance un contrôle ClamAV rapide et recommande
@@ -200,8 +280,15 @@ export default function SmartScan() {
             <Sparkles size={14} /> {stage === "done" ? "Analyser à nouveau" : "Lancer Smart Scan"}
           </button>
         ) : stage === "ready" ? (
-          <button onClick={fix} className="btn-primary px-7 py-2.5 flex items-center gap-2">
-            <Wrench size={14} /> Corriger les éléments recommandés
+          <button
+            onClick={fix}
+            disabled={selectedActionCount === 0}
+            className="btn-primary px-7 py-2.5 flex items-center gap-2"
+          >
+            <Wrench size={14} />
+            {selectedActionCount === 0
+              ? "Sélectionnez au moins une action"
+              : `Exécuter la sélection (${selectedActionCount})`}
           </button>
         ) : stage === "running" ? (
           <button
@@ -241,7 +328,7 @@ export default function SmartScan() {
               : "—",
             detail: result?.definitions_outdated
               ? "Définitions à actualiser"
-              : "Analyse ClamAV rapide",
+              : "Analyse uniquement · aucune action automatique",
             done: securityDone,
           },
           {
@@ -280,41 +367,152 @@ export default function SmartScan() {
       {result && (
         <div className="grid grid-cols-2 gap-3">
           <div className="card p-4">
-            <h3 className="text-sm font-semibold mb-3" style={{ color: "var(--text-1)" }}>
-              Éléments récupérables
-            </h3>
+            <div className="flex items-center justify-between gap-3 mb-3">
+              <h3 className="text-sm font-semibold" style={{ color: "var(--text-1)" }}>
+                Éléments récupérables
+              </h3>
+              {remainingCleanCategories.length > 0 && stage === "ready" && (
+                <button
+                  type="button"
+                  className="text-[10px] font-semibold"
+                  style={{ color: "var(--accent-text)" }}
+                  onClick={() =>
+                    setSelectedCleanCategories(
+                      selectedCleanCount === remainingCleanCategories.length
+                        ? new Set()
+                        : new Set(remainingCleanCategories.map((category) => category.id))
+                    )
+                  }
+                >
+                  {selectedCleanCount === remainingCleanCategories.length
+                    ? "Tout désélectionner"
+                    : "Tout sélectionner"}
+                </button>
+              )}
+            </div>
             <div className="space-y-2">
               {safeCategories.length === 0 ? (
                 <span className="text-xs" style={{ color: "var(--text-3)" }}>
                   Rien à nettoyer
                 </span>
               ) : (
-                safeCategories.map((category) => (
-                  <div key={category.id} className="flex items-center justify-between text-xs">
-                    <span style={{ color: "var(--text-2)" }}>
-                      {CLEAN_LABELS[category.id] ?? category.id}
-                    </span>
-                    <span className="font-mono" style={{ color: "var(--text-3)" }}>
-                      {category.size_mb} Mo
-                    </span>
-                  </div>
-                ))
+                safeCategories.map((category) => {
+                  const completed = completedCleanCategories.has(category.id);
+                  const selected = selectedCleanCategories.has(category.id);
+                  return (
+                    <button
+                      key={category.id}
+                      type="button"
+                      role="checkbox"
+                      aria-checked={completed || selected}
+                      disabled={completed || stage !== "ready"}
+                      onClick={() => toggleSelection(category.id, setSelectedCleanCategories)}
+                      className="w-full flex items-center justify-between gap-3 text-xs text-left disabled:cursor-default"
+                    >
+                      <span className="flex items-center gap-2 min-w-0">
+                        {completed || selected ? (
+                          <CheckSquare2
+                            size={14}
+                            style={{ color: completed ? "var(--success)" : "var(--accent)" }}
+                          />
+                        ) : (
+                          <Square size={14} style={{ color: "var(--text-3)" }} />
+                        )}
+                        <span
+                          className={completed ? "line-through" : ""}
+                          style={{ color: completed ? "var(--text-3)" : "var(--text-2)" }}
+                        >
+                          {CLEAN_LABELS[category.id] ?? category.id}
+                        </span>
+                      </span>
+                      <span className="font-mono shrink-0" style={{ color: "var(--text-3)" }}>
+                        {completed ? "Terminé" : `${category.size_mb} Mo`}
+                      </span>
+                    </button>
+                  );
+                })
               )}
             </div>
           </div>
           <div className="card p-4">
-            <h3 className="text-sm font-semibold mb-3" style={{ color: "var(--text-1)" }}>
-              Maintenance recommandée
-            </h3>
+            <div className="flex items-center justify-between gap-3 mb-3">
+              <h3 className="text-sm font-semibold" style={{ color: "var(--text-1)" }}>
+                Maintenance recommandée
+              </h3>
+              {remainingMaintenanceTasks.length > 0 && stage === "ready" && (
+                <button
+                  type="button"
+                  className="text-[10px] font-semibold"
+                  style={{ color: "var(--accent-text)" }}
+                  onClick={() =>
+                    setSelectedMaintenanceTasks(
+                      selectedMaintenanceCount === remainingMaintenanceTasks.length
+                        ? new Set()
+                        : new Set(remainingMaintenanceTasks)
+                    )
+                  }
+                >
+                  {selectedMaintenanceCount === remainingMaintenanceTasks.length
+                    ? "Tout désélectionner"
+                    : "Tout sélectionner"}
+                </button>
+              )}
+            </div>
             <div className="space-y-2">
-              {result.maintenance_recommendations.map((task) => (
-                <div key={task} className="flex items-center gap-2 text-xs">
-                  <CheckCircle2 size={12} style={{ color: "var(--warning)" }} />
-                  <span style={{ color: "var(--text-2)" }}>{TASK_LABELS[task] ?? task}</span>
-                </div>
-              ))}
+              {result.maintenance_recommendations.length === 0 ? (
+                <span className="text-xs" style={{ color: "var(--text-3)" }}>
+                  Aucune action recommandée
+                </span>
+              ) : (
+                result.maintenance_recommendations.map((task) => {
+                  const completed = completedMaintenanceTasks.has(task);
+                  const selected = selectedMaintenanceTasks.has(task);
+                  return (
+                    <button
+                      key={task}
+                      type="button"
+                      role="checkbox"
+                      aria-checked={completed || selected}
+                      disabled={completed || stage !== "ready"}
+                      onClick={() => toggleSelection(task, setSelectedMaintenanceTasks)}
+                      className="w-full flex items-center justify-between gap-3 text-xs text-left disabled:cursor-default"
+                    >
+                      <span className="flex items-center gap-2 min-w-0">
+                        {completed || selected ? (
+                          <CheckSquare2
+                            size={14}
+                            style={{ color: completed ? "var(--success)" : "var(--warning)" }}
+                          />
+                        ) : (
+                          <Square size={14} style={{ color: "var(--text-3)" }} />
+                        )}
+                        <span
+                          className={completed ? "line-through" : ""}
+                          style={{ color: completed ? "var(--text-3)" : "var(--text-2)" }}
+                        >
+                          {TASK_LABELS[task] ?? task}
+                        </span>
+                      </span>
+                      {completed && (
+                        <span className="font-mono shrink-0" style={{ color: "var(--text-3)" }}>
+                          Terminé
+                        </span>
+                      )}
+                    </button>
+                  );
+                })
+              )}
             </div>
           </div>
+        </div>
+      )}
+
+      {notice && (
+        <div
+          className="text-xs px-4 py-3 rounded-xl"
+          style={{ background: "var(--success-dim)", color: "var(--success-text)" }}
+        >
+          {notice}
         </div>
       )}
 
@@ -326,10 +524,15 @@ export default function SmartScan() {
           {error}
         </div>
       )}
-      {running && (
+      {stage === "running" && (
         <div className="text-center text-[10px]" style={{ color: "var(--text-3)" }}>
           Vous pouvez laisser cette page ouverte ; aucune suppression n’est réalisée pendant
           l’analyse.
+        </div>
+      )}
+      {stage === "fixing" && (
+        <div className="text-center text-[10px]" style={{ color: "var(--text-3)" }}>
+          Seules les actions que vous avez sélectionnées sont en cours d’exécution.
         </div>
       )}
     </div>

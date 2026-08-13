@@ -26,6 +26,10 @@ cargo test --manifest-path src-tauri/Cargo.toml
 scripts/verify_bundled_resources.sh
 ```
 
+To regenerate the macOS application icon from the original Burrow artwork,
+run `npm run icon:macos`. The generator keeps the artwork inside the standard
+macOS visual bounds and writes both the reviewable PNG and bundled ICNS file.
+
 ## Safety requirements
 
 - Treat every Tauri command argument as attacker-controlled.

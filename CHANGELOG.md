@@ -3,6 +3,24 @@
 All notable changes to Burrow are documented here. Burrow is pre-1.0 software,
 so security and behavior changes may still be substantial between versions.
 
+## 0.2.2 — 2026-08-13
+
+### Added
+
+- Let users select individual cleanup categories and maintenance tasks before
+  applying Smart Scan recommendations.
+- Keep deferred Smart Scan actions available after a partial run and visibly
+  mark completed actions.
+- Add a reproducible macOS icon generator and a continuous-integration compile
+  check for it.
+
+### Fixed
+
+- Give the macOS application icon the expected transparent canvas and visual
+  bounds so it no longer appears as an oversized red square in the Dock.
+- Clarify that the Smart Scan security pass is analysis-only and never applies
+  automatic remediation.
+
 ## 0.2.1 — 2026-08-13
 
 ### Fixed
