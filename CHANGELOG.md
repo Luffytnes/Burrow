@@ -18,6 +18,9 @@ so security and behavior changes may still be substantial between versions.
 
 - Give the macOS application icon the expected transparent canvas and visual
   bounds so it no longer appears as an oversized red square in the Dock.
+- Keep the Smart Scan progress indicator visibly rotating throughout analysis
+  and selected-action execution, including in reduced-motion mode at a slower
+  speed.
 - Clarify that the Smart Scan security pass is analysis-only and never applies
   automatic remediation.
 

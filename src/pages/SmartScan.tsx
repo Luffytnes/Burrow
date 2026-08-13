@@ -252,7 +252,12 @@ export default function SmartScan() {
           style={{ background: "var(--bg)", border: "1px solid var(--border)" }}
         >
           {stage === "running" || stage === "fixing" ? (
-            <Loader2 size={32} className="animate-spin" style={{ color: "var(--accent)" }} />
+            <Loader2
+              size={32}
+              className="smart-scan-spinner"
+              aria-hidden="true"
+              style={{ color: "var(--accent)" }}
+            />
           ) : stage === "done" ? (
             <CheckCircle2 size={34} style={{ color: "var(--success)" }} />
           ) : (

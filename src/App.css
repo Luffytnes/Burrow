@@ -273,3 +273,23 @@ body {
     opacity: 0.6;
   }
 }
+
+/* The Smart Scan loader is an essential progress indicator. Keep it moving
+   even with reduced motion enabled, but slow it down in that mode. */
+@keyframes smart-scan-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.smart-scan-spinner {
+  animation: smart-scan-spin 0.85s linear infinite;
+  transform-origin: center;
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .smart-scan-spinner {
+    animation: smart-scan-spin 1.8s linear infinite !important;
+  }
+}
