@@ -3,6 +3,7 @@ import "./App.css";
 import Topbar from "./components/Topbar";
 import PermissionsGate from "./components/PermissionsGate";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import { listen } from "@tauri-apps/api/event";
 
 const Dashboard = lazy(() => import("./pages/Dashboard"));
 const Clean = lazy(() => import("./pages/Clean"));
@@ -11,6 +12,8 @@ const Optimize = lazy(() => import("./pages/Optimize"));
 const Uninstall = lazy(() => import("./pages/Uninstall"));
 const Settings = lazy(() => import("./pages/Settings"));
 const DnsPage = lazy(() => import("./pages/Dns"));
+const ActivityPage = lazy(() => import("./pages/Activity"));
+const SmartScan = lazy(() => import("./pages/SmartScan"));
 
 function PageFallback() {
   return (
@@ -38,8 +41,18 @@ export default function App() {
     if (active === "clean") setCleanMounted(true);
   }, [active]);
 
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<string>("navigate", ({ payload }) => setActive(payload)).then((stop) => {
+      unlisten = stop;
+    });
+    return () => unlisten?.();
+  }, []);
+
   const renderPage = () => {
     switch (active) {
+      case "smart-scan":
+        return <SmartScan />;
       case "dashboard":
         return <Dashboard onNavigate={setActive} />;
       case "scan":
@@ -52,6 +65,8 @@ export default function App() {
         return <Settings />;
       case "dns":
         return <DnsPage />;
+      case "activity":
+        return <ActivityPage />;
       default:
         return <Dashboard onNavigate={setActive} />;
     }

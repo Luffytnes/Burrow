@@ -40,19 +40,23 @@ Burrow brings the tools you would normally collect across several apps and comma
 
 |                         | What you can do                                                                                                                  |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| **✨ Smart Scan**       | Combine recoverable cleanup, a focused malware scan and context-aware maintenance recommendations in one guided workflow.       |
 | **📊 Live Status**      | Track CPU and GPU activity, memory pressure, temperatures, power, fans, battery, storage, network traffic and running processes. |
-| **🧹 Smart Cleanup**    | Review and remove caches, logs, crash reports, browser data, developer artifacts, old installers and other reclaimable files.    |
+| **🧹 Smart Cleanup**    | Review caches, logs, browser data, developer artifacts and installers, then move selected items to the macOS Trash.              |
 | **🛡️ Malware Scan**     | Scan with the bundled ClamAV engine, refresh definitions and quarantine suspicious files.                                        |
 | **📦 App Management**   | Find application updates and uninstall apps together with their associated preferences, caches and launch items.                 |
-| **🔎 Storage Analysis** | Explore disk usage, large files, duplicates, developer projects and estimated storage growth.                                    |
+| **🔎 Storage Analysis** | Explore an interactive treemap, disk usage, large files, duplicates, developer projects and estimated storage growth.            |
 | **⚡ Maintenance**      | Run selected macOS maintenance tasks, manage Low Power Mode and use supported Apple Silicon fan controls.                        |
+| **✂️ Binary Thinning**  | Remove Intel slices from compatible universal apps while keeping the original application recoverable from the Trash.           |
+| **📜 Activity Journal** | Review a private local history of scans, cleanup, application operations and maintenance actions.                                |
+| **📍 Menu Bar Widget**  | Keep essential system metrics visible and open Smart Scan or the activity journal in one click.                                  |
 | **🔐 Private DNS**      | Install encrypted DNS profiles from a curated provider catalogue and manage DNS or search-domain settings.                       |
 
 ## 🐹 Why Burrow feels different
 
 - **Built specifically for Apple Silicon.** Burrow targets `arm64` from the UI down to its bundled helpers and release artifacts.
 - **Local by default.** Scans, hardware monitoring, cleanup analysis and application inventory stay on your Mac.
-- **Useful before destructive.** Results are presented for review, sensitive paths are guarded in the Rust backend and privileged actions require explicit approval.
+- **Recoverable by policy.** User-facing cleanup and removal actions use the macOS Trash, results are presented for review and sensitive paths are guarded in the Rust backend.
 - **One coherent toolbox.** System health, cleanup, security, applications, storage and networking share the same fast interface.
 - **Open and inspectable.** Burrow's source is MIT-licensed, with third-party components and exact license texts documented separately.
 
@@ -60,15 +64,16 @@ Burrow brings the tools you would normally collect across several apps and comma
 
 ## 🧭 A focused macOS experience
 
-Burrow is organized around five everyday workflows:
+Burrow is organized around six everyday workflows:
 
-1. **Status** — understand what your Mac is doing right now.
-2. **Analyze** — find where storage is going before removing anything.
-3. **Clean** — select reclaimable data and review the operation.
-4. **Apps** — update, inspect or completely uninstall applications.
-5. **Optimize** — run deliberate maintenance actions from one place.
+1. **Smart Scan** — combine cleanup, security and optimization in one guided check.
+2. **Status** — understand what your Mac is doing right now.
+3. **Analyze** — map storage visually before removing anything.
+4. **Clean** — select reclaimable data and keep it recoverable from the Trash.
+5. **Apps** — update, inspect, uninstall or thin compatible universal applications.
+6. **Optimize** — run deliberate maintenance actions from one place.
 
-Private DNS and settings remain one click away without crowding the main navigation. The interface is available in English, French, Spanish, German and Simplified Chinese.
+The activity journal, private DNS and settings remain one click away without crowding the main navigation. The menu-bar widget provides live metrics and quick access even when the main window is hidden. The interface is available in English, French, Spanish, German and Simplified Chinese.
 
 ## 🛡️ Designed for sensitive operations
 
@@ -86,7 +91,7 @@ Security issues should be reported privately using the process in [SECURITY.md](
 
 ## 🚀 Get Burrow
 
-> **Early preview:** Burrow is under active development. Prebuilt Apple Silicon releases will be published on the [Releases page](https://github.com/Luffytnes/Burrow/releases). Until then, build it from source and use test data when exercising destructive features.
+> **Preview:** Burrow is under active development. Download the latest Apple Silicon build from the [Releases page](https://github.com/Luffytnes/Burrow/releases), or build it from source below.
 
 ### Requirements
 
@@ -119,9 +124,9 @@ Burrow requests additional access only when a feature requires it:
 | -------------------------- | ------------------------------------------------------------------------------------ |
 | **Full Disk Access**       | Inspect protected caches, logs and other locations selected for analysis or cleanup. |
 | **Administrator approval** | Perform selected system, power, DNS and hardware operations.                         |
-| **Touch ID or password**   | Confirm privileged or destructive actions through macOS.                             |
+| **Touch ID or password**   | Confirm protected application operations through macOS.                              |
 
-Always review the selected items and operation before confirming a cleanup or uninstall.
+Always review the selected items and operation before confirming it. Burrow does not empty the Trash; restoration and final deletion remain under your control in Finder.
 
 ## 🧩 Under the hood
 

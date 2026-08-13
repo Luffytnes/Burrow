@@ -1300,7 +1300,7 @@ mod tests {
             use std::os::unix::fs::symlink;
             let tmp = tempfile::Builder::new()
                 .prefix("burrow-test-")
-                .tempdir_in("/tmp")
+                .tempdir_in(env!("CARGO_MANIFEST_DIR"))
                 .unwrap();
             let link = tmp.path().join("evil_link");
             let ssh = home_dir().join(".ssh");
@@ -1530,7 +1530,7 @@ mod tests {
     fn disk_browse_rejects_symlink_even_when_target_is_allowed() {
         use std::os::unix::fs::symlink;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir");
         let target = tmp.path().join("allowed");
         let link = tmp.path().join("alias");
         std::fs::create_dir(&target).expect("target");

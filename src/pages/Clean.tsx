@@ -41,6 +41,8 @@ import {
   Users,
   UserX,
   Lock,
+  LayoutGrid,
+  List,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useMo } from "../hooks/useMo";
@@ -112,6 +114,7 @@ interface UniversalBinaryEntry {
   path: string;
   total_size_bytes: number;
   reclaimable_bytes: number;
+  binary_count: number;
   thinning_unsafe: boolean;
   thinning_warning: string;
 }
@@ -209,7 +212,6 @@ const CLEAN_CATS = [
     desc: "Safari, Chrome, Firefox, Brave",
     icon: Globe,
   },
-  { id: "trash", label: "Corbeille", desc: "~/.Trash", icon: Trash2 },
   {
     id: "ios_backups",
     label: "Sauvegardes iOS",
@@ -556,12 +558,53 @@ function GroupRow({
 
 type DiskBrowseError = "protected" | "inaccessible" | "busy" | "timeout" | "changed" | "system";
 
+interface TreemapRect {
+  entry: DiskEntry;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+function binaryTreemap(
+  entries: DiskEntry[],
+  x = 0,
+  y = 0,
+  width = 100,
+  height = 100
+): TreemapRect[] {
+  if (entries.length === 0) return [];
+  if (entries.length === 1) return [{ entry: entries[0], x, y, width, height }];
+  const total = entries.reduce((sum, entry) => sum + entry.size_bytes, 0);
+  let leftTotal = 0;
+  let split = 1;
+  for (let index = 0; index < entries.length - 1; index++) {
+    leftTotal += entries[index].size_bytes;
+    split = index + 1;
+    if (leftTotal >= total / 2) break;
+  }
+  const ratio = total > 0 ? leftTotal / total : 0.5;
+  if (width >= height) {
+    const leftWidth = width * ratio;
+    return [
+      ...binaryTreemap(entries.slice(0, split), x, y, leftWidth, height),
+      ...binaryTreemap(entries.slice(split), x + leftWidth, y, width - leftWidth, height),
+    ];
+  }
+  const topHeight = height * ratio;
+  return [
+    ...binaryTreemap(entries.slice(0, split), x, y, width, topHeight),
+    ...binaryTreemap(entries.slice(split), x, y + topHeight, width, height - topHeight),
+  ];
+}
+
 function DiskBrowser() {
   const [stack, setStack] = useState<string[]>([]);
   const [entries, setEntries] = useState<DiskEntry[] | null>(null);
   const [browseError, setBrowseError] = useState<DiskBrowseError | null>(null);
   const [truncated, setTruncated] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [view, setView] = useState<"treemap" | "list">("treemap");
   const initialized = useRef(false);
 
   const load = useCallback(async (path: string) => {
@@ -675,6 +718,33 @@ function DiskBrowser() {
         >
           <RefreshCw size={10} />
         </button>
+        <div
+          className="flex items-center p-0.5 rounded-lg"
+          style={{ background: "var(--bar-track)" }}
+        >
+          <button
+            onClick={() => setView("treemap")}
+            className="p-1 rounded-md"
+            style={{
+              color: view === "treemap" ? "var(--accent)" : "var(--text-3)",
+              background: view === "treemap" ? "var(--bg-card)" : "transparent",
+            }}
+            aria-label="Vue treemap"
+          >
+            <LayoutGrid size={10} />
+          </button>
+          <button
+            onClick={() => setView("list")}
+            className="p-1 rounded-md"
+            style={{
+              color: view === "list" ? "var(--accent)" : "var(--text-3)",
+              background: view === "list" ? "var(--bg-card)" : "transparent",
+            }}
+            aria-label="Vue liste"
+          >
+            <List size={10} />
+          </button>
+        </div>
       </div>
 
       {/* Entry list */}
@@ -698,6 +768,54 @@ function DiskBrowser() {
       ) : entries.length === 0 ? (
         <div className="text-center py-6 text-xs" style={{ color: "var(--text-3)" }}>
           Dossier vide
+        </div>
+      ) : view === "treemap" ? (
+        <div
+          className="relative m-2 rounded-lg overflow-hidden"
+          style={{ height: 292, background: "var(--bar-track)" }}
+        >
+          {binaryTreemap(entries.slice(0, 48)).map(({ entry, x, y, width, height }, index) => {
+            const color = entry.is_dir ? "var(--info)" : fileExtColor(entry.name);
+            const showLabel = width >= 10 && height >= 12;
+            return (
+              <motion.button
+                key={entry.path}
+                initial={{ opacity: 0, scale: 0.96 }}
+                animate={{ opacity: 1, scale: 1 }}
+                transition={{ delay: Math.min(index * 0.01, 0.35) }}
+                onClick={() => navigate(entry)}
+                disabled={!entry.is_dir}
+                title={`${entry.name} — ${fmtBytes(entry.size_bytes)}`}
+                className="absolute overflow-hidden text-left p-2 disabled:cursor-default"
+                style={{
+                  left: `${x}%`,
+                  top: `${y}%`,
+                  width: `${width}%`,
+                  height: `${height}%`,
+                  background: `color-mix(in srgb, ${color} 24%, var(--bg-card))`,
+                  border: "1px solid var(--bg)",
+                  color: "var(--text-1)",
+                }}
+              >
+                {showLabel && (
+                  <>
+                    <span className="text-[10px] font-semibold block truncate">{entry.name}</span>
+                    <span className="text-[9px] block mt-0.5" style={{ color: "var(--text-3)" }}>
+                      {fmtBytes(entry.size_bytes)}
+                    </span>
+                  </>
+                )}
+              </motion.button>
+            );
+          })}
+          {entries.length > 48 && (
+            <div
+              className="absolute bottom-1 right-1 px-2 py-1 rounded text-[9px]"
+              style={{ background: "var(--bg)", color: "var(--text-3)" }}
+            >
+              48 plus grands éléments affichés
+            </div>
+          )}
         </div>
       ) : (
         <div style={{ maxHeight: 280, overflowY: "auto" }}>
@@ -1437,7 +1555,8 @@ function DeveloppeurTab({
           }}
         >
           <AlertTriangle size={13} />
-          Xcode est ouvert — fermez-le avant de supprimer ses caches pour éviter des incohérences.
+          Xcode est ouvert — fermez-le avant de déplacer ses caches dans la Corbeille pour éviter
+          des incohérences.
         </div>
       )}
 
@@ -1827,7 +1946,10 @@ function DoublonsTab({ onToast }: { onToast: (ok: boolean, msg: string) => void 
     );
     setSelected(new Set());
     setDeleting(false);
-    onToast(true, `${count} doublon${count > 1 ? "s" : ""} supprimé${count > 1 ? "s" : ""}`);
+    onToast(
+      true,
+      `${count} doublon${count > 1 ? "s" : ""} déplacé${count > 1 ? "s" : ""} dans la Corbeille`
+    );
   };
 
   // Idle state
@@ -2264,9 +2386,11 @@ function PrivacyTab({ onToast }: { onToast: (ok: boolean, msg: string) => void }
 
 // ── Tab 6: Binaires universels ────────────────────────────────────────────────
 
-function BinairesTab() {
+function BinairesTab({ onToast }: { onToast: (ok: boolean, msg: string) => void }) {
   const [entries, setEntries] = useState<UniversalBinaryEntry[] | null>(_cache.binaries ?? null);
   const [scanning, setScanning] = useState(!_cache.binaries);
+  const [confirmPath, setConfirmPath] = useState<string | null>(null);
+  const [thinningPath, setThinningPath] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setScanning(true);
@@ -2285,6 +2409,26 @@ function BinairesTab() {
   }, [load]);
 
   const totalReclaimable = (entries ?? []).reduce((s, e) => s + e.reclaimable_bytes, 0);
+
+  const thin = async (entry: UniversalBinaryEntry) => {
+    setThinningPath(entry.path);
+    setConfirmPath(null);
+    try {
+      const result = await invoke<{ bytes_saved: number; binary_count: number }>(
+        "thin_universal_app",
+        { name: entry.name, appPath: entry.path }
+      );
+      onToast(
+        true,
+        `${entry.name} allégé : ${fmtBytes(result.bytes_saved)} récupérés · original dans la Corbeille`
+      );
+      await load();
+    } catch (error) {
+      onToast(false, String(error));
+    } finally {
+      setThinningPath(null);
+    }
+  };
 
   return (
     <div className="flex flex-col gap-2">
@@ -2336,9 +2480,9 @@ function BinairesTab() {
             style={{ color: "var(--warning)", flexShrink: 0, marginTop: 1 }}
           />
           <div className="text-[11px] leading-relaxed" style={{ color: "var(--text-3)" }}>
-            <strong style={{ color: "var(--warning)" }}>Modification désactivée</strong> — retirer
-            une tranche invalide la signature de l'application et peut l'empêcher de démarrer ou de
-            se mettre à jour. Burrow ne modifie donc pas automatiquement ces binaires.
+            <strong style={{ color: "var(--warning)" }}>Opération récupérable</strong> — Burrow
+            travaille sur une copie, conserve l'application originale dans la Corbeille, re-signe
+            localement la copie allégée et vérifie son intégrité avant de l'installer.
           </div>
         </div>
       </div>
@@ -2349,7 +2493,7 @@ function BinairesTab() {
           style={{ color: "var(--text-3)" }}
         >
           <Loader2 size={14} className="animate-spin" />
-          <span className="text-xs">Scan de /Applications…</span>
+          <span className="text-xs">Scan des applications…</span>
         </div>
       ) : (entries?.length ?? 0) === 0 ? (
         <div className="text-center py-8 text-sm" style={{ color: "var(--text-3)" }}>
@@ -2372,15 +2516,46 @@ function BinairesTab() {
                   {entry.path.replace(/^\/Applications\//, "")}
                 </div>
               </div>
-              <span
-                className="text-[10px] font-mono shrink-0 px-2 py-0.5 rounded"
-                style={{ background: "var(--bar-track)", color: "var(--text-2)" }}
-              >
-                ~{fmtBytes(entry.reclaimable_bytes)}
-              </span>
-              <span className="text-[10px]" style={{ color: "var(--text-3)" }}>
-                Informatif
-              </span>
+              <div className="text-right shrink-0">
+                <div className="text-[10px] font-mono" style={{ color: "var(--text-2)" }}>
+                  ~{fmtBytes(entry.reclaimable_bytes)}
+                </div>
+                <div className="text-[9px]" style={{ color: "var(--text-3)" }}>
+                  {entry.binary_count} binaire{entry.binary_count > 1 ? "s" : ""}
+                </div>
+              </div>
+              {confirmPath === entry.path ? (
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    onClick={() => thin(entry)}
+                    className="text-[10px] px-2 py-1 rounded-lg font-semibold"
+                    style={{ background: "var(--warning)", color: "#1c1917" }}
+                  >
+                    Confirmer
+                  </button>
+                  <button
+                    onClick={() => setConfirmPath(null)}
+                    className="text-[10px] px-2 py-1 rounded-lg"
+                    style={{ background: "var(--bar-track)", color: "var(--text-2)" }}
+                  >
+                    Annuler
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setConfirmPath(entry.path)}
+                  disabled={thinningPath !== null}
+                  className="text-[10px] px-2.5 py-1 rounded-lg font-semibold disabled:opacity-40 flex items-center gap-1"
+                  style={{ background: "var(--accent)", color: "var(--on-accent)" }}
+                >
+                  {thinningPath === entry.path ? (
+                    <Loader2 size={10} className="animate-spin" />
+                  ) : (
+                    <Cpu size={10} />
+                  )}
+                  Amincir
+                </button>
+              )}
             </div>
           ))}
         </div>
@@ -2538,11 +2713,8 @@ function SectionHeader({
 
 function SystemeTab({ onToast }: { onToast: (ok: boolean, msg: string) => void }) {
   const [purgeable, setPurgeable] = useState<PurgeableInfo | null>(_cache.purgeable ?? null);
-  const [purging, setPurging] = useState(false);
   const [snapshots, setSnapshots] = useState<TmSnapshot[] | null>(_cache.snapshots ?? null);
-  const [deletingSnap, setDeletingSnap] = useState<string | null>(null);
   const [sims, setSims] = useState<SimRuntime[] | null>(_cache.sims ?? null);
-  const [deletingSim, setDeletingSim] = useState<string | null>(null);
   const [devCaches, setDevCaches] = useState<DevCacheItem[] | null>(_cache.sysDevCaches ?? null);
   const [selDev, setSelDev] = useState<Set<string>>(new Set());
   const [cleaningDev, setCleaningDev] = useState(false);
@@ -2577,46 +2749,6 @@ function SystemeTab({ onToast }: { onToast: (ok: boolean, msg: string) => void }
   useEffect(() => {
     if (!_cache.purgeable && !_cache.snapshots) load();
   }, [load]);
-
-  const handlePurge = async () => {
-    setPurging(true);
-    try {
-      const freed = await invoke<number>("purge_purgeable_space");
-      onToast(true, `Espace purgeable récupéré (${fmtBytes(freed)})`);
-      setPurgeable(await invoke<PurgeableInfo>("get_purgeable_space"));
-    } catch (e) {
-      onToast(false, String(e));
-    }
-    setPurging(false);
-  };
-
-  const handleDeleteSnap = async (date: string) => {
-    setDeletingSnap(date);
-    try {
-      await invoke("delete_tm_snapshot", { date });
-      setSnapshots((prev) => {
-        const next = prev ? prev.filter((s) => s.date !== date) : null;
-        _cache.snapshots = next;
-        return next;
-      });
-      onToast(true, `Snapshot ${date} supprimé`);
-    } catch (e) {
-      onToast(false, String(e));
-    }
-    setDeletingSnap(null);
-  };
-
-  const handleDeleteSim = async (id: string) => {
-    setDeletingSim(id);
-    try {
-      await invoke("delete_simulator_runtime", { identifier: id });
-      setSims((prev) => (prev ? prev.filter((s) => s.identifier !== id) : null));
-      onToast(true, "Runtime supprimé");
-    } catch (e) {
-      onToast(false, String(e));
-    }
-    setDeletingSim(null);
-  };
 
   const toggleDev = (id: string) =>
     setSelDev((prev) => {
@@ -2661,7 +2793,7 @@ function SystemeTab({ onToast }: { onToast: (ok: boolean, msg: string) => void }
         <Database size={16} style={{ color: "var(--accent)", flexShrink: 0 }} />
         <div className="flex-1 min-w-0">
           <div className="text-sm font-medium" style={{ color: "var(--text-1)" }}>
-            Espace récupérable
+            Espace géré par macOS
           </div>
           <div className="text-[10px]" style={{ color: "var(--text-3)" }}>
             {purgeable
@@ -2669,14 +2801,12 @@ function SystemeTab({ onToast }: { onToast: (ok: boolean, msg: string) => void }
               : "—"}
           </div>
         </div>
-        <button
-          onClick={handlePurge}
-          disabled={purging || !purgeable || purgeable.purgeable_bytes === 0}
-          className="text-[11px] px-3 py-1.5 rounded-lg font-medium transition-opacity hover:opacity-70 disabled:opacity-40"
-          style={{ background: "var(--accent)", color: "#fff" }}
+        <span
+          className="text-[9px] px-2 py-1 rounded-full"
+          style={{ background: "var(--bar-track)", color: "var(--text-3)" }}
         >
-          {purging ? <Loader2 size={11} className="animate-spin" /> : "Purger"}
-        </button>
+          Informatif
+        </span>
       </div>
 
       {/* Time Machine Snapshots */}
@@ -2705,17 +2835,9 @@ function SystemeTab({ onToast }: { onToast: (ok: boolean, msg: string) => void }
                     </div>
                   )}
                 </div>
-                {deletingSnap === s.date ? (
-                  <Loader2 size={13} className="animate-spin" style={{ color: "var(--accent)" }} />
-                ) : (
-                  <button
-                    onClick={() => handleDeleteSnap(s.date)}
-                    className="p-1.5 rounded transition-opacity hover:opacity-70"
-                    style={{ background: "var(--danger)18", color: "var(--danger)" }}
-                  >
-                    <Trash2 size={11} />
-                  </button>
-                )}
+                <span className="text-[9px]" style={{ color: "var(--text-3)" }}>
+                  Géré par Time Machine
+                </span>
               </div>
             ))}
           </div>
@@ -2746,24 +2868,12 @@ function SystemeTab({ onToast }: { onToast: (ok: boolean, msg: string) => void }
                     {fmtBytes(s.size_bytes)} · build {s.build}
                   </div>
                 </div>
-                {!s.deletable ? (
-                  <span
-                    className="text-[9px] px-1.5 py-0.5 rounded"
-                    style={{ background: "var(--bar-track)", color: "var(--text-3)" }}
-                  >
-                    actif
-                  </span>
-                ) : deletingSim === s.identifier ? (
-                  <Loader2 size={13} className="animate-spin" style={{ color: "var(--accent)" }} />
-                ) : (
-                  <button
-                    onClick={() => handleDeleteSim(s.identifier)}
-                    className="p-1.5 rounded transition-opacity hover:opacity-70"
-                    style={{ background: "var(--danger)18", color: "var(--danger)" }}
-                  >
-                    <Trash2 size={11} />
-                  </button>
-                )}
+                <span
+                  className="text-[9px] px-1.5 py-0.5 rounded"
+                  style={{ background: "var(--bar-track)", color: "var(--text-3)" }}
+                >
+                  {s.deletable ? "informatif" : "actif"}
+                </span>
               </div>
             ))}
           </div>
@@ -2915,7 +3025,7 @@ function LoginItemsConfirmModal({
               <div className="text-[11px] mb-2" style={{ color: "var(--text-3)" }}>
                 {data.related.length} composant{data.related.length > 1 ? "s" : ""} lié
                 {data.related.length > 1 ? "s" : ""} trouvé{data.related.length > 1 ? "s" : ""} —
-                supprimer tout évite que l'item réapparaisse.
+                tout déplacer dans la Corbeille évite que l'item réapparaisse.
               </div>
               <div
                 className="rounded-lg p-2 flex flex-col gap-1"
@@ -2933,7 +3043,7 @@ function LoginItemsConfirmModal({
             </>
           ) : (
             <div className="text-[11px]" style={{ color: "var(--text-3)" }}>
-              Cette action est irréversible.
+              Cet élément sera déplacé dans la Corbeille et pourra être restauré.
             </div>
           )}
         </div>
@@ -2951,7 +3061,7 @@ function LoginItemsConfirmModal({
               className="flex-1 py-2 rounded-xl text-xs font-medium transition-opacity hover:opacity-70"
               style={{ background: "var(--danger)22", color: "var(--danger)" }}
             >
-              Seulement celui-ci
+              Celui-ci
             </button>
           )}
           <button
@@ -2959,7 +3069,7 @@ function LoginItemsConfirmModal({
             className="flex-1 py-2 rounded-xl text-xs font-medium transition-opacity hover:opacity-70"
             style={{ background: "var(--danger)", color: "#fff" }}
           >
-            {hasRelated ? "Tout supprimer" : "Supprimer"}
+            {hasRelated ? "Tout déplacer" : "Déplacer"}
           </button>
         </div>
       </div>
@@ -3034,7 +3144,7 @@ function LoginItemsTab({ onToast }: { onToast: (ok: boolean, msg: string) => voi
       removePaths(paths);
       onToast(
         true,
-        `${paths.length} élément${paths.length > 1 ? "s" : ""} supprimé${paths.length > 1 ? "s" : ""}`
+        `${paths.length} élément${paths.length > 1 ? "s" : ""} déplacé${paths.length > 1 ? "s" : ""} dans la Corbeille`
       );
     } catch (e) {
       onToast(false, String(e));
@@ -3422,7 +3532,7 @@ export default function Clean() {
           {mounted.has(5) && <PrivacyTab onToast={showToast} />}
         </div>
         <div style={{ display: tab === 6 ? "block" : "none" }}>
-          {mounted.has(6) && <BinairesTab />}
+          {mounted.has(6) && <BinairesTab onToast={showToast} />}
         </div>
         <div style={{ display: tab === 7 ? "block" : "none" }}>
           {mounted.has(7) && <LoginItemsTab onToast={showToast} />}

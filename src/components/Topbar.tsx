@@ -1,4 +1,4 @@
-import { Settings, ShieldCheck } from "lucide-react";
+import { Activity, Settings, ShieldCheck } from "lucide-react";
 import { useT } from "../i18n/useT";
 
 export default function Topbar({
@@ -11,6 +11,7 @@ export default function Topbar({
   const { t } = useT();
 
   const NAV = [
+    { id: "smart-scan", label: "Smart Scan" },
     { id: "dashboard", label: t.topbar_state },
     { id: "scan", label: t.topbar_scan },
     { id: "clean", label: t.topbar_clean },
@@ -63,7 +64,19 @@ export default function Topbar({
       </nav>
 
       {/* DNS + Settings icons */}
-      <div className="w-20 shrink-0 flex justify-end items-center gap-0.5">
+      <div className="w-24 shrink-0 flex justify-end items-center gap-0.5">
+        <button
+          onClick={() => onSelect("activity")}
+          aria-label="Journal d’activité"
+          aria-current={active === "activity" ? "page" : undefined}
+          className="p-2 rounded-full transition-all"
+          style={{
+            color: active === "activity" ? "var(--accent)" : "var(--text-3)",
+            background: active === "activity" ? "var(--accent-dim)" : "transparent",
+          }}
+        >
+          <Activity size={14} aria-hidden="true" />
+        </button>
         <button
           onClick={() => onSelect("dns")}
           aria-label="DNS Privé"

@@ -3,7 +3,20 @@
 All notable changes to Burrow are documented here. Burrow is pre-1.0 software,
 so security and behavior changes may still be substantial between versions.
 
-## Unreleased
+## 0.2.0 — 2026-08-13
+
+### Added
+
+- Add Smart Scan, combining recoverable cleanup, a focused ClamAV security
+  scan and system maintenance recommendations in one guided workflow.
+- Add an interactive disk-usage treemap with directory drill-down.
+- Add a live menu-bar widget for CPU, memory, disk, temperature and GPU status,
+  with shortcuts to Smart Scan and the activity journal.
+- Add a private, size-bounded, centralized activity journal for scans,
+  cleanups, app operations and maintenance actions.
+- Add working Apple Silicon thinning for universal application bundles,
+  including per-bundle discovery, verification and recovery of the original
+  application from the Trash.
 
 ### Security
 
@@ -13,6 +26,8 @@ so security and behavior changes may still be substantial between versions.
 - Harden ClamAV scanning and disk browsing against symbolic links, path
   replacement, unbounded output and concurrent process abuse.
 - Enforce backend-managed Touch ID protection for application removal.
+- Make user-facing cleanup and removal operations recoverable through the
+  macOS Trash, and remove irreversible Trash, snapshot and purge actions.
 
 ### Changed
 
@@ -22,6 +37,7 @@ so security and behavior changes may still be substantial between versions.
 - Add corresponding ClamAV source, third-party notices and automated resource
   integrity checks.
 - Add public contribution, security, issue and repository-maintenance guidance.
+- Add a production frontend build to continuous integration.
 
 ## 0.1.0 — 2026-08-12
 

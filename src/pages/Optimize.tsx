@@ -10,11 +10,8 @@ import {
   Loader2,
   CheckCircle2,
   AlertCircle,
-  Clock,
   HardDrive,
   Database,
-  Container,
-  Mail,
   ShieldCheck,
 } from "lucide-react";
 import { useMo } from "../hooks/useMo";
@@ -41,13 +38,6 @@ function getTasks(t: Record<string, string>) {
       admin: false,
     },
     {
-      id: "tmutil_thin",
-      label: t.task_tmutil_thin,
-      desc: t.task_tmutil_thin_desc,
-      icon: Clock,
-      admin: true,
-    },
-    {
       id: "periodic",
       label: t.task_periodic,
       desc: t.task_periodic_desc,
@@ -66,20 +56,6 @@ function getTasks(t: Record<string, string>) {
       label: t.task_launch_services,
       desc: t.task_launch_services_desc,
       icon: Database,
-      admin: false,
-    },
-    {
-      id: "docker_prune",
-      label: t.task_docker_prune,
-      desc: t.task_docker_prune_desc,
-      icon: Container,
-      admin: false,
-    },
-    {
-      id: "mail_speed",
-      label: t.task_mail_speed,
-      desc: t.task_mail_speed_desc,
-      icon: Mail,
       admin: false,
     },
   ];

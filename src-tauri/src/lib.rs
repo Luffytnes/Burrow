@@ -1,3 +1,4 @@
+mod activity;
 pub mod duplicates;
 pub mod gpu;
 mod guard;
@@ -15,6 +16,17 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
+
+fn show_main_window(app: &tauri::AppHandle, page: Option<&str>) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        if let Some(page) = page {
+            let _ = window.emit("navigate", page);
+        }
+    }
+}
 
 // ── ClamAV child-process store ────────────────────────────────────────────────
 
@@ -71,6 +83,7 @@ pub(crate) enum PathGrantPurpose {
     Quarantine = 2,
     LaunchItem = 4,
     Uninstall = 8,
+    Thin = 16,
 }
 
 struct PathGrant {
@@ -348,7 +361,8 @@ fn which_mo() -> Result<String, String> {
 
 fn du_mb(path: &Path) -> u64 {
     Command::new("/usr/bin/du")
-        .args(["-sk", &path.to_string_lossy()])
+        .args(["-s", "-k", "-P", "--"])
+        .arg(path)
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -877,37 +891,40 @@ fn uninstall_app(app: tauri::AppHandle, name: String, app_path: String) -> Resul
     }
 
     std::thread::spawn(move || {
-        let _ = app.emit("mo-output", format!("→ Suppression de {}…", name));
-
-        // Tentative 1 : suppression directe (apps dans ~/Applications)
-        match fs::remove_dir_all(&canonical) {
-            Ok(_) => {
-                let _ = app.emit("mo-output", format!("✓ {} désinstallé avec succès", name));
-                let _ = app.emit("mo-done", 0i32);
-                return;
-            }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::PermissionDenied
-                    || e.raw_os_error() == Some(13) =>
-            {
-                let _ = app.emit("mo-output", "→ Autorisations requises, demande en cours…");
-            }
-            Err(e) => {
-                let _ = app.emit("mo-output", format!("✗ Erreur : {}", e));
-                let _ = app.emit("mo-done", 1i32);
-                return;
-            }
-        }
-
-        // Tentative 2 : privilèges admin — quoting POSIX correct
-        let q = guard::posix_shell_quote(&canonical.to_string_lossy());
-        match run_admin_sh(&format!("/bin/rm -rf {}", q)) {
+        let _ = app.emit(
+            "mo-output",
+            format!("→ Déplacement de {} dans la Corbeille…", name),
+        );
+        let size = du_bytes(&canonical);
+        match move_path_to_trash(&canonical) {
             Ok(()) => {
-                let _ = app.emit("mo-output", format!("✓ {} désinstallé avec succès", name));
+                let _ = app.emit(
+                    "mo-output",
+                    format!(
+                        "✓ {} déplacé dans la Corbeille — restauration possible",
+                        name
+                    ),
+                );
+                activity::record(
+                    "applications",
+                    "Désinstallation récupérable",
+                    "success",
+                    &name,
+                    Some(size),
+                    true,
+                );
                 let _ = app.emit("mo-done", 0i32);
             }
             Err(e) => {
                 let _ = app.emit("mo-output", format!("✗ Échec : {}", e));
+                activity::record(
+                    "applications",
+                    "Désinstallation récupérable",
+                    "error",
+                    &name,
+                    Some(size),
+                    true,
+                );
                 let _ = app.emit("mo-done", 1i32);
             }
         }
@@ -1176,6 +1193,35 @@ fn move_to_trash(path: String) -> Result<(), String> {
     guard::validate_trash_path(&path)?;
     let path = require_path_grant(&path, PathGrantPurpose::Trash)?;
     guard::validate_trash_path(&path.to_string_lossy())?;
+    let size = if path.is_dir() {
+        du_bytes(&path)
+    } else {
+        fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    };
+    let result = move_path_to_trash(&path);
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("élément");
+    activity::record(
+        "suppression",
+        "Déplacement dans la Corbeille",
+        if result.is_ok() { "success" } else { "error" },
+        name,
+        Some(size),
+        true,
+    );
+    result
+}
+
+/// Déplace un chemin dans la Corbeille via Finder. Le chemin est transmis en
+/// argument AppleScript, jamais interpolé dans le code exécuté.
+fn move_path_to_trash(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
     let path = path.to_string_lossy().into_owned();
     // Pass the path as an argv value. Never interpolate a frontend-controlled path
     // into AppleScript source: macOS filenames may legally contain quotes/newlines.
@@ -1198,6 +1244,35 @@ end run"#;
     }
 }
 
+fn move_directory_children_to_trash(directory: &Path) -> Result<u64, String> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut moved = 0u64;
+    let mut errors = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let size = if path.is_dir() {
+            du_bytes(&path)
+        } else {
+            fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        };
+        match move_path_to_trash(&path) {
+            Ok(()) => moved = moved.saturating_add(size),
+            Err(error) => errors.push(error),
+        }
+    }
+    if errors.is_empty() {
+        Ok(moved)
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 fn quit_application(name: &str) {
     let script = r#"on run argv
 tell application (item 1 of argv) to quit
@@ -1215,6 +1290,57 @@ pub struct CleanCategorySize {
     pub size_mb: u64,
 }
 
+#[derive(Serialize)]
+pub struct SmartScanResult {
+    pub clean_categories: Vec<CleanCategorySize>,
+    pub safe_clean_bytes: u64,
+    pub clamav_ready: bool,
+    pub definitions_outdated: bool,
+    pub maintenance_recommendations: Vec<String>,
+    pub disk_used_percent: f64,
+}
+
+#[tauri::command]
+fn run_smart_scan(app: tauri::AppHandle) -> SmartScanResult {
+    let clean_categories = get_clean_sizes();
+    let safe_clean_bytes = clean_categories
+        .iter()
+        .filter(|category| category.id != "trash" && category.id != "ios_backups")
+        .map(|category| category.size_mb.saturating_mul(1024 * 1024))
+        .sum();
+    let clamav = check_clamav(app.clone());
+    let metrics = get_quick_metrics();
+    let mut maintenance_recommendations = vec!["dns".to_string(), "diskutil_verify".to_string()];
+    if metrics.mem_used_percent >= 80.0 {
+        maintenance_recommendations.push("swap".to_string());
+    }
+    activity::record(
+        "smart scan",
+        "Diagnostic combiné",
+        "success",
+        &format!(
+            "{} récupérables · ClamAV {} · {} recommandations",
+            safe_clean_bytes,
+            if clamav.installed && clamav.has_database {
+                "prêt"
+            } else {
+                "indisponible"
+            },
+            maintenance_recommendations.len()
+        ),
+        Some(safe_clean_bytes),
+        false,
+    );
+    SmartScanResult {
+        clean_categories,
+        safe_clean_bytes,
+        clamav_ready: clamav.installed && clamav.has_database,
+        definitions_outdated: check_clamav_defs_outdated(app),
+        maintenance_recommendations,
+        disk_used_percent: metrics.disk_used_percent,
+    }
+}
+
 #[tauri::command]
 fn get_clean_sizes() -> Vec<CleanCategorySize> {
     let home = home_dir();
@@ -1225,7 +1351,6 @@ fn get_clean_sizes() -> Vec<CleanCategorySize> {
         ("crash_reports", home.join("Library/Logs/DiagnosticReports")),
         ("npm_cache", home.join(".npm")),
         ("yarn_cache", home.join(".yarn/cache")),
-        ("trash", home.join(".Trash")),
         ("xcode", home.join("Library/Developer/Xcode/DerivedData")),
         (
             "ios_backups",
@@ -1279,47 +1404,6 @@ fn get_clean_sizes() -> Vec<CleanCategorySize> {
 
 // ── 2. Run clean selection ────────────────────────────────────────────────────
 
-/// Supprime tous les enfants directs d'un répertoire.
-/// Si le répertoire n'existe pas, c'est un succès (rien à faire).
-fn delete_dir_children(dir: &std::path::Path) -> std::io::Result<()> {
-    match fs::read_dir(dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-        Ok(entries) => {
-            let mut first_err: Option<std::io::Error> = None;
-            for entry in entries.flatten() {
-                let p = entry.path();
-                let r = if p.is_dir() {
-                    fs::remove_dir_all(&p)
-                } else {
-                    fs::remove_file(&p)
-                };
-                if let Err(e) = r {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
-                }
-            }
-            match first_err {
-                None => Ok(()),
-                Some(e) => Err(e),
-            }
-        }
-    }
-}
-
-/// Supprime un chemin (fichier ou répertoire). Retourne Ok si n'existe pas.
-fn remove_if_exists(p: &std::path::Path) -> std::io::Result<()> {
-    if !p.exists() {
-        return Ok(());
-    }
-    if p.is_dir() {
-        fs::remove_dir_all(p)
-    } else {
-        fs::remove_file(p)
-    }
-}
-
 #[tauri::command]
 fn run_clean_selection(
     app: tauri::AppHandle,
@@ -1331,25 +1415,39 @@ fn run_clean_selection(
         let mut any_error = false;
 
         for cat_id in &categories {
-            let (label, result): (&str, std::io::Result<()>) = match cat_id.as_str() {
+            let (label, result): (&str, Result<u64, String>) = match cat_id.as_str() {
                 "user_cache" => (
                     "Cache utilisateur",
-                    delete_dir_children(&home.join("Library/Caches")),
+                    move_directory_children_to_trash(&home.join("Library/Caches")),
                 ),
                 "system_logs" => (
                     "Logs système",
-                    delete_dir_children(&home.join("Library/Logs")),
+                    move_directory_children_to_trash(&home.join("Library/Logs")),
                 ),
                 "crash_reports" => (
                     "Rapports de crash",
-                    delete_dir_children(&home.join("Library/Logs/DiagnosticReports")),
+                    move_directory_children_to_trash(
+                        &home.join("Library/Logs/DiagnosticReports"),
+                    ),
                 ),
                 "npm_cache" => {
-                    let r1 = remove_if_exists(&home.join(".npm/cache"));
-                    let r2 = remove_if_exists(&home.join(".npm/_logs"));
-                    ("Cache npm", r1.and(r2))
+                    let mut moved = 0u64;
+                    let result = [home.join(".npm/cache"), home.join(".npm/_logs")]
+                        .iter()
+                        .try_for_each(|path| {
+                            let size = du_bytes(path);
+                            move_path_to_trash(path)?;
+                            moved = moved.saturating_add(size);
+                            Ok::<(), String>(())
+                        })
+                        .map(|_| moved);
+                    ("Cache npm", result)
                 }
-                "yarn_cache" => ("Cache yarn", remove_if_exists(&home.join(".yarn/cache"))),
+                "yarn_cache" => {
+                    let path = home.join(".yarn/cache");
+                    let size = du_bytes(&path);
+                    ("Cache yarn", move_path_to_trash(&path).map(|_| size))
+                }
                 "browser_cache" => {
                     let paths = [
                         home.join("Library/Caches/com.apple.Safari"),
@@ -1359,51 +1457,71 @@ fn run_clean_selection(
                             "Library/Application Support/BraveSoftware/Brave-Browser/Default/Cache",
                         ),
                     ];
-                    let r = paths.iter().try_fold((), |(), p| remove_if_exists(p));
-                    ("Caches navigateurs", r)
+                    let mut moved = 0u64;
+                    let result = paths
+                        .iter()
+                        .try_for_each(|path| {
+                            let size = du_bytes(path);
+                            move_path_to_trash(path)?;
+                            moved = moved.saturating_add(size);
+                            Ok::<(), String>(())
+                        })
+                        .map(|_| moved);
+                    ("Caches navigateurs", result)
                 }
-                "trash" => {
-                    let out = Command::new("/usr/bin/osascript")
-                        .args(["-e", "tell application \"Finder\" to empty trash"])
-                        .output();
-                    let r = match out {
-                        Ok(o) if o.status.success() => Ok(()),
-                        Ok(o) => Err(std::io::Error::other(
-                            String::from_utf8_lossy(&o.stderr).trim().to_string(),
-                        )),
-                        Err(e) => Err(e),
-                    };
-                    ("Corbeille", r)
-                }
+                "trash" => (
+                    "Corbeille",
+                    Err("Burrow n'efface jamais la Corbeille : utilisez Finder pour cette action irréversible".to_string()),
+                ),
                 "xcode" => (
                     "Xcode DerivedData",
-                    delete_dir_children(&home.join("Library/Developer/Xcode/DerivedData")),
+                    move_directory_children_to_trash(
+                        &home.join("Library/Developer/Xcode/DerivedData"),
+                    ),
                 ),
                 "ios_backups" => (
                     "Sauvegardes iOS",
-                    delete_dir_children(
+                    move_directory_children_to_trash(
                         &home.join("Library/Application Support/MobileSync/Backup"),
                     ),
                 ),
                 "brew_cache" => (
                     "Cache Homebrew",
-                    delete_dir_children(&home.join("Library/Caches/Homebrew")),
+                    move_directory_children_to_trash(&home.join("Library/Caches/Homebrew")),
                 ),
                 "simulator" => (
                     "Cache Simulateur iOS",
-                    delete_dir_children(&home.join("Library/Developer/CoreSimulator/Caches")),
+                    move_directory_children_to_trash(
+                        &home.join("Library/Developer/CoreSimulator/Caches"),
+                    ),
                 ),
                 _ => continue,
             };
 
             let _ = app.emit("mo-output", format!("→ {}", label));
             match result {
-                Ok(_) => {
+                Ok(bytes) => {
                     let _ = app.emit("mo-output", format!("  ✓ {}", label));
+                    activity::record(
+                        "nettoyage",
+                        "Nettoyage récupérable",
+                        "success",
+                        label,
+                        Some(bytes),
+                        true,
+                    );
                 }
                 Err(e) => {
                     any_error = true;
                     let _ = app.emit("mo-output", format!("  ✗ {} : {}", label, e));
+                    activity::record(
+                        "nettoyage",
+                        "Nettoyage récupérable",
+                        "error",
+                        label,
+                        None,
+                        true,
+                    );
                 }
             }
         }
@@ -1432,18 +1550,35 @@ fn run_clean_selection(
                 let _ = app.emit("mo-output", format!("  ✗ {} : chemin refusé ({})", name, e));
                 continue;
             }
-            let result = if p.is_dir() {
-                fs::remove_dir_all(&p)
+            let size = if p.is_dir() {
+                du_bytes(&p)
             } else {
-                fs::remove_file(&p)
+                fs::metadata(&p).map(|metadata| metadata.len()).unwrap_or(0)
             };
+            let result = move_path_to_trash(&p);
             match result {
                 Ok(_) => {
                     let _ = app.emit("mo-output", format!("  ✓ {}", name));
+                    activity::record(
+                        "nettoyage",
+                        "Installateur déplacé dans la Corbeille",
+                        "success",
+                        name,
+                        Some(size),
+                        true,
+                    );
                 }
                 Err(e) => {
                     any_error = true;
                     let _ = app.emit("mo-output", format!("  ✗ {} : {}", name, e));
+                    activity::record(
+                        "nettoyage",
+                        "Installateur déplacé dans la Corbeille",
+                        "error",
+                        name,
+                        Some(size),
+                        true,
+                    );
                 }
             }
         }
@@ -1464,12 +1599,9 @@ fn run_optimize_selection(app: tauri::AppHandle, tasks: Vec<String>) {
             ("dock", "Dock"),
             ("swap", "Mémoire swap"),
             ("launchpad", "Launchpad"),
-            ("tmutil_thin", "Time Machine (thin)"),
             ("periodic", "Scripts périodiques"),
             ("diskutil_verify", "Vérification disque"),
             ("launch_services", "Base de données apps"),
-            ("docker_prune", "Docker (nettoyage)"),
-            ("mail_speed", "Mail (accélération)"),
         ];
 
         let mut any_error = false;
@@ -1508,9 +1640,6 @@ fn run_optimize_selection(app: tauri::AppHandle, tasks: Vec<String>) {
                             .unwrap_or(false);
                         r1 && r2
                     }
-                    "tmutil_thin" => {
-                        run_admin_sh("/usr/bin/tmutil thinlocalsnapshots / 999999999999 4").is_ok()
-                    }
                     "periodic" => run_admin_sh("/usr/sbin/periodic daily weekly monthly").is_ok(),
                     "diskutil_verify" => Command::new("/usr/sbin/diskutil")
                         .args(["verifyVolume", "/"])
@@ -1528,38 +1657,30 @@ fn run_optimize_selection(app: tauri::AppHandle, tasks: Vec<String>) {
                             .map(|o| o.status.success())
                             .unwrap_or(false)
                     }
-                    "docker_prune" => ["/opt/homebrew/bin/docker", "/usr/local/bin/docker"]
-                        .iter()
-                        .find(|path| Path::new(path).is_file())
-                        .and_then(|path| {
-                            Command::new(path)
-                                .args(["system", "prune", "-f"])
-                                .output()
-                                .ok()
-                        })
-                        .map(|output| output.status.success())
-                        .unwrap_or(false),
-                    "mail_speed" => {
-                        let home = home_dir();
-                        let envelope = home.join("Library/Mail/V10/MailData/Envelope Index");
-                        let envelope_alt = home.join("Library/Mail/V9/MailData/Envelope Index");
-                        let target = if envelope.exists() {
-                            Some(envelope)
-                        } else if envelope_alt.exists() {
-                            Some(envelope_alt)
-                        } else {
-                            None
-                        };
-                        target.map(|p| fs::remove_file(p).is_ok()).unwrap_or(false)
-                    }
                     _ => false,
                 };
 
                 if success {
                     let _ = app.emit("mo-output", format!("  ✓ {}", label));
+                    activity::record(
+                        "optimisation",
+                        "Tâche de maintenance",
+                        "success",
+                        label,
+                        None,
+                        false,
+                    );
                 } else {
                     any_error = true;
                     let _ = app.emit("mo-output", format!("  ✗ {}", label));
+                    activity::record(
+                        "optimisation",
+                        "Tâche de maintenance",
+                        "error",
+                        label,
+                        None,
+                        false,
+                    );
                 }
             }
         }
@@ -3220,8 +3341,10 @@ fn start_clamav_scan(app: tauri::AppHandle, paths: Vec<String>) {
         let scan_roots_found = scan_roots.clone();
         let output_lines = Arc::new(AtomicU64::new(0));
         let output_bytes = Arc::new(AtomicU64::new(0));
+        let threat_count = Arc::new(AtomicU64::new(0));
         let stdout_lines = Arc::clone(&output_lines);
         let stdout_bytes = Arc::clone(&output_bytes);
+        let stdout_threats = Arc::clone(&threat_count);
         let stderr_lines = Arc::clone(&output_lines);
         let stderr_bytes = Arc::clone(&output_bytes);
 
@@ -3239,6 +3362,7 @@ fn start_clamav_scan(app: tauri::AppHandle, paths: Vec<String>) {
                 }
 
                 if line.ends_with(" FOUND") {
+                    stdout_threats.fetch_add(1, Ordering::Relaxed);
                     if let Some((raw_path, _)) = line.rsplit_once(": ") {
                         // Validate the FOUND path:
                         // - must still exist (canonicalize is the TOCTOU guard)
@@ -3295,8 +3419,33 @@ fn start_clamav_scan(app: tauri::AppHandle, paths: Vec<String>) {
         if let Ok(mut slot) = scan_child_store().lock() {
             *slot = None;
         }
+        let threats = threat_count.load(Ordering::Relaxed);
+        activity::record(
+            "sécurité",
+            "Analyse ClamAV",
+            if code == 0 || code == 1 {
+                "success"
+            } else {
+                "error"
+            },
+            &format!("{threats} menace(s) détectée(s)"),
+            None,
+            false,
+        );
         let _ = app.emit("scan-done", code);
     });
+}
+
+#[tauri::command]
+fn start_smart_security_scan(app: tauri::AppHandle) {
+    let home = home_dir();
+    let targets = ["Downloads", "Desktop", "Documents"]
+        .iter()
+        .map(|name| home.join(name))
+        .filter(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    start_clamav_scan(app, targets);
 }
 
 #[tauri::command]
@@ -3484,19 +3633,30 @@ fn restore_from_quarantine(name: String) -> Result<(), String> {
 fn delete_from_quarantine(name: String) -> Result<(), String> {
     guard::validate_quarantine_name(&name)?;
     let qpath = quarantine_dir().join(&name);
-    if qpath.is_dir() {
-        fs::remove_dir_all(&qpath)
+    let size = if qpath.is_dir() {
+        du_bytes(&qpath)
     } else {
-        fs::remove_file(&qpath)
-    }
-    .map_err(|e| e.to_string())?;
+        fs::metadata(&qpath)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    };
+    move_path_to_trash(&qpath)?;
 
     let meta = read_quarantine_meta();
     let new_meta: Vec<_> = meta
         .into_iter()
         .filter(|m| m["name"].as_str() != Some(&name))
         .collect();
-    write_quarantine_meta(&new_meta)
+    write_quarantine_meta(&new_meta)?;
+    activity::record(
+        "sécurité",
+        "Quarantaine déplacée dans la Corbeille",
+        "success",
+        &name,
+        Some(size),
+        true,
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -3728,19 +3888,6 @@ fn get_purgeable_space() -> PurgeableInfo {
     }
 }
 
-#[tauri::command]
-fn purge_purgeable_space() -> Result<u64, String> {
-    let before = get_purgeable_space().purgeable_bytes;
-    let out = Command::new("/usr/sbin/diskutil")
-        .args(["apfs", "purgePurgeable", "/"])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-    }
-    Ok(before)
-}
-
 // ── Time Machine local snapshots ──────────────────────────────────────────────
 
 #[derive(Serialize, Clone)]
@@ -3823,25 +3970,6 @@ fn scan_tm_snapshots() -> Vec<TmSnapshot> {
         .collect()
 }
 
-#[tauri::command]
-fn delete_tm_snapshot(date: String) -> Result<(), String> {
-    if !scan_tm_snapshots()
-        .iter()
-        .any(|snapshot| snapshot.date == date)
-    {
-        return Err("Snapshot non autorisé : relancez l'analyse".to_string());
-    }
-    let out = Command::new("/usr/bin/tmutil")
-        .args(["deletelocalsnapshots", &date])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
-}
-
 // ── Xcode simulator runtimes ──────────────────────────────────────────────────
 
 #[derive(Serialize, Clone)]
@@ -3914,25 +4042,6 @@ fn scan_simulator_runtimes() -> Vec<SimRuntime> {
         .collect()
 }
 
-#[tauri::command]
-fn delete_simulator_runtime(identifier: String) -> Result<(), String> {
-    if !scan_simulator_runtimes()
-        .iter()
-        .any(|runtime| runtime.identifier == identifier && runtime.deletable)
-    {
-        return Err("Runtime non autorisé ou non supprimable : relancez l'analyse".to_string());
-    }
-    let out = Command::new("/usr/bin/xcrun")
-        .args(["simctl", "runtime", "delete", &identifier])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
-}
-
 // ── AI Apps cache paths ───────────────────────────────────────────────────────
 
 #[derive(Serialize, Clone)]
@@ -3995,7 +4104,7 @@ fn scan_ai_caches() -> Vec<AiCacheItem> {
         ),
     ];
 
-    candidates
+    let results: Vec<AiCacheItem> = candidates
         .iter()
         .filter_map(|(id, label, rel)| {
             let p = home.join(rel);
@@ -4017,7 +4126,11 @@ fn scan_ai_caches() -> Vec<AiCacheItem> {
                 size_bytes,
             })
         })
-        .collect()
+        .collect();
+    for item in &results {
+        grant_path(Path::new(&item.path), PathGrantPurpose::Trash);
+    }
+    results
 }
 
 #[tauri::command]
@@ -4025,20 +4138,23 @@ fn clean_ai_caches(ids: Vec<String>) -> Result<u64, String> {
     let all = scan_ai_caches();
     let mut freed = 0u64;
     for item in all.iter().filter(|i| ids.contains(&i.id)) {
-        let p = Path::new(&item.path);
+        let p = require_path_grant(&item.path, PathGrantPurpose::Trash)?;
+        guard::validate_trash_path(&p.to_string_lossy())?;
         let size = if p.is_dir() {
-            du_bytes(p)
+            du_bytes(&p)
         } else {
-            fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+            fs::metadata(&p).map(|m| m.len()).unwrap_or(0)
         };
-        let deleted = if p.is_dir() {
-            fs::remove_dir_all(p).is_ok()
-        } else {
-            fs::remove_file(p).is_ok()
-        };
-        if deleted {
-            freed += size;
-        }
+        move_path_to_trash(&p)?;
+        freed = freed.saturating_add(size);
+        activity::record(
+            "nettoyage",
+            "Cache IA déplacé dans la Corbeille",
+            "success",
+            &item.label,
+            Some(size),
+            true,
+        );
     }
     Ok(freed)
 }
@@ -4110,7 +4226,7 @@ fn scan_dev_caches() -> Vec<DevCacheItem> {
         ("spm", "Swift PM — Cache", spm_path),
     ];
 
-    candidates
+    let results: Vec<DevCacheItem> = candidates
         .into_iter()
         .filter_map(|(id, label, path)| {
             let p = Path::new(&path);
@@ -4128,7 +4244,11 @@ fn scan_dev_caches() -> Vec<DevCacheItem> {
                 size_bytes,
             })
         })
-        .collect()
+        .collect();
+    for item in &results {
+        grant_path(Path::new(&item.path), PathGrantPurpose::Trash);
+    }
+    results
 }
 
 #[tauri::command]
@@ -4136,16 +4256,19 @@ fn clean_dev_caches(ids: Vec<String>) -> Result<u64, String> {
     let all = scan_dev_caches();
     let mut freed = 0u64;
     for item in all.iter().filter(|i| ids.contains(&i.id)) {
-        let p = Path::new(&item.path);
-        let size = du_bytes(p);
-        let deleted = if p.is_dir() {
-            fs::remove_dir_all(p).is_ok()
-        } else {
-            fs::remove_file(p).is_ok()
-        };
-        if deleted {
-            freed += size;
-        }
+        let p = require_path_grant(&item.path, PathGrantPurpose::Trash)?;
+        guard::validate_trash_path(&p.to_string_lossy())?;
+        let size = du_bytes(&p);
+        move_path_to_trash(&p)?;
+        freed = freed.saturating_add(size);
+        activity::record(
+            "nettoyage",
+            "Cache développeur déplacé dans la Corbeille",
+            "success",
+            &item.label,
+            Some(size),
+            true,
+        );
     }
     Ok(freed)
 }
@@ -7487,24 +7610,6 @@ fn get_large_files() -> Vec<LargeFile> {
     files
 }
 
-#[tauri::command]
-fn empty_trash() -> Result<(), String> {
-    let out = Command::new("/usr/bin/osascript")
-        .args(["-e", r#"tell application "Finder" to empty trash"#])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        let e = String::from_utf8_lossy(&out.stderr).to_string();
-        Err(if e.is_empty() {
-            "Échec".to_string()
-        } else {
-            e
-        })
-    }
-}
-
 // ── DerivedData project breakdown ─────────────────────────────────────────────
 
 #[derive(Serialize, Clone)]
@@ -8180,18 +8285,49 @@ pub struct UniversalBinaryEntry {
     pub path: String,
     pub total_size_bytes: u64,
     pub reclaimable_bytes: u64,
-    // Always true — codesign --deep doesn't descend into Contents/Resources,
-    // leaving nested Mach-O files with mismatched Team IDs → crash at spawn.
+    pub binary_count: usize,
     pub thinning_unsafe: bool,
     pub thinning_warning: String,
 }
 
-fn is_universal_binary(path: &Path) -> bool {
-    let Ok(out) = Command::new("/usr/bin/file").arg(path).output() else {
+#[derive(Serialize)]
+pub struct ThinResult {
+    pub bytes_saved: u64,
+    pub binary_count: usize,
+    pub original_in_trash: bool,
+}
+
+fn is_fat_macho_candidate(path: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
-    let s = String::from_utf8_lossy(&out.stdout);
-    s.contains("x86_64") && s.contains("arm64")
+    let mut magic = [0u8; 4];
+    if file.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    matches!(
+        magic,
+        [0xca, 0xfe, 0xba, 0xbe]
+            | [0xbe, 0xba, 0xfe, 0xca]
+            | [0xca, 0xfe, 0xba, 0xbf]
+            | [0xbf, 0xba, 0xfe, 0xca]
+    )
+}
+
+fn is_universal_binary(path: &Path) -> bool {
+    if !is_fat_macho_candidate(path) {
+        return false;
+    }
+    let Ok(out) = Command::new("/usr/bin/lipo")
+        .args(["-archs"])
+        .arg(path)
+        .output()
+    else {
+        return false;
+    };
+    let arches = String::from_utf8_lossy(&out.stdout);
+    arches.split_whitespace().any(|arch| arch == "x86_64")
+        && arches.split_whitespace().any(|arch| arch == "arm64")
 }
 
 fn app_bundle_id(app_path: &Path) -> String {
@@ -8207,52 +8343,333 @@ fn app_bundle_id(app_path: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn scan_app_fatbinaries(app_path: &Path) -> Vec<UniversalBinaryEntry> {
+fn collect_universal_files(app_path: &Path) -> Vec<PathBuf> {
+    const MAX_VISITED_FILES: usize = 100_000;
+    let mut stack = vec![app_path.to_path_buf()];
+    let mut visited = 0usize;
     let mut results = Vec::new();
-    let macos_dir = app_path.join("Contents/MacOS");
-    let Ok(entries) = fs::read_dir(&macos_dir) else {
-        return results;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.is_file() && is_universal_binary(&p) {
-            let total = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-            results.push(UniversalBinaryEntry {
-                name: p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string(),
-                path: p.to_string_lossy().to_string(),
-                total_size_bytes: total,
-                reclaimable_bytes: total / 2,
-                thinning_unsafe: true,
-                thinning_warning: "L'amincissement peut corrompre la signature de l'app (codesign --deep ne descend pas dans Contents/Resources). Désactivé par sécurité.".to_string(),
-            });
+
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > MAX_VISITED_FILES {
+                return results;
+            }
+            let path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                stack.push(path);
+            } else if metadata.is_file() && is_universal_binary(&path) {
+                results.push(path);
+            }
         }
     }
     results
+}
+
+fn scan_app_fatbinaries(app_path: &Path) -> Option<UniversalBinaryEntry> {
+    let binaries = collect_universal_files(app_path);
+    if binaries.is_empty() {
+        return None;
+    }
+    let total_size_bytes = binaries
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .sum::<u64>();
+    grant_path(app_path, PathGrantPurpose::Thin);
+    Some(UniversalBinaryEntry {
+        name: app_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("Application")
+            .to_string(),
+        path: app_path.to_string_lossy().into_owned(),
+        total_size_bytes,
+        reclaimable_bytes: total_size_bytes / 2,
+        binary_count: binaries.len(),
+        thinning_unsafe: false,
+        thinning_warning: "L'original sera déplacé dans la Corbeille. Burrow amincit une copie, la re-signe localement puis vérifie son intégrité avant remplacement.".to_string(),
+    })
 }
 
 #[tauri::command]
 async fn scan_universal_binaries() -> Vec<UniversalBinaryEntry> {
     tauri::async_runtime::spawn_blocking(|| {
         let mut results = Vec::new();
-        let apps_dir = Path::new("/Applications");
-        let Ok(entries) = fs::read_dir(apps_dir) else {
-            return results;
-        };
-        for entry in entries.flatten() {
-            let app_path = entry.path();
-            if app_path.extension().and_then(|e| e.to_str()) != Some("app") {
+        let application_dirs = [
+            PathBuf::from("/Applications"),
+            home_dir().join("Applications"),
+        ];
+        for apps_dir in application_dirs {
+            let Ok(entries) = fs::read_dir(apps_dir) else {
                 continue;
+            };
+            for entry in entries.flatten() {
+                let app_path = entry.path();
+                if app_path.extension().and_then(|e| e.to_str()) != Some("app") {
+                    continue;
+                }
+                let bundle_id = app_bundle_id(&app_path);
+                if bundle_id.starts_with("com.apple.") || bundle_id == "com.karimachi.burrow" {
+                    continue;
+                }
+                if let Some(entry) = scan_app_fatbinaries(&app_path) {
+                    results.push(entry);
+                }
             }
-            if app_bundle_id(&app_path).starts_with("com.apple.") {
-                continue;
-            }
-            results.extend(scan_app_fatbinaries(&app_path));
         }
         results.sort_by_key(|k| std::cmp::Reverse(k.reclaimable_bytes));
         results
     })
     .await
     .unwrap_or_default()
+}
+
+fn thin_file_to_arm64(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Dossier du binaire introuvable".to_string())?;
+    let temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    let permissions = fs::metadata(path)
+        .map_err(|error| error.to_string())?
+        .permissions();
+    let output = Command::new("/usr/bin/lipo")
+        .arg(path)
+        .args(["-thin", "arm64", "-output"])
+        .arg(temporary.path())
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(permissions.mode()))
+        .map_err(|error| error.to_string())?;
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error.to_string())
+}
+
+fn adhoc_sign_code(path: &Path, deep: bool) -> Result<(), String> {
+    let already_signed = Command::new("/usr/bin/codesign")
+        .args(["--display"])
+        .arg(path)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    let mut command = Command::new("/usr/bin/codesign");
+    command.args(["--force", "--sign", "-"]);
+    if deep {
+        command.arg("--deep");
+    }
+    if already_signed {
+        command.arg("--preserve-metadata=identifier,entitlements,requirements,flags,runtime");
+    }
+    let output = command
+        .arg(path)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn verify_signed_code(path: &Path, deep: bool) -> Result<(), String> {
+    let mut command = Command::new("/usr/bin/codesign");
+    command.args(["--verify", "--strict"]);
+    if deep {
+        command.arg("--deep");
+    }
+    let output = command
+        .arg(path)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+#[cfg(test)]
+mod universal_binary_tests {
+    use super::*;
+
+    #[test]
+    fn detects_and_thins_a_real_universal_macho() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source = directory.path().join("fixture.c");
+        let binary = directory.path().join("fixture");
+        fs::write(&source, "int main(void) { return 0; }\n").expect("write fixture source");
+
+        let build = Command::new("/usr/bin/xcrun")
+            .args(["clang", "-arch", "arm64", "-arch", "x86_64"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .expect("invoke clang");
+        assert!(
+            build.status.success(),
+            "clang failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        assert!(is_universal_binary(&binary));
+
+        thin_file_to_arm64(&binary).expect("thin fixture");
+        let arches = Command::new("/usr/bin/lipo")
+            .args(["-archs"])
+            .arg(&binary)
+            .output()
+            .expect("inspect thinned fixture");
+        assert!(arches.status.success());
+        let arches = String::from_utf8_lossy(&arches.stdout);
+        assert!(arches.split_whitespace().any(|arch| arch == "arm64"));
+        assert!(!arches.split_whitespace().any(|arch| arch == "x86_64"));
+
+        adhoc_sign_code(&binary, false).expect("sign thinned fixture");
+        verify_signed_code(&binary, false).expect("verify thinned fixture");
+    }
+}
+
+fn install_prepared_app(source: &Path, destination: &Path) -> Result<(), String> {
+    let direct = Command::new("/usr/bin/ditto")
+        .args(["--noqtn"])
+        .arg(source)
+        .arg(destination)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if direct.status.success() {
+        return Ok(());
+    }
+    let source = guard::posix_shell_quote(&source.to_string_lossy());
+    let destination = guard::posix_shell_quote(&destination.to_string_lossy());
+    run_admin_sh(&format!("/usr/bin/ditto --noqtn {source} {destination}"))
+}
+
+#[tauri::command]
+async fn thin_universal_app(
+    app: tauri::AppHandle,
+    name: String,
+    app_path: String,
+) -> Result<ThinResult, String> {
+    guard::validate_app_uninstall_path(&app_path)?;
+    let canonical = require_path_grant(&app_path, PathGrantPurpose::Thin)?;
+    guard::validate_app_uninstall_path(&canonical.to_string_lossy())?;
+    if canonical.file_stem().and_then(|value| value.to_str()) != Some(name.as_str()) {
+        return Err("Le nom ne correspond pas à l'application analysée".to_string());
+    }
+    if touchid_enabled(&app) {
+        run_touchid(&app, &format!("Amincir {name}"))?;
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let before = du_bytes(&canonical);
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let staged = temporary.path().join(
+            canonical
+                .file_name()
+                .ok_or_else(|| "Nom d'application invalide".to_string())?,
+        );
+        let copy = Command::new("/usr/bin/ditto")
+            .args(["--noqtn"])
+            .arg(&canonical)
+            .arg(&staged)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !copy.status.success() {
+            return Err(String::from_utf8_lossy(&copy.stderr).trim().to_string());
+        }
+
+        let binaries = collect_universal_files(&staged);
+        if binaries.is_empty() {
+            return Err("Aucun binaire universel n'est encore présent".to_string());
+        }
+        for binary in &binaries {
+            thin_file_to_arm64(binary)?;
+            adhoc_sign_code(binary, false).map_err(|error| {
+                format!("Re-signature d'un composant allégé impossible : {error}")
+            })?;
+        }
+
+        adhoc_sign_code(&staged, true)
+            .map_err(|error| format!("Re-signature locale impossible : {error}"))?;
+        for binary in &binaries {
+            verify_signed_code(binary, false).map_err(|error| {
+                format!("Vérification d'un composant allégé impossible : {error}")
+            })?;
+        }
+        verify_signed_code(&staged, true)
+            .map_err(|error| format!("Vérification de la copie allégée impossible : {error}"))?;
+
+        let parent = canonical
+            .parent()
+            .ok_or_else(|| "Dossier Applications introuvable".to_string())?;
+        let prepared = parent.join(format!(".burrow-thinned-{}.app", uuid::Uuid::new_v4()));
+        install_prepared_app(&staged, &prepared)?;
+        quit_application(&name);
+        if let Err(error) = move_path_to_trash(&canonical) {
+            let _ = if prepared.is_dir() {
+                fs::remove_dir_all(&prepared)
+            } else {
+                fs::remove_file(&prepared)
+            };
+            return Err(format!("L'original n'a pas pu être sauvegardé dans la Corbeille : {error}"));
+        }
+
+        let installed = fs::rename(&prepared, &canonical).or_else(|_| {
+            let source = guard::posix_shell_quote(&prepared.to_string_lossy());
+            let destination = guard::posix_shell_quote(&canonical.to_string_lossy());
+            run_admin_sh(&format!("/bin/mv {source} {destination}"))
+                .map_err(std::io::Error::other)
+        });
+        if let Err(error) = installed {
+            activity::record(
+                "applications",
+                "Amincissement de binaire universel",
+                "error",
+                &format!("{name} — original conservé dans la Corbeille"),
+                None,
+                true,
+            );
+            return Err(format!(
+                "La copie allégée n'a pas pu être installée. L'original reste dans la Corbeille : {error}"
+            ));
+        }
+
+        let after = du_bytes(&canonical);
+        let bytes_saved = before.saturating_sub(after);
+        activity::record(
+            "applications",
+            "Amincissement de binaire universel",
+            "success",
+            &format!("{name} — original conservé dans la Corbeille"),
+            Some(bytes_saved),
+            true,
+        );
+        Ok(ThinResult {
+            bytes_saved,
+            binary_count: binaries.len(),
+            original_in_trash: true,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 // ── Login Items / LaunchAgents ─────────────────────────────────────────────────
@@ -8438,9 +8855,6 @@ fn find_related_launch_items(plist_path: String) -> Vec<String> {
 
 #[tauri::command]
 fn delete_launch_items(plist_paths: Vec<String>) -> Result<(), String> {
-    let home = home_dir();
-    let home_str = home.to_string_lossy().to_string();
-    let mut sys_paths: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
     for p in &plist_paths {
@@ -8457,38 +8871,40 @@ fn delete_launch_items(plist_paths: Vec<String>) -> Result<(), String> {
             errors.push(format!("{}: {}", p, e));
             continue;
         }
-        if canonical_str.starts_with(&home_str) {
-            // User-level: pas besoin d'admin, Command::arg() — aucune interpolation
-            let _ = Command::new("/bin/launchctl")
-                .args(["unload", "-w", &canonical_str])
-                .output();
-            if let Err(e) = fs::remove_file(&canonical) {
-                errors.push(format!("{}: {}", canonical.display(), e));
+        let unloaded = Command::new("/bin/launchctl")
+            .args(["unload", "-w", &canonical_str])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !unloaded && !canonical_str.starts_with(&home_dir().to_string_lossy().to_string()) {
+            let quoted = guard::posix_shell_quote(&canonical_str);
+            if let Err(error) = run_admin_sh(&format!("/bin/launchctl unload -w {quoted}")) {
+                errors.push(format!("{}: {}", canonical.display(), error));
+                continue;
             }
+        }
+        if let Err(error) = move_path_to_trash(&canonical) {
+            errors.push(format!("{}: {}", canonical.display(), error));
         } else {
-            sys_paths.push(canonical_str);
+            let name = canonical
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("Launch Item");
+            activity::record(
+                "démarrage",
+                "Élément déplacé dans la Corbeille",
+                "success",
+                name,
+                None,
+                true,
+            );
         }
     }
 
     if !errors.is_empty() {
         return Err(errors.join("; "));
     }
-    if sys_paths.is_empty() {
-        return Ok(());
-    }
-
-    // Construction du script admin avec quoting POSIX correct (guard::posix_shell_quote)
-    let sys_cmds: Vec<String> = sys_paths
-        .iter()
-        .map(|p| {
-            let q = guard::posix_shell_quote(p);
-            format!(
-                "/bin/launchctl unload -w {} 2>/dev/null; /bin/rm -f {}",
-                q, q
-            )
-        })
-        .collect();
-    run_admin_sh(&sys_cmds.join("; "))
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -8766,7 +9182,7 @@ fn resolve_privacy_items(home: &Path) -> Vec<(String, String, PathBuf)> {
 #[tauri::command]
 fn scan_privacy_items() -> Vec<PrivacyItem> {
     let home = home_dir();
-    resolve_privacy_items(&home)
+    let results: Vec<PrivacyItem> = resolve_privacy_items(&home)
         .into_iter()
         .filter_map(|(id, label, p)| {
             let size_bytes = if p.is_dir() {
@@ -8784,33 +9200,41 @@ fn scan_privacy_items() -> Vec<PrivacyItem> {
                 size_bytes,
             })
         })
-        .collect()
+        .collect();
+    for item in &results {
+        grant_path(Path::new(&item.path), PathGrantPurpose::Trash);
+    }
+    results
 }
 
 #[tauri::command]
 fn clean_privacy_items(ids: Vec<String>) -> Result<u64, String> {
     let home = home_dir();
     let mut freed: u64 = 0;
-    for (id, _, p) in resolve_privacy_items(&home) {
+    for (id, label, p) in resolve_privacy_items(&home) {
         if !ids.iter().any(|x| x == &id) {
             continue;
         }
         if !p.exists() {
             continue;
         }
+        let canonical = require_path_grant(&p.to_string_lossy(), PathGrantPurpose::Trash)?;
+        guard::validate_trash_path(&canonical.to_string_lossy())?;
         let size = if p.is_dir() {
             du_mb(&p).saturating_mul(1024 * 1024)
         } else {
             fs::metadata(&p).map(|m| m.len()).unwrap_or(0)
         };
-        let ok = if p.is_dir() {
-            fs::remove_dir_all(&p).is_ok()
-        } else {
-            fs::remove_file(&p).is_ok()
-        };
-        if ok {
-            freed += size;
-        }
+        move_path_to_trash(&canonical)?;
+        freed = freed.saturating_add(size);
+        activity::record(
+            "confidentialité",
+            "Données déplacées dans la Corbeille",
+            "success",
+            &label,
+            Some(size),
+            true,
+        );
     }
     Ok(freed)
 }
@@ -8834,7 +9258,18 @@ fn posix_applescript_string(shell_cmd: &str) -> String {
 
 // ── Admin helper : sudo (Touch ID via pam_tid.so) → fallback osascript ───────
 
+fn validate_admin_script(script: &str) -> Result<(), String> {
+    if script
+        .chars()
+        .any(|character| matches!(character, '\n' | '\r' | '\0'))
+    {
+        return Err("Commande administrateur invalide".to_string());
+    }
+    Ok(())
+}
+
 fn run_admin_sh(script: &str) -> Result<(), String> {
+    validate_admin_script(script)?;
     // -n : non-interactif — réussit uniquement si Touch ID / sudo_local est configuré,
     // échoue immédiatement sinon (pas de prompt terminal depuis une app GUI)
     let sudo_ok = Command::new("/usr/bin/sudo")
@@ -8857,6 +9292,26 @@ fn run_admin_sh(script: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+#[cfg(test)]
+mod admin_command_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_control_characters_before_any_privileged_execution() {
+        assert!(validate_admin_script("/bin/echo ok\n/bin/echo injected").is_err());
+        assert!(validate_admin_script("/bin/echo ok\r/bin/echo injected").is_err());
+        assert!(validate_admin_script("/bin/echo ok\0injected").is_err());
+    }
+
+    #[test]
+    fn accepts_the_typed_maintenance_command_shape() {
+        assert!(validate_admin_script(
+            "/usr/bin/dscacheutil -flushcache; /usr/bin/killall -HUP mDNSResponder"
+        )
+        .is_ok());
     }
 }
 
@@ -9086,57 +9541,132 @@ pub fn run() {
                 get_brew_outdated();  // pré-chauffe le cache brew cask
             });
 
-            // ── Menu bar (tray icon) ──────────────────────────────────────────
+            // ── Menu bar widget ───────────────────────────────────────────────
+            use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+            let widget_status = MenuItem::with_id(
+                app,
+                "widget-status",
+                "CPU —  · Mémoire —  · Disque —",
+                false,
+                None::<&str>,
+            )?;
+            let widget_thermal = MenuItem::with_id(
+                app,
+                "widget-thermal",
+                "Température —  · GPU —",
+                false,
+                None::<&str>,
+            )?;
+            let open_smart = MenuItem::with_id(
+                app,
+                "open-smart-scan",
+                "Lancer Smart Scan…",
+                true,
+                None::<&str>,
+            )?;
+            let open_activity = MenuItem::with_id(
+                app,
+                "open-activity",
+                "Ouvrir le journal d’activité",
+                true,
+                None::<&str>,
+            )?;
+            let open_burrow = MenuItem::with_id(
+                app,
+                "open-burrow",
+                "Ouvrir Burrow",
+                true,
+                None::<&str>,
+            )?;
+            let quit_burrow = MenuItem::with_id(
+                app,
+                "quit-burrow",
+                "Quitter Burrow",
+                true,
+                None::<&str>,
+            )?;
+            let tray_menu = Menu::with_items(
+                app,
+                &[
+                    &widget_status,
+                    &widget_thermal,
+                    &PredefinedMenuItem::separator(app)?,
+                    &open_smart,
+                    &open_activity,
+                    &open_burrow,
+                    &PredefinedMenuItem::separator(app)?,
+                    &quit_burrow,
+                ],
+            )?;
             let mut tray_builder = tauri::tray::TrayIconBuilder::new();
             if let Some(icon) = app.default_window_icon() {
                 tray_builder = tray_builder.icon(icon.clone());
             }
             let tray = tray_builder
-                .title(" 💾")
-                .tooltip("Burrow — Cliquer pour ouvrir")
+                .title(" Burrow")
+                .tooltip("Burrow — état du Mac")
+                .menu(&tray_menu)
+                .show_menu_on_left_click(true)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "open-smart-scan" => show_main_window(app, Some("smart-scan")),
+                    "open-activity" => show_main_window(app, Some("activity")),
+                    "open-burrow" => show_main_window(app, None),
+                    "quit-burrow" => app.exit(0),
+                    _ => {}
+                })
                 .on_tray_icon_event(|tray, event| {
-                    if let tauri::tray::TrayIconEvent::Click {
-                        button: tauri::tray::MouseButton::Left, ..
+                    if let tauri::tray::TrayIconEvent::DoubleClick {
+                        button: tauri::tray::MouseButton::Left,
+                        ..
                     } = event {
-                        if let Some(w) = tray.app_handle().get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
+                        show_main_window(tray.app_handle(), None);
                     }
                 })
                 .build(app)?;
 
-            // ── Background disk monitor: update tray + notifications ──────────
+            // Refresh the widget immediately, then every five seconds. Disk
+            // notifications remain throttled and only transition at thresholds.
             std::thread::spawn(move || {
                 loop {
-                    std::thread::sleep(Duration::from_secs(300));
-                    use sysinfo::Disks;
-                    let disks = Disks::new_with_refreshed_list();
-                    let (used, total) = disks.list().iter()
-                        .find(|d| d.mount_point() == std::path::Path::new("/"))
-                        .map(|d| (d.total_space() - d.available_space(), d.total_space()))
-                        .unwrap_or((0, 1));
-                    if total == 0 { continue; }
-                    let pct = ((used * 100) / total) as u8;
-                    let label = if pct >= 90 { format!(" 🔴 {}%", pct) }
-                        else if pct >= 80 { format!(" ⚠️ {}%", pct) }
-                        else { format!(" 💾 {}%", pct) };
-                    let _ = tray.set_title(Some(&label));
+                    let metrics = get_quick_metrics();
+                    let disk_pct = metrics.disk_used_percent.round() as u8;
+                    let menu_title = if disk_pct >= 90 {
+                        format!(" 🔴 {disk_pct}%")
+                    } else {
+                        format!(" CPU {:.0}%", metrics.cpu_usage)
+                    };
+                    let _ = tray.set_title(Some(&menu_title));
+                    let _ = widget_status.set_text(format!(
+                        "CPU {:.0}%  · Mémoire {:.0}%  · Disque {disk_pct}%",
+                        metrics.cpu_usage, metrics.mem_used_percent
+                    ));
+                    let temperature = if metrics.soc_temp > 0.0 {
+                        metrics.soc_temp
+                    } else {
+                        metrics.cpu_temp
+                    };
+                    let _ = widget_thermal.set_text(format!(
+                        "Température {:.0}°C  · GPU {:.0}%",
+                        temperature, metrics.gpu_busy_percent
+                    ));
 
                     let last = LAST_NOTIF_PCT.load(Ordering::Relaxed);
-                    if pct >= 90 && last < 90 {
+                    if disk_pct >= 90 && last < 90 {
                         let _ = Command::new("/usr/bin/osascript")
                             .args(["-e", "display notification \"Votre disque est rempli à plus de 90 %. Nettoyez maintenant.\" with title \"Burrow\""])
                             .output();
                         LAST_NOTIF_PCT.store(90, Ordering::Relaxed);
-                    } else if pct >= 80 && last < 80 {
+                    } else if disk_pct >= 80 && last < 80 {
                         let _ = Command::new("/usr/bin/osascript")
                             .args(["-e", "display notification \"Votre disque est rempli à 80 %.\" with title \"Burrow\""])
                             .output();
                         LAST_NOTIF_PCT.store(80, Ordering::Relaxed);
+                    } else if disk_pct < 80 && last != 0 {
+                        LAST_NOTIF_PCT.store(0, Ordering::Relaxed);
                     }
 
-                    save_disk_sample_if_needed(used, total);
+                    save_disk_sample_if_needed(metrics.disk_used, metrics.disk_total);
+                    std::thread::sleep(Duration::from_secs(5));
                 }
             });
 
@@ -9154,6 +9684,8 @@ pub fn run() {
             check_full_disk_access,
             open_full_disk_access_settings,
             get_clean_sizes,
+            run_smart_scan,
+            start_smart_security_scan,
             run_clean_selection,
             run_optimize_selection,
             get_net_rates,
@@ -9191,7 +9723,6 @@ pub fn run() {
             get_dev_caches,
             get_project_artifacts,
             get_large_files,
-            empty_trash,
             get_derived_data_projects,
             is_xcode_running,
             get_disk_forecast,
@@ -9215,6 +9746,7 @@ pub fn run() {
             get_launch_at_login,
             set_launch_at_login,
             scan_universal_binaries,
+            thin_universal_app,
             scan_login_items,
             scan_deleted_users,
             scan_privacy_items,
@@ -9223,15 +9755,14 @@ pub fn run() {
             find_related_launch_items,
             delete_launch_items,
             get_purgeable_space,
-            purge_purgeable_space,
             scan_tm_snapshots,
-            delete_tm_snapshot,
             scan_simulator_runtimes,
-            delete_simulator_runtime,
             scan_ai_caches,
             clean_ai_caches,
             scan_dev_caches,
             clean_dev_caches,
+            activity::list_activity,
+            activity::clear_activity,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

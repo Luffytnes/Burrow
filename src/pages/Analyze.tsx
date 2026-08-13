@@ -121,7 +121,6 @@ function OverviewTab() {
   const [categories, setCategories] = useState<DiskCategory[] | null>(null);
   const [diskInfo, setDiskInfo] = useState<{ used: number; total: number } | null>(null);
   const [trashSize, setTrashSize] = useState<number | null>(null);
-  const [emptyBusy, setEmptyBusy] = useState(false);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
@@ -244,27 +243,9 @@ function OverviewTab() {
         <span className="text-[11px]" style={{ color: "var(--text-3)" }}>
           {trashSize != null ? fmtBytes(trashSize) : "—"}
         </span>
-        <button
-          onClick={async () => {
-            setEmptyBusy(true);
-            try {
-              await invoke("empty_trash");
-              setTrashSize(0);
-            } catch (e) {
-              console.error("empty_trash:", e);
-            }
-            setEmptyBusy(false);
-          }}
-          disabled={emptyBusy || !trashSize}
-          className="text-xs px-2.5 py-1 rounded-lg transition-opacity disabled:opacity-40 flex items-center gap-1"
-          style={{
-            background: "var(--bg)",
-            color: "var(--danger)",
-            border: "1px solid var(--border)",
-          }}
-        >
-          {emptyBusy ? <Loader2 size={11} className="animate-spin" /> : "Vider"}
-        </button>
+        <span className="text-[10px]" style={{ color: "var(--success)" }}>
+          Restauration possible via Finder
+        </span>
       </div>
     </div>
   );
