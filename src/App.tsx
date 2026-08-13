@@ -32,7 +32,7 @@ function PageFallback() {
 }
 
 export default function App() {
-  const [active, setActive] = useState("dashboard");
+  const [active, setActive] = useState("smart-scan");
   // Once Clean is visited once, keep it mounted permanently (avoids re-scan on every navigation)
   const [cleanMounted, setCleanMounted] = useState(active === "clean");
   const reducedMotion = useReducedMotion();
@@ -68,7 +68,7 @@ export default function App() {
       case "activity":
         return <ActivityPage />;
       default:
-        return <Dashboard onNavigate={setActive} />;
+        return <SmartScan />;
     }
   };
 

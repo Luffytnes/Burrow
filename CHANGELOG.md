@@ -3,6 +3,20 @@
 All notable changes to Burrow are documented here. Burrow is pre-1.0 software,
 so security and behavior changes may still be substantial between versions.
 
+## 0.2.1 — 2026-08-13
+
+### Fixed
+
+- Replace the legacy transparent app-icon canvas with an opaque, full-bleed
+  macOS icon so macOS 26 no longer adds a grey compatibility enclosure.
+- Remove an intermediate `.burrow-thinned-*.app` copy if the final
+  universal-binary replacement cannot be installed.
+
+### Changed
+
+- Open Burrow on Smart Scan by default.
+- Replace the README hero image with the Smart Scan interface.
+
 ## 0.2.0 — 2026-08-13
 
 ### Added

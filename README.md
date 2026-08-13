@@ -26,10 +26,10 @@
 <br>
 
 <p align="center">
-  <img src="docs/images/burrow-dashboard.png" width="1100" alt="Burrow system dashboard on macOS">
+  <img src="docs/images/burrow-smart-scan.png" width="1100" alt="Burrow Smart Scan on macOS">
 </p>
 <p align="center">
-  <sub>Live system health, hardware telemetry, storage, network activity and processes — in one glance.</sub>
+  <sub>Cleanup, security and optimization — brought together in one guided Smart Scan.</sub>
 </p>
 
 ---

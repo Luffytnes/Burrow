@@ -8511,6 +8511,28 @@ mod universal_binary_tests {
     use super::*;
 
     #[test]
+    fn removes_a_valid_intermediate_application_copy() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let prepared = directory.path().join(".burrow-thinned-fixture.app");
+        fs::create_dir(&prepared).expect("create prepared app");
+        fs::write(prepared.join("fixture"), b"temporary").expect("write prepared app");
+
+        remove_prepared_app(&prepared).expect("remove prepared app");
+
+        assert!(!prepared.exists());
+    }
+
+    #[test]
+    fn refuses_to_remove_an_unrelated_path() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let unrelated = directory.path().join("Keep.app");
+        fs::create_dir(&unrelated).expect("create unrelated app");
+
+        assert!(remove_prepared_app(&unrelated).is_err());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
     fn detects_and_thins_a_real_universal_macho() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let source = directory.path().join("fixture.c");
@@ -8560,6 +8582,33 @@ fn install_prepared_app(source: &Path, destination: &Path) -> Result<(), String>
     let source = guard::posix_shell_quote(&source.to_string_lossy());
     let destination = guard::posix_shell_quote(&destination.to_string_lossy());
     run_admin_sh(&format!("/usr/bin/ditto --noqtn {source} {destination}"))
+}
+
+fn remove_prepared_app(path: &Path) -> Result<(), String> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if !file_name.starts_with(".burrow-thinned-") || !file_name.ends_with(".app") {
+        return Err("Chemin de copie intermédiaire invalide".to_string());
+    }
+
+    let direct = if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    if direct.is_ok() || !path.exists() {
+        return Ok(());
+    }
+
+    let quoted = guard::posix_shell_quote(&path.to_string_lossy());
+    run_admin_sh(&format!("/bin/rm -rf -- {quoted}"))?;
+    if path.exists() {
+        Err("La copie intermédiaire n'a pas pu être supprimée".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -8624,11 +8673,12 @@ async fn thin_universal_app(
         install_prepared_app(&staged, &prepared)?;
         quit_application(&name);
         if let Err(error) = move_path_to_trash(&canonical) {
-            let _ = if prepared.is_dir() {
-                fs::remove_dir_all(&prepared)
-            } else {
-                fs::remove_file(&prepared)
-            };
+            let cleanup = remove_prepared_app(&prepared);
+            if let Err(cleanup_error) = cleanup {
+                return Err(format!(
+                    "L'original n'a pas pu être sauvegardé dans la Corbeille : {error}. {cleanup_error}"
+                ));
+            }
             return Err(format!("L'original n'a pas pu être sauvegardé dans la Corbeille : {error}"));
         }
 
@@ -8639,6 +8689,7 @@ async fn thin_universal_app(
                 .map_err(std::io::Error::other)
         });
         if let Err(error) = installed {
+            let cleanup_error = remove_prepared_app(&prepared).err();
             activity::record(
                 "applications",
                 "Amincissement de binaire universel",
@@ -8647,8 +8698,11 @@ async fn thin_universal_app(
                 None,
                 true,
             );
+            let cleanup_status = cleanup_error
+                .map(|cleanup| format!(" La copie intermédiaire doit aussi être retirée manuellement : {cleanup}"))
+                .unwrap_or_default();
             return Err(format!(
-                "La copie allégée n'a pas pu être installée. L'original reste dans la Corbeille : {error}"
+                "La copie allégée n'a pas pu être installée. L'original reste dans la Corbeille : {error}.{cleanup_status}"
             ));
         }
 

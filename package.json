@@ -1,7 +1,7 @@
 {
   "name": "burrow",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "macOS cleaning & maintenance toolbox built with Tauri",
   "license": "MIT",
   "repository": {
