@@ -4351,7 +4351,8 @@ fn get_all_processes() -> Vec<ProcessEntry> {
     sys.refresh_cpu_usage();
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
-        ProcessRefreshKind::new()
+        true,
+        ProcessRefreshKind::nothing()
             .with_cpu()
             .with_memory()
             .with_disk_usage(),
@@ -4360,7 +4361,8 @@ fn get_all_processes() -> Vec<ProcessEntry> {
     sys.refresh_cpu_usage();
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
-        ProcessRefreshKind::new()
+        true,
+        ProcessRefreshKind::nothing()
             .with_cpu()
             .with_memory()
             .with_disk_usage(),
@@ -5007,7 +5009,8 @@ fn start_process_daemon(app_handle: tauri::AppHandle) {
         sys.refresh_cpu_usage();
         sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
-            ProcessRefreshKind::new()
+            true,
+            ProcessRefreshKind::nothing()
                 .with_cpu()
                 .with_memory()
                 .with_disk_usage(),
@@ -5017,7 +5020,8 @@ fn start_process_daemon(app_handle: tauri::AppHandle) {
             sys.refresh_cpu_usage();
             sys.refresh_processes_specifics(
                 ProcessesToUpdate::All,
-                ProcessRefreshKind::new()
+                true,
+                ProcessRefreshKind::nothing()
                     .with_cpu()
                     .with_memory()
                     .with_disk_usage(),
