@@ -19,7 +19,6 @@ interface DnsOption {
   label: string;
   desc: string;
   servers: string[];
-  hostnames?: string[];
   doH?: string;
   classic?: boolean;
   filter: FilterType;
@@ -65,7 +64,6 @@ const PROVIDERS: DnsProvider[] = [
         label: "Standard",
         desc: "Résolution pure, aucun filtrage",
         servers: ["194.242.2.2"],
-        hostnames: ["dns.mullvad.net"],
         doH: "https://dns.mullvad.net/dns-query",
         filter: "none",
       },
@@ -74,7 +72,6 @@ const PROVIDERS: DnsProvider[] = [
         label: "Pub & trackers",
         desc: "Bloque publicités et trackers",
         servers: ["194.242.2.3"],
-        hostnames: ["adblock.dns.mullvad.net"],
         doH: "https://adblock.dns.mullvad.net/dns-query",
         filter: "ads",
       },
@@ -83,7 +80,6 @@ const PROVIDERS: DnsProvider[] = [
         label: "Pub + malwares",
         desc: "Bloque pub, trackers et domaines malveillants",
         servers: ["194.242.2.4"],
-        hostnames: ["base.dns.mullvad.net"],
         doH: "https://base.dns.mullvad.net/dns-query",
         filter: "ads+malware",
       },
@@ -92,7 +88,6 @@ const PROVIDERS: DnsProvider[] = [
         label: "Pub + malwares + social",
         desc: "Idem base + réseaux sociaux bloqués",
         servers: ["194.242.2.5"],
-        hostnames: ["extended.dns.mullvad.net"],
         doH: "https://extended.dns.mullvad.net/dns-query",
         filter: "ads+malware+social",
       },
@@ -101,7 +96,6 @@ const PROVIDERS: DnsProvider[] = [
         label: "Famille",
         desc: "Pub, malwares, contenus adultes et jeux d'argent bloqués",
         servers: ["194.242.2.6"],
-        hostnames: ["family.dns.mullvad.net"],
         doH: "https://family.dns.mullvad.net/dns-query",
         filter: "family",
       },
@@ -110,7 +104,6 @@ const PROVIDERS: DnsProvider[] = [
         label: "Tout filtrer",
         desc: "Filtrage maximal — pub, malwares, adulte, jeux, réseaux soc.",
         servers: ["194.242.2.9"],
-        hostnames: ["all.dns.mullvad.net"],
         doH: "https://all.dns.mullvad.net/dns-query",
         filter: "all",
       },
@@ -141,7 +134,6 @@ const PROVIDERS: DnsProvider[] = [
         label: "Sécurisé",
         desc: "Blocage malwares + DNSSEC validé",
         servers: ["9.9.9.9", "149.112.112.112"],
-        hostnames: ["dns.quad9.net", "dns.quad9.net"],
         doH: "https://dns.quad9.net/dns-query",
         filter: "malware",
       },
@@ -150,7 +142,6 @@ const PROVIDERS: DnsProvider[] = [
         label: "Sans filtre",
         desc: "Résolution pure, DNSSEC désactivé",
         servers: ["9.9.9.10", "149.112.112.10"],
-        hostnames: ["dns10.quad9.net", "dns10.quad9.net"],
         doH: "https://dns10.quad9.net/dns-query",
         filter: "none",
       },
@@ -159,7 +150,6 @@ const PROVIDERS: DnsProvider[] = [
         label: "Sécurisé + ECS",
         desc: "Blocage malwares + EDNS Client Subnet",
         servers: ["9.9.9.11", "149.112.112.11"],
-        hostnames: ["dns11.quad9.net", "dns11.quad9.net"],
         doH: "https://dns11.quad9.net/dns-query",
         filter: "malware",
       },
@@ -210,7 +200,6 @@ const PROVIDERS: DnsProvider[] = [
         label: "Standard",
         desc: "Résolution neutre avec validation DNSSEC, sans filtrage ni journalisation",
         servers: ["80.67.169.12", "80.67.169.40"],
-        hostnames: ["ns0.fdn.fr", "ns1.fdn.fr"],
         doH: "https://ns0.fdn.fr/dns-query",
         classic: false,
         filter: "none",
@@ -346,7 +335,6 @@ const PROVIDERS: DnsProvider[] = [
         label: "Standard",
         desc: "Bloque pubs, traqueurs et domaines malveillants",
         servers: ["94.140.14.14", "94.140.15.15"],
-        hostnames: ["dns.adguard-dns.com", "dns.adguard-dns.com"],
         doH: "https://dns.adguard-dns.com/dns-query",
         filter: "ads+malware",
       },
@@ -355,7 +343,6 @@ const PROVIDERS: DnsProvider[] = [
         label: "Famille",
         desc: "Standard + filtre contenu adulte",
         servers: ["94.140.14.15", "94.140.15.16"],
-        hostnames: ["family.adguard-dns.com", "family.adguard-dns.com"],
         doH: "https://family.adguard-dns.com/dns-query",
         filter: "family",
       },
@@ -364,7 +351,6 @@ const PROVIDERS: DnsProvider[] = [
         label: "Sans filtre",
         desc: "Résolution pure, aucun blocage",
         servers: ["94.140.14.140", "94.140.14.141"],
-        hostnames: ["unfiltered.adguard-dns.com", "unfiltered.adguard-dns.com"],
         doH: "https://unfiltered.adguard-dns.com/dns-query",
         filter: "none",
       },
@@ -389,7 +375,6 @@ const PROVIDERS: DnsProvider[] = [
         label: "Standard",
         desc: "DNS pur, aucun filtrage",
         servers: ["1.1.1.1", "1.0.0.1"],
-        hostnames: ["one.one.one.one", "1dot1dot1dot1.cloudflare-dns.com"],
         doH: "https://cloudflare-dns.com/dns-query",
         filter: "none",
       },
@@ -430,7 +415,6 @@ const PROVIDERS: DnsProvider[] = [
         label: "Standard",
         desc: "DNS pur, neutre, aucun filtrage ni log",
         servers: ["84.200.69.80", "84.200.70.40"],
-        hostnames: ["resolver1.dns.watch", "resolver2.dns.watch"],
         filter: "none",
       },
     ],
@@ -536,7 +520,6 @@ export default function DnsPage() {
   const [selections, setSelections] = useState<Record<string, string>>(() =>
     Object.fromEntries(PROVIDERS.map((p) => [p.id, p.options[0].id]))
   );
-  const [dnsMode, setDnsMode] = useState<"hostname" | "ip">("hostname");
   const [useDoH, setUseDoH] = useState(true);
   const [installingDoH, setInstallingDoH] = useState(false);
   const [searchDomains, setSearchDomains] = useState<string[]>([]);
@@ -626,9 +609,6 @@ export default function DnsPage() {
     setInstallingDoH(false);
   };
 
-  const getServers = (option: DnsOption) =>
-    dnsMode === "hostname" && option.hostnames?.length ? option.hostnames : option.servers;
-
   const apply = async (provider: DnsProvider) => {
     if (!selectedSvc) return;
     const optId = selections[provider.id];
@@ -636,7 +616,11 @@ export default function DnsPage() {
     if (!option || option.classic === false) return;
     setApplying(true);
     try {
-      await invoke("set_dns_servers", { service: selectedSvc, servers: getServers(option) });
+      await invoke("set_dns_servers", {
+        service: selectedSvc,
+        providerId: provider.id,
+        optionId: option.id,
+      });
       flash(true, `DNS ${provider.name} — ${option.label} appliqué avec succès`);
       await load();
     } catch (e) {
@@ -748,28 +732,6 @@ export default function DnsPage() {
                 DoH
               </button>
             </div>
-
-            {/* Hostname / IP (Classique only) */}
-            {!useDoH && (
-              <div
-                className="flex items-center rounded-lg overflow-hidden"
-                style={{ border: "1px solid var(--border)", background: "var(--bg-card)" }}
-              >
-                {(["hostname", "ip"] as const).map((mode) => (
-                  <button
-                    key={mode}
-                    onClick={() => setDnsMode(mode)}
-                    className="text-[10px] font-semibold px-2.5 py-1.5 transition-all"
-                    style={{
-                      background: dnsMode === mode ? "var(--accent)" : "transparent",
-                      color: dnsMode === mode ? "#fff" : "var(--text-3)",
-                    }}
-                  >
-                    {mode === "hostname" ? "Hostname" : "IP"}
-                  </button>
-                ))}
-              </div>
-            )}
 
             {/* Reset button */}
             <button
@@ -995,7 +957,7 @@ export default function DnsPage() {
                             className="font-mono text-[9px] mt-1"
                             style={{ color: "var(--text-3)" }}
                           >
-                            {getServers(selOpt).join(" · ")}
+                            {selOpt.servers.join(" · ")}
                           </p>
                         </div>
                       </div>

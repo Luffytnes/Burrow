@@ -293,10 +293,26 @@ pub fn validate_service_name(service: &str) -> Result<(), String> {
 /// Valide une adresse IP (v4 ou v6) pour usage DNS.
 pub fn validate_ip_address(ip: &str) -> Result<(), String> {
     use std::net::IpAddr;
-    ip.trim()
+    let address = ip
+        .trim()
         .parse::<IpAddr>()
-        .map(|_| ())
-        .map_err(|_| format!("Adresse IP invalide : {:?}", ip))
+        .map_err(|_| format!("Adresse IP invalide : {:?}", ip))?;
+    let reserved = match address {
+        IpAddr::V4(address) => {
+            address.is_unspecified()
+                || address.is_loopback()
+                || address.is_multicast()
+                || address.is_broadcast()
+                || address.is_link_local()
+        }
+        IpAddr::V6(address) => {
+            address.is_unspecified() || address.is_loopback() || address.is_multicast()
+        }
+    };
+    if reserved {
+        return Err(format!("Adresse IP réservée refusée : {:?}", ip));
+    }
+    Ok(())
 }
 
 /// Valide un nom de domaine de recherche.
@@ -941,7 +957,25 @@ mod tests {
         assert!(validate_ip_address("1.1.1.1").is_ok());
         assert!(validate_ip_address("8.8.8.8").is_ok());
         assert!(validate_ip_address("2606:4700:4700::1111").is_ok());
-        assert!(validate_ip_address("::1").is_ok());
+    }
+
+    #[test]
+    fn ip_rejects_reserved_dns_destinations() {
+        for address in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "169.254.1.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "ff02::1",
+        ] {
+            assert!(
+                validate_ip_address(address).is_err(),
+                "should reject reserved address: {address}"
+            );
+        }
     }
 
     #[test]

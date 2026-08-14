@@ -4609,11 +4609,13 @@ fn generate_doh_mobileconfig(
 ) -> String {
     let root_uuid = uuid_from_seed(&format!("{}_{}r", provider_id, option_id));
     let payload_uuid = uuid_from_seed(&format!("{}_{}p", provider_id, option_id));
-    let root_id = format!("net.burrow.dns.{}.{}", provider_id, option_id);
-    let payload_id = format!("com.apple.dnsSettings.managed.{}", payload_uuid);
+    let root_id = xml_escape(&format!("net.burrow.dns.{}.{}", provider_id, option_id));
+    let payload_id = xml_escape(&format!("com.apple.dnsSettings.managed.{}", payload_uuid));
+    let display_name = xml_escape(display_name);
+    let doh_url = xml_escape(doh_url);
     let addrs: String = servers
         .iter()
-        .map(|s| format!("\t\t\t\t\t<string>{}</string>", s))
+        .map(|s| format!("\t\t\t\t\t<string>{}</string>", xml_escape(s)))
         .collect::<Vec<_>>()
         .join("\n");
     format!(
@@ -4955,9 +4957,41 @@ fn doh_catalog() -> std::collections::HashMap<(&'static str, &'static str), DohE
     m
 }
 
+/// Catalogue DNS classique immuable. Le frontend ne choisit que le fournisseur et le profil ;
+/// les adresses effectivement appliquées restent définies et validées dans le backend.
+fn classic_dns_servers(provider_id: &str, option_id: &str) -> Option<&'static [&'static str]> {
+    match (provider_id, option_id) {
+        ("mullvad", "std") => Some(&["194.242.2.2"]),
+        ("mullvad", "adblock") => Some(&["194.242.2.3"]),
+        ("mullvad", "base") => Some(&["194.242.2.4"]),
+        ("mullvad", "extended") => Some(&["194.242.2.5"]),
+        ("mullvad", "family") => Some(&["194.242.2.6"]),
+        ("mullvad", "all") => Some(&["194.242.2.9"]),
+        ("quad9", "sec") => Some(&["9.9.9.9", "149.112.112.112"]),
+        ("quad9", "unf") => Some(&["9.9.9.10", "149.112.112.10"]),
+        ("quad9", "edns") => Some(&["9.9.9.11", "149.112.112.11"]),
+        ("libredns", "std") => Some(&["116.202.176.26"]),
+        ("dns4eu", "protective") => Some(&["86.54.11.1", "86.54.11.201"]),
+        ("dns4eu", "child") => Some(&["86.54.11.12", "86.54.11.212"]),
+        ("dns4eu", "noads") => Some(&["86.54.11.13", "86.54.11.213"]),
+        ("dns4eu", "child-noads") => Some(&["86.54.11.11", "86.54.11.211"]),
+        ("dns4eu", "unfiltered") => Some(&["86.54.11.100", "86.54.11.200"]),
+        ("dnssb", "std") => Some(&["185.222.222.222", "45.11.45.11"]),
+        ("opennic", "eu") => Some(&["91.190.185.43", "194.36.144.87"]),
+        ("adguard", "std") => Some(&["94.140.14.14", "94.140.15.15"]),
+        ("adguard", "family") => Some(&["94.140.14.15", "94.140.15.16"]),
+        ("adguard", "unf") => Some(&["94.140.14.140", "94.140.14.141"]),
+        ("cloudflare", "std") => Some(&["1.1.1.1", "1.0.0.1"]),
+        ("cloudflare", "mal") => Some(&["1.1.1.2", "1.0.0.2"]),
+        ("cloudflare", "family") => Some(&["1.1.1.3", "1.0.0.3"]),
+        ("dnswatch", "std") => Some(&["84.200.69.80", "84.200.70.40"]),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod doh_catalog_tests {
-    use super::doh_catalog;
+    use super::{classic_dns_servers, doh_catalog, generate_doh_mobileconfig, guard};
 
     #[test]
     fn contains_every_frontend_doh_option() {
@@ -4992,6 +5026,76 @@ mod doh_catalog_tests {
         for key in expected {
             assert!(catalog.contains_key(&key), "missing DoH entry: {key:?}");
         }
+    }
+
+    #[test]
+    fn classic_catalog_contains_only_curated_frontend_options() {
+        let expected = [
+            ("mullvad", "std"),
+            ("mullvad", "adblock"),
+            ("mullvad", "base"),
+            ("mullvad", "extended"),
+            ("mullvad", "family"),
+            ("mullvad", "all"),
+            ("quad9", "sec"),
+            ("quad9", "unf"),
+            ("quad9", "edns"),
+            ("libredns", "std"),
+            ("dns4eu", "protective"),
+            ("dns4eu", "child"),
+            ("dns4eu", "noads"),
+            ("dns4eu", "child-noads"),
+            ("dns4eu", "unfiltered"),
+            ("dnssb", "std"),
+            ("opennic", "eu"),
+            ("adguard", "std"),
+            ("adguard", "family"),
+            ("adguard", "unf"),
+            ("cloudflare", "std"),
+            ("cloudflare", "mal"),
+            ("cloudflare", "family"),
+            ("dnswatch", "std"),
+        ];
+        let doh = doh_catalog();
+
+        for key in expected {
+            let servers = classic_dns_servers(key.0, key.1)
+                .unwrap_or_else(|| panic!("missing classic DNS entry: {key:?}"));
+            assert!(!servers.is_empty());
+            for server in servers {
+                guard::validate_ip_address(server)
+                    .expect("catalog address must be public and valid");
+            }
+            if let Some(encrypted) = doh.get(&key) {
+                for server in servers {
+                    assert!(
+                        encrypted.servers.contains(server),
+                        "classic and DoH catalog disagree for {key:?}: {server}"
+                    );
+                }
+            }
+        }
+
+        assert!(classic_dns_servers("fdn", "std").is_none());
+        assert!(classic_dns_servers("unknown", "std").is_none());
+        assert!(classic_dns_servers("cloudflare", "unknown").is_none());
+    }
+
+    #[test]
+    fn mobileconfig_escapes_every_xml_value() {
+        let xml = generate_doh_mobileconfig(
+            "provider<&",
+            "option>\"",
+            "Display & <Name>",
+            "https://example.test/dns-query?a=1&b=2",
+            &["1.1.1.1".to_string(), "<invalid>".to_string()],
+        );
+
+        assert!(xml.contains("net.burrow.dns.provider&lt;&amp;.option&gt;&quot;"));
+        assert!(xml.contains("Display &amp; &lt;Name&gt;"));
+        assert!(xml.contains("dns-query?a=1&amp;b=2"));
+        assert!(xml.contains("<string>&lt;invalid&gt;</string>"));
+        assert!(!xml.contains("<string><invalid></string>"));
     }
 
     #[test]
@@ -5082,34 +5186,22 @@ fn install_doh_profile(provider_id: String, option_id: String) -> Result<(), Str
     Ok(())
 }
 
-fn resolve_to_ip(entry: &str) -> String {
-    if entry.parse::<std::net::IpAddr>().is_ok() {
-        return entry.to_string();
-    }
-    use std::net::ToSocketAddrs;
-    if let Ok(mut addrs) = format!("{}:53", entry).to_socket_addrs() {
-        if let Some(addr) = addrs.find(|a| a.ip().is_ipv4()) {
-            return addr.ip().to_string();
-        }
-    }
-    entry.to_string()
-}
-
 #[tauri::command]
-fn set_dns_servers(service: String, servers: Vec<String>) -> Result<(), String> {
+fn set_dns_servers(service: String, provider_id: String, option_id: String) -> Result<(), String> {
     guard::validate_service_name(&service)?;
-    if servers.is_empty() {
-        return Err("Aucun serveur DNS fourni".to_string());
-    }
-    // Valider chaque IP (les noms de domaine sont résolus côté backend)
-    let resolved: Vec<String> = servers.iter().map(|s| resolve_to_ip(s)).collect();
-    for ip in &resolved {
+    let servers = classic_dns_servers(&provider_id, &option_id).ok_or_else(|| {
+        format!(
+            "Profil DNS classique inconnu ou indisponible : {}/{}",
+            provider_id, option_id
+        )
+    })?;
+    for ip in servers {
         guard::validate_ip_address(ip).map_err(|e| format!("Serveur DNS invalide : {}", e))?;
     }
     // Utiliser Command::arg() — aucune interpolation shell
     let mut cmd = Command::new("/usr/sbin/networksetup");
     cmd.arg("-setdnsservers").arg(&service);
-    for ip in &resolved {
+    for ip in servers {
         cmd.arg(ip);
     }
     let out = cmd.output().map_err(|e| e.to_string())?;
@@ -5123,7 +5215,7 @@ fn set_dns_servers(service: String, servers: Vec<String>) -> Result<(), String> 
                 posix_applescript_string(&format!(
                     "networksetup -setdnsservers {} {}",
                     posix_shell_quote_value(&service),
-                    resolved
+                    servers
                         .iter()
                         .map(|s| posix_shell_quote_value(s))
                         .collect::<Vec<_>>()
@@ -8534,6 +8626,19 @@ fn scan_app_fatbinaries(app_path: &Path) -> Option<UniversalBinaryEntry> {
     })
 }
 
+fn is_scannable_app_bundle(app_path: &Path) -> bool {
+    if app_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("app")
+    {
+        return false;
+    }
+    fs::symlink_metadata(app_path)
+        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 #[tauri::command]
 async fn scan_universal_binaries() -> Vec<UniversalBinaryEntry> {
     tauri::async_runtime::spawn_blocking(|| {
@@ -8548,7 +8653,7 @@ async fn scan_universal_binaries() -> Vec<UniversalBinaryEntry> {
             };
             for entry in entries.flatten() {
                 let app_path = entry.path();
-                if app_path.extension().and_then(|e| e.to_str()) != Some("app") {
+                if !is_scannable_app_bundle(&app_path) {
                     continue;
                 }
                 let bundle_id = app_bundle_id(&app_path);
@@ -8616,6 +8721,23 @@ fn verify_signed_code(path: &Path, deep: bool) -> Result<(), String> {
 #[cfg(test)]
 mod universal_binary_tests {
     use super::*;
+
+    #[test]
+    fn scan_rejects_symlinked_application_roots() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let real_app = directory.path().join("Real.app");
+        let linked_app = directory.path().join("Linked.app");
+        let unrelated = directory.path().join("NotAnApp");
+        fs::create_dir(&real_app).expect("create real app");
+        fs::create_dir(&unrelated).expect("create unrelated directory");
+        symlink(&real_app, &linked_app).expect("create app symlink");
+
+        assert!(is_scannable_app_bundle(&real_app));
+        assert!(!is_scannable_app_bundle(&linked_app));
+        assert!(!is_scannable_app_bundle(&unrelated));
+    }
 
     fn build_universal(source: &Path, binary: &Path) {
         fs::write(source, "int main(void) { return 0; }\n").expect("write fixture source");

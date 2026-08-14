@@ -3,6 +3,24 @@
 All notable changes to Burrow are documented here. Burrow is pre-1.0 software,
 so security and behavior changes may still be substantial between versions.
 
+## Unreleased
+
+### Security
+
+- Lock classic DNS changes to an immutable backend catalogue selected by
+  provider and profile identifiers, instead of accepting server addresses from
+  the frontend.
+- Reject loopback, unspecified, multicast, broadcast and link-local addresses
+  in the DNS address validator.
+- Escape every dynamic XML value generated for encrypted-DNS configuration
+  profiles.
+
+### Fixed
+
+- Skip symbolic-link application roots while scanning for universal binaries.
+- Remove the redundant hostname mode from classic DNS configuration; macOS now
+  receives the curated static addresses published for each provider.
+
 ## 0.2.3 — 2026-08-14
 
 ### Added
