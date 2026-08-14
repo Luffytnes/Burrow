@@ -40,6 +40,20 @@ The upstream license is included at `src-tauri/resources/mole/LICENSE`.
 `burrow-smc` and `burrow-touchid` are Burrow components released under the
 repository's MIT License. Their sources are included alongside the resources.
 
+## DNS provider identifiers
+
+The provider artwork in `public/dns` is used solely to identify the respective
+DNS services in Burrow. Provider names, logos and trademarks remain the
+property of their respective owners and are not covered by Burrow's MIT
+License.
+
+New provider artwork and official service information for 0.2.3:
+
+- FDN: <https://www.fdn.fr/actions/dns/>
+- DNS4EU: <https://joindns4.eu/for-public>
+- DNS.SB: <https://dns.sb/>
+- OpenNIC: <https://opennic.org/>
+
 This notice is informational and is not legal advice. If a packaged build adds
 or replaces a binary dependency, update this document, the corresponding
 license text, version marker and checksum manifest in the same change.

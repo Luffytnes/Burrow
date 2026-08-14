@@ -3,7 +3,7 @@
 All notable changes to Burrow are documented here. Burrow is pre-1.0 software,
 so security and behavior changes may still be substantial between versions.
 
-## Unreleased
+## 0.2.3 — 2026-08-14
 
 ### Added
 
@@ -14,6 +14,9 @@ so security and behavior changes may still be substantial between versions.
   folder selection before scanning.
 - Add compatibility feedback for applications whose original code signature
   is invalid or missing.
+- Add FDN, DNS4EU, DNS.SB and OpenNIC to the private DNS catalog, including all
+  five official DNS4EU filtering profiles and encrypted DNS profiles wherever
+  the provider publishes a stable DoH endpoint.
 
 ### Fixed
 

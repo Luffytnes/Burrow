@@ -21,18 +21,22 @@ interface DnsOption {
   servers: string[];
   hostnames?: string[];
   doH?: string;
+  classic?: boolean;
   filter: FilterType;
 }
 
 interface DnsProvider {
   id: string;
   name: string;
+  logo?: string;
+  logoBackground?: string;
   country: string;
   flag: string;
   color: string;
   privacy: number;
   openSource: boolean | "partial";
   noLogs: boolean;
+  loggingLabel?: string;
   eu: boolean;
   description: string;
   features: string[];
@@ -181,6 +185,144 @@ const PROVIDERS: DnsProvider[] = [
         desc: "Résolution DNS sans filtre ni collecte",
         servers: ["116.202.176.26"],
         doH: "https://doh.libredns.gr/dns-query",
+        filter: "none",
+      },
+    ],
+  },
+  {
+    id: "fdn",
+    name: "FDN",
+    logo: "/dns/fdn.svg",
+    logoBackground: "#202431",
+    country: "France",
+    flag: "🇫🇷",
+    color: "#7B86B7",
+    privacy: 5,
+    openSource: true,
+    noLogs: true,
+    eu: true,
+    description:
+      "Résolveurs de French Data Network, fournisseur d'accès associatif français créé en 1992. FDN ne conserve aucun journal, valide DNSSEC et utilise des logiciels libres. Depuis mars 2025, le grand public doit passer par DoH ou DoT.",
+    features: ["Association", "Sans log", "DNSSEC", "IPv6", "DoH / DoT"],
+    options: [
+      {
+        id: "std",
+        label: "Standard",
+        desc: "Résolution neutre avec validation DNSSEC, sans filtrage ni journalisation",
+        servers: ["80.67.169.12", "80.67.169.40"],
+        hostnames: ["ns0.fdn.fr", "ns1.fdn.fr"],
+        doH: "https://ns0.fdn.fr/dns-query",
+        classic: false,
+        filter: "none",
+      },
+    ],
+  },
+  {
+    id: "dns4eu",
+    name: "DNS4EU",
+    logo: "/dns/dns4eu.png",
+    country: "Union européenne",
+    flag: "🇪🇺",
+    color: "#1E3856",
+    privacy: 4,
+    openSource: "partial",
+    noLogs: false,
+    loggingLabel: "IPs anonymisées",
+    eu: true,
+    description:
+      "Service public européen cofinancé par l'Union européenne et opéré par Whalebone en Tchéquie. Les adresses IP clientes sont anonymisées avant journalisation. Cinq profils permettent de choisir précisément le niveau de protection.",
+    features: ["Juridiction UE", "DNSSEC", "Anycast", "IPv6", "DoH / DoT"],
+    options: [
+      {
+        id: "protective",
+        label: "Protection",
+        desc: "Bloque les domaines frauduleux ou malveillants",
+        servers: ["86.54.11.1", "86.54.11.201"],
+        doH: "https://protective.joindns4.eu/dns-query",
+        filter: "malware",
+      },
+      {
+        id: "child",
+        label: "Protection enfants",
+        desc: "Protection contre les menaces et les contenus inadaptés aux enfants",
+        servers: ["86.54.11.12", "86.54.11.212"],
+        doH: "https://child.joindns4.eu/dns-query",
+        filter: "family",
+      },
+      {
+        id: "noads",
+        label: "Protectif + publicités",
+        desc: "Protection contre les menaces avec blocage des domaines publicitaires",
+        servers: ["86.54.11.13", "86.54.11.213"],
+        doH: "https://noads.joindns4.eu/dns-query",
+        filter: "ads+malware",
+      },
+      {
+        id: "child-noads",
+        label: "Famille + publicités",
+        desc: "Protection enfants, menaces et blocage publicitaire combinés",
+        servers: ["86.54.11.11", "86.54.11.211"],
+        doH: "https://child-noads.joindns4.eu/dns-query",
+        filter: "family",
+      },
+      {
+        id: "unfiltered",
+        label: "Sans filtre",
+        desc: "Résolution européenne anonymisée sans filtrage de contenu",
+        servers: ["86.54.11.100", "86.54.11.200"],
+        doH: "https://unfiltered.joindns4.eu/dns-query",
+        filter: "none",
+      },
+    ],
+  },
+  {
+    id: "dnssb",
+    name: "DNS.SB",
+    logo: "/dns/dnssb.ico",
+    logoBackground: "#ffffff",
+    country: "International",
+    flag: "🌍",
+    color: "#3569D4",
+    privacy: 4,
+    openSource: false,
+    noLogs: true,
+    eu: false,
+    description:
+      "Résolveur mondial axé confidentialité, exploité sur le réseau Anycast de xTom. DNS.SB annonce ne conserver aucun journal et propose DNSSEC ainsi que des transports chiffrés DoH et DoT.",
+    features: ["Sans log", "DNSSEC", "Anycast mondial", "IPv6", "DoH / DoT"],
+    options: [
+      {
+        id: "std",
+        label: "Standard",
+        desc: "Résolution rapide et neutre, sans filtrage annoncé",
+        servers: ["185.222.222.222", "45.11.45.11"],
+        doH: "https://doh.dns.sb/dns-query",
+        filter: "none",
+      },
+    ],
+  },
+  {
+    id: "opennic",
+    name: "OpenNIC",
+    logo: "/dns/opennic.png",
+    logoBackground: "#ffffff",
+    country: "Communautaire",
+    flag: "🌐",
+    color: "#4B5563",
+    privacy: 3,
+    openSource: "partial",
+    noLogs: false,
+    loggingLabel: "Politique variable",
+    eu: false,
+    description:
+      "Réseau DNS alternatif, démocratique et géré par des bénévoles. Il résout les domaines classiques ainsi que les extensions OpenNIC. Les serveurs sont opérés indépendamment : disponibilité et politique de journalisation peuvent varier.",
+    features: ["À but non lucratif", "Communautaire", "DNS alternatif", "Anti-censure"],
+    options: [
+      {
+        id: "eu",
+        label: "Europe",
+        desc: "Deux résolveurs communautaires actuellement opérationnels en France et Allemagne",
+        servers: ["91.190.185.43", "194.36.144.87"],
         filter: "none",
       },
     ],
@@ -344,9 +486,10 @@ function ProviderLogo({ p }: { p: DnsProvider }) {
   if (!err) {
     return (
       <img
-        src={`/dns/${p.id}.svg`}
+        src={p.logo ?? `/dns/${p.id}.svg`}
         alt={p.name}
         className="w-10 h-10 rounded-xl object-contain shrink-0"
+        style={{ background: p.logoBackground ?? "transparent", padding: p.logo ? 4 : 0 }}
         onError={() => {
           if (!errRef.current) {
             errRef.current = true;
@@ -364,6 +507,10 @@ function ProviderLogo({ p }: { p: DnsProvider }) {
     adguard: "AG",
     cloudflare: "CF",
     dnswatch: "W",
+    fdn: "FDN",
+    dns4eu: "EU",
+    dnssb: "SB",
+    opennic: "ON",
   };
   return (
     <div
@@ -486,7 +633,7 @@ export default function DnsPage() {
     if (!selectedSvc) return;
     const optId = selections[provider.id];
     const option = provider.options.find((o) => o.id === optId);
-    if (!option) return;
+    if (!option || option.classic === false) return;
     setApplying(true);
     try {
       await invoke("set_dns_servers", { service: selectedSvc, servers: getServers(option) });
@@ -797,7 +944,7 @@ export default function DnsPage() {
                       className="text-[9px] font-medium px-2 py-0.5 rounded-full"
                       style={{ background: "var(--bar-track)", color: "var(--text-3)" }}
                     >
-                      {provider.noLogs ? "✓ Sans log" : "Logs anonymes"}
+                      {provider.loggingLabel ?? (provider.noLogs ? "✓ Sans log" : "Logs anonymes")}
                     </span>
                     <span
                       className="text-[9px] font-medium px-2 py-0.5 rounded-full"
@@ -856,54 +1003,59 @@ export default function DnsPage() {
                   })()}
 
                   {/* Apply / DoH button */}
-                  {useDoH ? (
-                    (() => {
-                      const opt = provider.options.find((o) => o.id === selOptId);
-                      const hasDoH = !!opt?.doH;
-                      return (
-                        <button
-                          onClick={() => installDoH(provider)}
-                          disabled={installingDoH || !hasDoH}
-                          className="mt-auto w-full py-2 rounded-xl text-[12px] font-semibold transition-all flex items-center justify-center gap-1.5"
-                          style={{
-                            background: hasDoH ? "var(--violet)" : "var(--bar-track)",
-                            color: hasDoH ? "#fff" : "var(--text-3)",
-                            opacity: installingDoH ? 0.6 : 1,
-                            cursor: hasDoH ? "pointer" : "default",
-                          }}
-                        >
-                          {installingDoH
-                            ? "Préparation…"
-                            : hasDoH
-                              ? "🔒 Installer le profil DoH"
-                              : "DoH non disponible"}
-                        </button>
-                      );
-                    })()
-                  ) : (
-                    <button
-                      onClick={() => apply(provider)}
-                      disabled={applying || resetting || !selectedSvc}
-                      className="mt-auto w-full py-2 rounded-xl text-[12px] font-semibold transition-all"
-                      style={{
-                        background:
-                          isActive && identified?.option.id === selOptId
-                            ? "var(--bar-track)"
-                            : provider.color,
-                        color:
-                          isActive && identified?.option.id === selOptId ? "var(--text-3)" : "#fff",
-                        opacity: applying || resetting ? 0.5 : 1,
-                        cursor:
-                          isActive && identified?.option.id === selOptId ? "default" : "pointer",
-                      }}
-                    >
-                      {isActive && identified?.option.id === selOptId
-                        ? "✓ Déjà actif"
-                        : applying
-                          ? "Application…"
-                          : "Appliquer"}
-                    </button>
-                  )}
+                  {useDoH
+                    ? (() => {
+                        const opt = provider.options.find((o) => o.id === selOptId);
+                        const hasDoH = !!opt?.doH;
+                        return (
+                          <button
+                            onClick={() => installDoH(provider)}
+                            disabled={installingDoH || !hasDoH}
+                            className="mt-auto w-full py-2 rounded-xl text-[12px] font-semibold transition-all flex items-center justify-center gap-1.5"
+                            style={{
+                              background: hasDoH ? "var(--violet)" : "var(--bar-track)",
+                              color: hasDoH ? "#fff" : "var(--text-3)",
+                              opacity: installingDoH ? 0.6 : 1,
+                              cursor: hasDoH ? "pointer" : "default",
+                            }}
+                          >
+                            {installingDoH
+                              ? "Préparation…"
+                              : hasDoH
+                                ? "🔒 Installer le profil DoH"
+                                : "DoH non disponible"}
+                          </button>
+                        );
+                      })()
+                    : (() => {
+                        const option = provider.options.find((o) => o.id === selOptId);
+                        const classicAvailable = option?.classic !== false;
+                        const alreadyActive = isActive && identified?.option.id === selOptId;
+                        return (
+                          <button
+                            onClick={() => apply(provider)}
+                            disabled={applying || resetting || !selectedSvc || !classicAvailable}
+                            className="mt-auto w-full py-2 rounded-xl text-[12px] font-semibold transition-all"
+                            style={{
+                              background:
+                                !classicAvailable || alreadyActive
+                                  ? "var(--bar-track)"
+                                  : provider.color,
+                              color: !classicAvailable || alreadyActive ? "var(--text-3)" : "#fff",
+                              opacity: applying || resetting ? 0.5 : 1,
+                              cursor: classicAvailable && !alreadyActive ? "pointer" : "default",
+                            }}
+                          >
+                            {!classicAvailable
+                              ? "DoH requis hors réseau FDN/FFDN"
+                              : alreadyActive
+                                ? "✓ Déjà actif"
+                                : applying
+                                  ? "Application…"
+                                  : "Appliquer"}
+                          </button>
+                        );
+                      })()}
                 </motion.div>
               );
             })}

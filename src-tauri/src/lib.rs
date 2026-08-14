@@ -4778,6 +4778,98 @@ fn doh_catalog() -> std::collections::HashMap<(&'static str, &'static str), DohE
         },
     );
 
+    // FDN — https://www.fdn.fr/actions/dns/
+    m.insert(
+        ("fdn", "std"),
+        DohEntry {
+            display_name: "FDN — Standard",
+            doh_url: "https://ns0.fdn.fr/dns-query",
+            servers: &[
+                "80.67.169.12",
+                "80.67.169.40",
+                "2001:910:800::12",
+                "2001:910:800::40",
+            ],
+        },
+    );
+
+    // DNS4EU Public Service — https://joindns4.eu/for-public
+    m.insert(
+        ("dns4eu", "protective"),
+        DohEntry {
+            display_name: "DNS4EU — Protective",
+            doh_url: "https://protective.joindns4.eu/dns-query",
+            servers: &[
+                "86.54.11.1",
+                "86.54.11.201",
+                "2a13:1001::86:54:11:1",
+                "2a13:1001::86:54:11:201",
+            ],
+        },
+    );
+    m.insert(
+        ("dns4eu", "child"),
+        DohEntry {
+            display_name: "DNS4EU — Child Protection",
+            doh_url: "https://child.joindns4.eu/dns-query",
+            servers: &[
+                "86.54.11.12",
+                "86.54.11.212",
+                "2a13:1001::86:54:11:12",
+                "2a13:1001::86:54:11:212",
+            ],
+        },
+    );
+    m.insert(
+        ("dns4eu", "noads"),
+        DohEntry {
+            display_name: "DNS4EU — Protective + Ad Blocking",
+            doh_url: "https://noads.joindns4.eu/dns-query",
+            servers: &[
+                "86.54.11.13",
+                "86.54.11.213",
+                "2a13:1001::86:54:11:13",
+                "2a13:1001::86:54:11:213",
+            ],
+        },
+    );
+    m.insert(
+        ("dns4eu", "child-noads"),
+        DohEntry {
+            display_name: "DNS4EU — Child Protection + Ad Blocking",
+            doh_url: "https://child-noads.joindns4.eu/dns-query",
+            servers: &[
+                "86.54.11.11",
+                "86.54.11.211",
+                "2a13:1001::86:54:11:11",
+                "2a13:1001::86:54:11:211",
+            ],
+        },
+    );
+    m.insert(
+        ("dns4eu", "unfiltered"),
+        DohEntry {
+            display_name: "DNS4EU — Unfiltered",
+            doh_url: "https://unfiltered.joindns4.eu/dns-query",
+            servers: &[
+                "86.54.11.100",
+                "86.54.11.200",
+                "2a13:1001::86:54:11:100",
+                "2a13:1001::86:54:11:200",
+            ],
+        },
+    );
+
+    // DNS.SB — https://dns.sb/guide/ and https://dns.sb/doh/
+    m.insert(
+        ("dnssb", "std"),
+        DohEntry {
+            display_name: "DNS.SB — Standard",
+            doh_url: "https://doh.dns.sb/dns-query",
+            servers: &["185.222.222.222", "45.11.45.11", "2a09::", "2a11::"],
+        },
+    );
+
     // AdGuard
     m.insert(
         ("adguard", "std"),
@@ -4881,6 +4973,13 @@ mod doh_catalog_tests {
             ("quad9", "unf"),
             ("quad9", "edns"),
             ("libredns", "std"),
+            ("fdn", "std"),
+            ("dns4eu", "protective"),
+            ("dns4eu", "child"),
+            ("dns4eu", "noads"),
+            ("dns4eu", "child-noads"),
+            ("dns4eu", "unfiltered"),
+            ("dnssb", "std"),
             ("adguard", "std"),
             ("adguard", "family"),
             ("adguard", "unf"),
@@ -4905,6 +5004,31 @@ mod doh_catalog_tests {
         assert_eq!(
             catalog.get(&("mullvad", "all")).expect("all").servers,
             &["194.242.2.9", "2a07:e340::9"]
+        );
+    }
+
+    #[test]
+    fn uses_official_fdn_dns4eu_and_dnssb_endpoints() {
+        let catalog = doh_catalog();
+        assert_eq!(
+            catalog.get(&("fdn", "std")).expect("fdn").servers,
+            &[
+                "80.67.169.12",
+                "80.67.169.40",
+                "2001:910:800::12",
+                "2001:910:800::40",
+            ]
+        );
+        assert_eq!(
+            catalog
+                .get(&("dns4eu", "protective"))
+                .expect("dns4eu protective")
+                .doh_url,
+            "https://protective.joindns4.eu/dns-query"
+        );
+        assert_eq!(
+            catalog.get(&("dnssb", "std")).expect("dns.sb").servers,
+            &["185.222.222.222", "45.11.45.11", "2a09::", "2a11::"]
         );
     }
 }
