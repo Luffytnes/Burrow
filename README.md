@@ -16,6 +16,7 @@
   </p>
   <p>
     <a href="#-everything-your-mac-needs-in-one-place">Features</a> ·
+    <a href="#-see-burrow-in-action">Screenshots</a> ·
     <a href="#-get-burrow">Get Burrow</a> ·
     <a href="PRIVACY.md">Privacy</a> ·
     <a href="SECURITY.md">Security</a> ·
@@ -34,20 +35,49 @@
 
 ---
 
+## 📸 See Burrow in action
+
+<table>
+  <tr>
+    <th width="50%">Live Status</th>
+    <th width="50%">Malware Scan</th>
+  </tr>
+  <tr>
+    <td><img src="docs/images/burrow-status.png" alt="Burrow live system status dashboard"></td>
+    <td><img src="docs/images/burrow-malware-scan.png" alt="Burrow ClamAV malware scanner"></td>
+  </tr>
+  <tr>
+    <th>Smart Cleanup</th>
+    <th>Selected Maintenance</th>
+  </tr>
+  <tr>
+    <td><img src="docs/images/burrow-cleanup.png" alt="Burrow smart cleanup priority center"></td>
+    <td><img src="docs/images/burrow-maintenance.png" alt="Burrow selected macOS maintenance actions"></td>
+  </tr>
+  <tr>
+    <th colspan="2">Private DNS</th>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><img src="docs/images/burrow-private-dns.png" width="760" alt="Burrow private encrypted DNS catalogue"></td>
+  </tr>
+</table>
+
+---
+
 ## ✨ Everything your Mac needs, in one place
 
 Burrow brings the tools you would normally collect across several apps and command-line utilities into one focused interface. No subscription, no ads, no Burrow account and no first-party telemetry.
 
 |                         | What you can do                                                                                                                  |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| **✨ Smart Scan**       | Combine recoverable cleanup, a focused malware scan and context-aware maintenance recommendations in one guided workflow.       |
+| **✨ Smart Scan**       | Combine recoverable cleanup, a focused malware scan and context-aware maintenance recommendations in one guided workflow.        |
 | **📊 Live Status**      | Track CPU and GPU activity, memory pressure, temperatures, power, fans, battery, storage, network traffic and running processes. |
 | **🧹 Smart Cleanup**    | Review caches, logs, browser data, developer artifacts and installers, then move selected items to the macOS Trash.              |
 | **🛡️ Malware Scan**     | Scan with the bundled ClamAV engine, refresh definitions and quarantine suspicious files.                                        |
 | **📦 App Management**   | Find application updates and uninstall apps together with their associated preferences, caches and launch items.                 |
 | **🔎 Storage Analysis** | Explore an interactive treemap, disk usage, large files, duplicates, developer projects and estimated storage growth.            |
 | **⚡ Maintenance**      | Run selected macOS maintenance tasks, manage Low Power Mode and use supported Apple Silicon fan controls.                        |
-| **✂️ Binary Thinning**  | Remove Intel slices from compatible universal apps while keeping the original application recoverable from the Trash.           |
+| **✂️ Binary Thinning**  | Remove Intel slices from compatible universal apps while keeping the original application recoverable from the Trash.            |
 | **📜 Activity Journal** | Review a private local history of scans, cleanup, application operations and maintenance actions.                                |
 | **📍 Menu Bar Widget**  | Keep essential system metrics visible and open Smart Scan or the activity journal in one click.                                  |
 | **🔐 Private DNS**      | Install encrypted DNS profiles from a curated provider catalogue and manage DNS or search-domain settings.                       |
