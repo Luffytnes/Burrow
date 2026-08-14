@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Trash2,
@@ -31,18 +31,12 @@ import {
   Cloud,
   FolderOpen,
   Copy,
-  Home,
-  ChevronLeft,
   ScanSearch,
-  Folder,
-  File,
   Eye,
   Cpu,
   Users,
   UserX,
   Lock,
-  LayoutGrid,
-  List,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useMo } from "../hooks/useMo";
@@ -98,16 +92,6 @@ interface DuplicateGroup {
   size_bytes: number;
   paths: string[];
   wasted_bytes: number;
-}
-interface DiskEntry {
-  name: string;
-  path: string;
-  size_bytes: number;
-  is_dir: boolean;
-}
-interface DiskBreakdownResult {
-  entries: DiskEntry[];
-  truncated: boolean;
 }
 interface UniversalBinaryEntry {
   name: string;
@@ -388,16 +372,6 @@ function ImageThumb({ path }: { path: string }) {
   );
 }
 
-function fileExtColor(name: string): string {
-  const ext = name.split(".").pop()?.toLowerCase() ?? "";
-  if (["mp4", "mov", "mkv", "avi", "m4v"].includes(ext)) return "var(--danger)";
-  if (["jpg", "jpeg", "png", "gif", "heic", "raw", "cr2"].includes(ext)) return "var(--success)";
-  if (["zip", "tar", "gz", "rar", "7z", "dmg", "pkg"].includes(ext)) return "var(--warning)";
-  if (["pdf", "doc", "docx", "pages", "xls", "xlsx"].includes(ext)) return "var(--info)";
-  if (["mp3", "flac", "aac", "wav", "m4a"].includes(ext)) return "var(--pink)";
-  return "var(--text-3)";
-}
-
 // ── Shared components ─────────────────────────────────────────────────────────
 
 function SelectRow({
@@ -554,352 +528,18 @@ function GroupRow({
   );
 }
 
-// ── Disk Browser (used in Aperçu) ─────────────────────────────────────────────
-
-type DiskBrowseError = "protected" | "inaccessible" | "busy" | "timeout" | "changed" | "system";
-
-interface TreemapRect {
-  entry: DiskEntry;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-function binaryTreemap(
-  entries: DiskEntry[],
-  x = 0,
-  y = 0,
-  width = 100,
-  height = 100
-): TreemapRect[] {
-  if (entries.length === 0) return [];
-  if (entries.length === 1) return [{ entry: entries[0], x, y, width, height }];
-  const total = entries.reduce((sum, entry) => sum + entry.size_bytes, 0);
-  let leftTotal = 0;
-  let split = 1;
-  for (let index = 0; index < entries.length - 1; index++) {
-    leftTotal += entries[index].size_bytes;
-    split = index + 1;
-    if (leftTotal >= total / 2) break;
-  }
-  const ratio = total > 0 ? leftTotal / total : 0.5;
-  if (width >= height) {
-    const leftWidth = width * ratio;
-    return [
-      ...binaryTreemap(entries.slice(0, split), x, y, leftWidth, height),
-      ...binaryTreemap(entries.slice(split), x + leftWidth, y, width - leftWidth, height),
-    ];
-  }
-  const topHeight = height * ratio;
-  return [
-    ...binaryTreemap(entries.slice(0, split), x, y, width, topHeight),
-    ...binaryTreemap(entries.slice(split), x, y + topHeight, width, height - topHeight),
-  ];
-}
-
-function DiskBrowser() {
-  const [stack, setStack] = useState<string[]>([]);
-  const [entries, setEntries] = useState<DiskEntry[] | null>(null);
-  const [browseError, setBrowseError] = useState<DiskBrowseError | null>(null);
-  const [truncated, setTruncated] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [view, setView] = useState<"treemap" | "list">("treemap");
-  const initialized = useRef(false);
-
-  const load = useCallback(async (path: string) => {
-    if (!path) return;
-    setLoading(true);
-    setBrowseError(null);
-    setTruncated(false);
-    try {
-      const result = await invoke<DiskBreakdownResult>("get_disk_breakdown", { path });
-      setEntries(result.entries);
-      setTruncated(result.truncated);
-    } catch (e) {
-      setEntries([]);
-      const msg = typeof e === "string" ? e : "system:unknown";
-      const kind = msg.split(":")[0] as DiskBrowseError;
-      setBrowseError(
-        ["protected", "inaccessible", "busy", "timeout", "changed"].includes(kind) ? kind : "system"
-      );
-    }
-    setLoading(false);
-  }, []);
-
-  useEffect(() => {
-    if (initialized.current) return;
-    initialized.current = true;
-    invoke<string>("get_home_dir")
-      .then((home) => {
-        setStack([home]);
-        load(home);
-      })
-      .catch(() => {
-        setStack(["/"]);
-        load("/");
-      });
-  }, [load]);
-
-  const currentPath = stack[stack.length - 1] ?? "";
-
-  const navigate = (entry: DiskEntry) => {
-    if (!entry.is_dir) return;
-    const next = [...stack, entry.path];
-    setStack(next);
-    load(entry.path);
-  };
-
-  const goBack = () => {
-    if (stack.length <= 1) return;
-    const next = stack.slice(0, -1);
-    setStack(next);
-    load(next[next.length - 1]);
-  };
-
-  const goHome = () => {
-    if (stack.length <= 1) return;
-    setStack([stack[0]]);
-    load(stack[0]);
-  };
-
-  const breadcrumbs = stack.map((p) => {
-    const parts = p.split("/").filter(Boolean);
-    return parts[parts.length - 1] || p;
-  });
-
-  const totalSize = entries?.reduce((s, e) => s + e.size_bytes, 0) ?? 1;
-
-  return (
-    <div className="card overflow-hidden">
-      {/* Navigation bar */}
-      <div
-        className="flex items-center gap-1.5 px-3 py-2"
-        style={{ borderBottom: "1px solid var(--border)", background: "var(--bg)" }}
-      >
-        <button
-          onClick={goHome}
-          disabled={stack.length <= 1}
-          className="p-1 rounded transition-opacity disabled:opacity-30 hover:opacity-60"
-          style={{ color: "var(--text-3)" }}
-        >
-          <Home size={12} />
-        </button>
-        <button
-          onClick={goBack}
-          disabled={stack.length <= 1}
-          className="p-1 rounded transition-opacity disabled:opacity-30 hover:opacity-60"
-          style={{ color: "var(--text-3)" }}
-        >
-          <ChevronLeft size={12} />
-        </button>
-        {/* Breadcrumb */}
-        <div className="flex items-center gap-0.5 overflow-hidden flex-1 min-w-0">
-          {breadcrumbs.map((crumb, i) => (
-            <span key={i} className="flex items-center gap-0.5 shrink-0 max-w-[90px]">
-              {i > 0 && <ChevronRight size={9} style={{ color: "var(--text-3)" }} />}
-              <span
-                className="text-[10px] truncate"
-                style={{ color: i === breadcrumbs.length - 1 ? "var(--text-1)" : "var(--text-3)" }}
-              >
-                {crumb}
-              </span>
-            </span>
-          ))}
-        </div>
-        {loading && (
-          <Loader2 size={10} className="animate-spin shrink-0" style={{ color: "var(--accent)" }} />
-        )}
-        <button
-          onClick={() => load(currentPath)}
-          disabled={loading}
-          className="p-1 rounded transition-opacity disabled:opacity-40 hover:opacity-60"
-          style={{ color: "var(--text-3)" }}
-        >
-          <RefreshCw size={10} />
-        </button>
-        <div
-          className="flex items-center p-0.5 rounded-lg"
-          style={{ background: "var(--bar-track)" }}
-        >
-          <button
-            onClick={() => setView("treemap")}
-            className="p-1 rounded-md"
-            style={{
-              color: view === "treemap" ? "var(--accent)" : "var(--text-3)",
-              background: view === "treemap" ? "var(--bg-card)" : "transparent",
-            }}
-            aria-label="Vue treemap"
-          >
-            <LayoutGrid size={10} />
-          </button>
-          <button
-            onClick={() => setView("list")}
-            className="p-1 rounded-md"
-            style={{
-              color: view === "list" ? "var(--accent)" : "var(--text-3)",
-              background: view === "list" ? "var(--bg-card)" : "transparent",
-            }}
-            aria-label="Vue liste"
-          >
-            <List size={10} />
-          </button>
-        </div>
-      </div>
-
-      {/* Entry list */}
-      {entries === null ? (
-        <div
-          className="flex items-center justify-center py-8 gap-2"
-          style={{ color: "var(--text-3)" }}
-        >
-          <Loader2 size={14} className="animate-spin" />
-          <span className="text-xs">Chargement…</span>
-        </div>
-      ) : browseError ? (
-        <div className="text-center py-6 text-xs" style={{ color: "var(--text-3)" }}>
-          {browseError === "protected" && "Dossier protégé — accès refusé"}
-          {browseError === "inaccessible" && "Dossier inaccessible"}
-          {browseError === "busy" && "Analyse en cours, réessayez dans un instant"}
-          {browseError === "timeout" && "Analyse trop longue — choisissez un dossier plus précis"}
-          {browseError === "changed" && "Le dossier a changé pendant l’analyse — réessayez"}
-          {browseError === "system" && "Erreur système"}
-        </div>
-      ) : entries.length === 0 ? (
-        <div className="text-center py-6 text-xs" style={{ color: "var(--text-3)" }}>
-          Dossier vide
-        </div>
-      ) : view === "treemap" ? (
-        <div
-          className="relative m-2 rounded-lg overflow-hidden"
-          style={{ height: 292, background: "var(--bar-track)" }}
-        >
-          {binaryTreemap(entries.slice(0, 48)).map(({ entry, x, y, width, height }, index) => {
-            const color = entry.is_dir ? "var(--info)" : fileExtColor(entry.name);
-            const showLabel = width >= 10 && height >= 12;
-            return (
-              <motion.button
-                key={entry.path}
-                initial={{ opacity: 0, scale: 0.96 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ delay: Math.min(index * 0.01, 0.35) }}
-                onClick={() => navigate(entry)}
-                disabled={!entry.is_dir}
-                title={`${entry.name} — ${fmtBytes(entry.size_bytes)}`}
-                className="absolute overflow-hidden text-left p-2 disabled:cursor-default"
-                style={{
-                  left: `${x}%`,
-                  top: `${y}%`,
-                  width: `${width}%`,
-                  height: `${height}%`,
-                  background: `color-mix(in srgb, ${color} 24%, var(--bg-card))`,
-                  border: "1px solid var(--bg)",
-                  color: "var(--text-1)",
-                }}
-              >
-                {showLabel && (
-                  <>
-                    <span className="text-[10px] font-semibold block truncate">{entry.name}</span>
-                    <span className="text-[9px] block mt-0.5" style={{ color: "var(--text-3)" }}>
-                      {fmtBytes(entry.size_bytes)}
-                    </span>
-                  </>
-                )}
-              </motion.button>
-            );
-          })}
-          {entries.length > 48 && (
-            <div
-              className="absolute bottom-1 right-1 px-2 py-1 rounded text-[9px]"
-              style={{ background: "var(--bg)", color: "var(--text-3)" }}
-            >
-              48 plus grands éléments affichés
-            </div>
-          )}
-        </div>
-      ) : (
-        <div style={{ maxHeight: 280, overflowY: "auto" }}>
-          {truncated && (
-            <div className="px-3 py-2 text-[10px]" style={{ color: "var(--warning)" }}>
-              Affichage limité aux 512 premiers éléments. Ouvrez un sous-dossier pour affiner.
-            </div>
-          )}
-          {entries.map((entry, i) => {
-            const pct = totalSize > 0 ? (entry.size_bytes / totalSize) * 100 : 0;
-            const color = entry.is_dir ? "var(--info)" : fileExtColor(entry.name);
-            return (
-              <motion.button
-                key={entry.path}
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                transition={{ delay: i * 0.012 }}
-                onClick={() => navigate(entry)}
-                disabled={!entry.is_dir}
-                className="w-full flex items-center gap-2.5 px-3 py-1.5 text-left"
-                style={{
-                  borderTop: i > 0 ? "1px solid var(--border)" : "none",
-                  cursor: entry.is_dir ? "pointer" : "default",
-                  opacity: entry.is_dir ? 1 : 0.7,
-                }}
-                onMouseEnter={(e) => {
-                  if (entry.is_dir)
-                    (e.currentTarget as HTMLElement).style.background = "var(--bar-track)";
-                }}
-                onMouseLeave={(e) => {
-                  (e.currentTarget as HTMLElement).style.background = "transparent";
-                }}
-              >
-                {entry.is_dir ? (
-                  <Folder size={12} style={{ color, flexShrink: 0 }} />
-                ) : (
-                  <File size={12} style={{ color, flexShrink: 0 }} />
-                )}
-                <span
-                  className="text-[11px] font-medium flex-1 truncate text-left"
-                  style={{ color: "var(--text-1)" }}
-                >
-                  {entry.name}
-                </span>
-                <div
-                  className="w-20 h-1 rounded-full shrink-0"
-                  style={{ background: "var(--bar-track)" }}
-                >
-                  <motion.div
-                    initial={{ width: 0 }}
-                    animate={{ width: `${Math.min(pct, 100)}%` }}
-                    transition={{ delay: 0.04 + i * 0.012, duration: 0.35 }}
-                    className="h-full rounded-full"
-                    style={{ background: color }}
-                  />
-                </div>
-                <span
-                  className="text-[10px] font-mono w-14 text-right shrink-0"
-                  style={{ color: "var(--text-3)" }}
-                >
-                  {fmtBytes(entry.size_bytes)}
-                </span>
-                {entry.is_dir && (
-                  <ChevronRight size={9} style={{ color: "var(--text-3)", flexShrink: 0 }} />
-                )}
-              </motion.button>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
-
 // ── Tab 0: Aperçu ─────────────────────────────────────────────────────────────
 
 function ApercuTab({
   caches,
   cachesLoading,
   onCleanSafe,
+  onOpenTab,
 }: {
   caches: DevCache[] | null;
   cachesLoading: boolean;
   onCleanSafe: () => void;
+  onOpenTab: (tab: number) => void;
 }) {
   const [metrics, setMetrics] = useState<DiskMetrics | null>(null);
   const [forecast, setForecast] = useState<number | null | undefined>(undefined);
@@ -921,6 +561,73 @@ function ApercuTab({
     caches?.filter((c) => c.risk === 1).reduce((s, c) => s + c.size_bytes, 0) ?? 0;
   const riskyBytes = caches?.filter((c) => c.risk === 2).reduce((s, c) => s + c.size_bytes, 0) ?? 0;
   const totalReclaimable = safeBytes + cautionBytes + riskyBytes;
+  const largeFilesBytes =
+    _cache.largeFiles?.reduce((sum, file) => sum + file.size_bytes, 0) ?? null;
+  const binaryBytes =
+    _cache.binaries
+      ?.filter((entry) => !entry.thinning_unsafe)
+      .reduce((sum, entry) => sum + entry.reclaimable_bytes, 0) ?? null;
+
+  const priorities = [
+    {
+      id: "safe",
+      title: "Nettoyage recommandé",
+      description:
+        safeBytes > 0
+          ? `${caches?.filter((cache) => cache.risk === 0).length ?? 0} éléments sans risque identifiés`
+          : "Aucun cache sûr à nettoyer pour le moment",
+      value: safeBytes > 0 ? fmtBytes(safeBytes) : "À jour",
+      color: "var(--success)",
+      icon: Shield,
+      tab: 2,
+    },
+    {
+      id: "review",
+      title: "Éléments à vérifier",
+      description:
+        cautionBytes + riskyBytes > 0
+          ? "Vérifiez leur contenu avant de les placer dans la Corbeille"
+          : "Aucun élément sensible en attente",
+      value:
+        cautionBytes + riskyBytes > 0 ? fmtBytes(cautionBytes + riskyBytes) : "Rien à signaler",
+      color: cautionBytes + riskyBytes > 0 ? "var(--warning)" : "var(--text-3)",
+      icon: AlertTriangle,
+      tab: 2,
+    },
+    {
+      id: "large-files",
+      title: "Fichiers volumineux",
+      description:
+        largeFilesBytes === null
+          ? "Repérez les fichiers qui occupent réellement votre stockage"
+          : `${_cache.largeFiles?.length ?? 0} fichiers de plus de 100 Mo analysés`,
+      value: largeFilesBytes === null ? "Analyser" : fmtBytes(largeFilesBytes),
+      color: "var(--info)",
+      icon: FileText,
+      tab: 3,
+    },
+    {
+      id: "duplicates",
+      title: "Doublons",
+      description: "Comparez les fichiers identiques avant toute suppression",
+      value: "Rechercher",
+      color: "var(--violet)",
+      icon: Copy,
+      tab: 4,
+    },
+    {
+      id: "binaries",
+      title: "Binaires universels",
+      description:
+        binaryBytes === null
+          ? "Vérifiez les applications compatibles avec Apple Silicon"
+          : `${_cache.binaries?.filter((entry) => !entry.thinning_unsafe).length ?? 0} applications compatibles détectées`,
+      value: binaryBytes === null ? "Vérifier" : `~${fmtBytes(binaryBytes)}`,
+      color: "var(--accent)",
+      icon: Cpu,
+      tab: 6,
+    },
+  ];
 
   function fmtForecast(days: number): string {
     if (days <= 7) return `dans ~${days} jour${days > 1 ? "s" : ""}`;
@@ -1054,16 +761,68 @@ function ApercuTab({
         </div>
       </div>
 
-      {/* ── Explorateur de disque ── */}
-      <div className="flex items-center gap-2 px-1 mt-1">
-        <span
-          className="text-[10px] uppercase tracking-widest font-semibold"
-          style={{ color: "var(--text-3)" }}
-        >
-          Explorateur
-        </span>
+      {/* ── Centre de priorités ── */}
+      <div className="flex items-end justify-between px-1 mt-1">
+        <div>
+          <span
+            className="text-[10px] uppercase tracking-widest font-semibold block"
+            style={{ color: "var(--text-3)" }}
+          >
+            Centre de priorités
+          </span>
+          <span className="text-[10px]" style={{ color: "var(--text-3)" }}>
+            Les actions utiles, sans analyse récursive automatique
+          </span>
+        </div>
       </div>
-      <DiskBrowser />
+      <div className="grid grid-cols-2 gap-2">
+        {priorities.map((priority, index) => {
+          const PriorityIcon = priority.icon;
+          return (
+            <motion.button
+              key={priority.id}
+              initial={{ opacity: 0, y: 4 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: index * 0.035 }}
+              onClick={() => onOpenTab(priority.tab)}
+              className="card px-3 py-2.5 flex items-center gap-3 text-left transition-opacity hover:opacity-80"
+            >
+              <div
+                className="w-8 h-8 rounded-xl flex items-center justify-center shrink-0"
+                style={{
+                  color: priority.color,
+                  background: `color-mix(in srgb, ${priority.color} 11%, transparent)`,
+                }}
+              >
+                <PriorityIcon size={14} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span
+                    className="text-[11px] font-semibold truncate"
+                    style={{ color: "var(--text-1)" }}
+                  >
+                    {priority.title}
+                  </span>
+                  <span
+                    className="text-[10px] font-mono ml-auto shrink-0"
+                    style={{ color: priority.color }}
+                  >
+                    {priority.value}
+                  </span>
+                </div>
+                <span
+                  className="text-[9px] block truncate mt-0.5"
+                  style={{ color: "var(--text-3)" }}
+                >
+                  {priority.description}
+                </span>
+              </div>
+              <ChevronRight size={11} style={{ color: "var(--text-3)", flexShrink: 0 }} />
+            </motion.button>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -2408,9 +2167,14 @@ function BinairesTab({ onToast }: { onToast: (ok: boolean, msg: string) => void 
     if (!_cache.binaries) load();
   }, [load]);
 
-  const totalReclaimable = (entries ?? []).reduce((s, e) => s + e.reclaimable_bytes, 0);
+  const compatibleEntries = (entries ?? []).filter((entry) => !entry.thinning_unsafe);
+  const totalReclaimable = compatibleEntries.reduce((s, e) => s + e.reclaimable_bytes, 0);
 
   const thin = async (entry: UniversalBinaryEntry) => {
+    if (entry.thinning_unsafe) {
+      onToast(false, entry.thinning_warning);
+      return;
+    }
     setThinningPath(entry.path);
     setConfirmPath(null);
     try {
@@ -2436,7 +2200,7 @@ function BinairesTab({ onToast }: { onToast: (ok: boolean, msg: string) => void 
         <span className="text-[11px]" style={{ color: "var(--text-3)" }}>
           {scanning
             ? "Analyse…"
-            : `${entries?.length ?? 0} binaire${(entries?.length ?? 0) !== 1 ? "s" : ""}`}
+            : `${compatibleEntries.length} application${compatibleEntries.length !== 1 ? "s" : ""} compatible${compatibleEntries.length !== 1 ? "s" : ""}`}
           {totalReclaimable > 0 && (
             <span style={{ color: "var(--accent)" }}>
               {" "}
@@ -2481,8 +2245,9 @@ function BinairesTab({ onToast }: { onToast: (ok: boolean, msg: string) => void 
           />
           <div className="text-[11px] leading-relaxed" style={{ color: "var(--text-3)" }}>
             <strong style={{ color: "var(--warning)" }}>Opération récupérable</strong> — Burrow
-            travaille sur une copie, conserve l'application originale dans la Corbeille, re-signe
-            localement la copie allégée et vérifie son intégrité avant de l'installer.
+            travaille sur une copie, préserve la signature de l'éditeur et vérifie son intégrité
+            avant l'installation. Si la signature ne peut pas être conservée, l'opération est
+            refusée et l'application originale reste intacte.
           </div>
         </div>
       </div>
@@ -2515,6 +2280,11 @@ function BinairesTab({ onToast }: { onToast: (ok: boolean, msg: string) => void 
                 <div className="text-[10px] truncate" style={{ color: "var(--text-3)" }}>
                   {entry.path.replace(/^\/Applications\//, "")}
                 </div>
+                {entry.thinning_unsafe && (
+                  <div className="text-[9px] mt-0.5" style={{ color: "var(--warning)" }}>
+                    Non compatible — réinstallation ou mise à jour requise
+                  </div>
+                )}
               </div>
               <div className="text-right shrink-0">
                 <div className="text-[10px] font-mono" style={{ color: "var(--text-2)" }}>
@@ -2544,7 +2314,8 @@ function BinairesTab({ onToast }: { onToast: (ok: boolean, msg: string) => void 
               ) : (
                 <button
                   onClick={() => setConfirmPath(entry.path)}
-                  disabled={thinningPath !== null}
+                  disabled={thinningPath !== null || entry.thinning_unsafe}
+                  title={entry.thinning_unsafe ? entry.thinning_warning : undefined}
                   className="text-[10px] px-2.5 py-1 rounded-lg font-semibold disabled:opacity-40 flex items-center gap-1"
                   style={{ background: "var(--accent)", color: "var(--on-accent)" }}
                 >
@@ -3505,6 +3276,7 @@ export default function Clean() {
               caches={caches}
               cachesLoading={cachesLoading}
               onCleanSafe={handleCleanSafe}
+              onOpenTab={switchTab}
             />
           )}
         </div>

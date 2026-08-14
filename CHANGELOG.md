@@ -3,6 +3,27 @@
 All notable changes to Burrow are documented here. Burrow is pre-1.0 software,
 so security and behavior changes may still be substantial between versions.
 
+## Unreleased
+
+### Added
+
+- Replace the automatic home-folder explorer with an actionable priority
+  center for safe cleanup, review items, large files, duplicates and universal
+  binaries.
+- Move the storage treemap to **Analyze > Storage** and require an explicit
+  folder selection before scanning.
+- Add compatibility feedback for applications whose original code signature
+  is invalid or missing.
+
+### Fixed
+
+- Preserve publisher signatures while thinning universal applications instead
+  of re-signing nested components ad hoc with `codesign --deep`.
+- Verify the source, temporary copy and prepared application before moving the
+  original to the Trash, and abort cleanly when any verification fails.
+- Cover nested application bundles with an automated signature-preservation
+  regression test.
+
 ## 0.2.2 — 2026-08-13
 
 ### Added

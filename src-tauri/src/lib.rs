@@ -8386,6 +8386,15 @@ fn scan_app_fatbinaries(app_path: &Path) -> Option<UniversalBinaryEntry> {
         .map(|metadata| metadata.len())
         .sum::<u64>();
     grant_path(app_path, PathGrantPurpose::Thin);
+    let signature_error = verify_signed_code(app_path, true).err();
+    let thinning_unsafe = signature_error.is_some();
+    let thinning_warning = if thinning_unsafe {
+        "Signature d’origine invalide ou absente. Réinstallez ou mettez à jour l’application avant de réessayer."
+            .to_string()
+    } else {
+        "Burrow amincit une copie sans remplacer la signature de l’éditeur, vérifie son intégrité, puis conserve l’original dans la Corbeille."
+            .to_string()
+    };
     Some(UniversalBinaryEntry {
         name: app_path
             .file_stem()
@@ -8396,8 +8405,8 @@ fn scan_app_fatbinaries(app_path: &Path) -> Option<UniversalBinaryEntry> {
         total_size_bytes,
         reclaimable_bytes: total_size_bytes / 2,
         binary_count: binaries.len(),
-        thinning_unsafe: false,
-        thinning_warning: "L'original sera déplacé dans la Corbeille. Burrow amincit une copie, la re-signe localement puis vérifie son intégrité avant remplacement.".to_string(),
+        thinning_unsafe,
+        thinning_warning,
     })
 }
 
@@ -8463,32 +8472,6 @@ fn thin_file_to_arm64(path: &Path) -> Result<(), String> {
         .map_err(|error| error.error.to_string())
 }
 
-fn adhoc_sign_code(path: &Path, deep: bool) -> Result<(), String> {
-    let already_signed = Command::new("/usr/bin/codesign")
-        .args(["--display"])
-        .arg(path)
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false);
-    let mut command = Command::new("/usr/bin/codesign");
-    command.args(["--force", "--sign", "-"]);
-    if deep {
-        command.arg("--deep");
-    }
-    if already_signed {
-        command.arg("--preserve-metadata=identifier,entitlements,requirements,flags,runtime");
-    }
-    let output = command
-        .arg(path)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
-}
-
 fn verify_signed_code(path: &Path, deep: bool) -> Result<(), String> {
     let mut command = Command::new("/usr/bin/codesign");
     command.args(["--verify", "--strict"]);
@@ -8509,6 +8492,35 @@ fn verify_signed_code(path: &Path, deep: bool) -> Result<(), String> {
 #[cfg(test)]
 mod universal_binary_tests {
     use super::*;
+
+    fn build_universal(source: &Path, binary: &Path) {
+        fs::write(source, "int main(void) { return 0; }\n").expect("write fixture source");
+        let build = Command::new("/usr/bin/xcrun")
+            .args(["clang", "-arch", "arm64", "-arch", "x86_64"])
+            .arg(source)
+            .arg("-o")
+            .arg(binary)
+            .output()
+            .expect("invoke clang");
+        assert!(
+            build.status.success(),
+            "clang failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+    }
+
+    fn sign(path: &Path) {
+        let output = Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(path)
+            .output()
+            .expect("invoke codesign");
+        assert!(
+            output.status.success(),
+            "codesign failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn removes_a_valid_intermediate_application_copy() {
@@ -8537,22 +8549,12 @@ mod universal_binary_tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let source = directory.path().join("fixture.c");
         let binary = directory.path().join("fixture");
-        fs::write(&source, "int main(void) { return 0; }\n").expect("write fixture source");
-
-        let build = Command::new("/usr/bin/xcrun")
-            .args(["clang", "-arch", "arm64", "-arch", "x86_64"])
-            .arg(&source)
-            .arg("-o")
-            .arg(&binary)
-            .output()
-            .expect("invoke clang");
-        assert!(
-            build.status.success(),
-            "clang failed: {}",
-            String::from_utf8_lossy(&build.stderr)
-        );
+        build_universal(&source, &binary);
         assert!(is_universal_binary(&binary));
 
+        sign(&binary);
+
+        verify_signed_code(&binary, false).expect("verify universal fixture");
         thin_file_to_arm64(&binary).expect("thin fixture");
         let arches = Command::new("/usr/bin/lipo")
             .args(["-archs"])
@@ -8564,8 +8566,54 @@ mod universal_binary_tests {
         assert!(arches.split_whitespace().any(|arch| arch == "arm64"));
         assert!(!arches.split_whitespace().any(|arch| arch == "x86_64"));
 
-        adhoc_sign_code(&binary, false).expect("sign thinned fixture");
         verify_signed_code(&binary, false).expect("verify thinned fixture");
+    }
+
+    #[test]
+    fn preserves_nested_application_signatures_while_thinning() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let app = directory.path().join("Fixture.app");
+        let helper = app.join("Contents/Frameworks/Helper.app");
+        let main_binary = app.join("Contents/MacOS/Fixture");
+        let helper_binary = helper.join("Contents/MacOS/Helper");
+        fs::create_dir_all(main_binary.parent().expect("main parent")).expect("create main dir");
+        fs::create_dir_all(helper_binary.parent().expect("helper parent"))
+            .expect("create helper dir");
+
+        let plist = |identifier: &str, executable: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+                 \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+                 <plist version=\"1.0\"><dict>\n\
+                 <key>CFBundleIdentifier</key><string>{identifier}</string>\n\
+                 <key>CFBundleExecutable</key><string>{executable}</string>\n\
+                 <key>CFBundlePackageType</key><string>APPL</string>\n\
+                 </dict></plist>\n"
+            )
+        };
+        fs::write(
+            app.join("Contents/Info.plist"),
+            plist("com.burrow.fixture", "Fixture"),
+        )
+        .expect("write app plist");
+        fs::write(
+            helper.join("Contents/Info.plist"),
+            plist("com.burrow.fixture.helper", "Helper"),
+        )
+        .expect("write helper plist");
+        build_universal(&directory.path().join("main.c"), &main_binary);
+        build_universal(&directory.path().join("helper.c"), &helper_binary);
+
+        sign(&helper);
+        sign(&app);
+        verify_signed_code(&app, true).expect("verify original app");
+
+        for binary in collect_universal_files(&app) {
+            thin_file_to_arm64(&binary).expect("thin nested fixture");
+        }
+
+        verify_signed_code(&app, true).expect("verify thinned app with original signatures");
     }
 }
 
@@ -8623,6 +8671,11 @@ async fn thin_universal_app(
     if canonical.file_stem().and_then(|value| value.to_str()) != Some(name.as_str()) {
         return Err("Le nom ne correspond pas à l'application analysée".to_string());
     }
+    verify_signed_code(&canonical, true).map_err(|_| {
+        format!(
+            "{name} n’est pas compatible avec l’amincissement sûr : sa signature d’origine est invalide ou absente. Aucune modification n’a été effectuée."
+        )
+    })?;
     if touchid_enabled(&app) {
         run_touchid(&app, &format!("Amincir {name}"))?;
     }
@@ -8644,6 +8697,10 @@ async fn thin_universal_app(
         if !copy.status.success() {
             return Err(String::from_utf8_lossy(&copy.stderr).trim().to_string());
         }
+        verify_signed_code(&staged, true).map_err(|_| {
+            "La copie de travail n’a pas conservé la signature d’origine. Aucune modification n’a été effectuée."
+                .to_string()
+        })?;
 
         let binaries = collect_universal_files(&staged);
         if binaries.is_empty() {
@@ -8651,26 +8708,28 @@ async fn thin_universal_app(
         }
         for binary in &binaries {
             thin_file_to_arm64(binary)?;
-            adhoc_sign_code(binary, false).map_err(|error| {
-                format!("Re-signature d'un composant allégé impossible : {error}")
-            })?;
         }
-
-        adhoc_sign_code(&staged, true)
-            .map_err(|error| format!("Re-signature locale impossible : {error}"))?;
-        for binary in &binaries {
-            verify_signed_code(binary, false).map_err(|error| {
-                format!("Vérification d'un composant allégé impossible : {error}")
-            })?;
-        }
-        verify_signed_code(&staged, true)
-            .map_err(|error| format!("Vérification de la copie allégée impossible : {error}"))?;
+        verify_signed_code(&staged, true).map_err(|_| {
+            format!(
+                "{name} ne peut pas être aminci sans altérer la signature de son éditeur. Aucune modification n’a été effectuée."
+            )
+        })?;
 
         let parent = canonical
             .parent()
             .ok_or_else(|| "Dossier Applications introuvable".to_string())?;
         let prepared = parent.join(format!(".burrow-thinned-{}.app", uuid::Uuid::new_v4()));
         install_prepared_app(&staged, &prepared)?;
+        if verify_signed_code(&prepared, true).is_err() {
+            let cleanup = remove_prepared_app(&prepared);
+            return Err(match cleanup {
+                Ok(()) => "La copie préparée a échoué à la dernière vérification. L’application originale est intacte."
+                    .to_string(),
+                Err(error) => format!(
+                    "La copie préparée a échoué à la dernière vérification. L’application originale est intacte, mais la copie intermédiaire doit être retirée manuellement : {error}"
+                ),
+            });
+        }
         quit_application(&name);
         if let Err(error) = move_path_to_trash(&canonical) {
             let cleanup = remove_prepared_app(&prepared);

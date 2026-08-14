@@ -23,6 +23,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useT } from "../i18n/useT";
+import DiskTreemap from "../components/DiskTreemap";
 
 interface ClamavInfo {
   installed: boolean;
@@ -49,7 +50,7 @@ interface QuarantineEntry {
 }
 
 type ScanMode = "quick" | "full" | "custom";
-type PageTab = "scanner" | "quarantine";
+type PageTab = "scanner" | "storage" | "quarantine";
 type TermKind = "ok" | "threat" | "warn" | "dl" | "info";
 interface TermLine {
   text: string;
@@ -465,26 +466,61 @@ export default function Scan() {
           <span className="text-sm">{t.common_loading}</span>
         </div>
       ) : !clamavInfo.installed ? (
-        <div className="flex flex-col gap-3 flex-1 justify-center items-center">
-          <div className="card rounded-2xl p-6 text-center max-w-sm">
-            <ShieldAlert size={32} className="mx-auto mb-3" style={{ color: "var(--accent)" }} />
-            <p className="text-sm font-semibold mb-2" style={{ color: "var(--text-1)" }}>
-              {t.scan_not_installed}
-            </p>
-            <p className="text-[11px] mb-4" style={{ color: "var(--text-3)" }}>
-              {t.scan_sub}
-            </p>
-            <code
-              className="block text-xs font-mono px-3 py-2 rounded-lg"
-              style={{
-                background: "var(--bg)",
-                border: "1px solid var(--border)",
-                color: "var(--text-2)",
-              }}
-            >
-              {t.scan_install_cmd}
-            </code>
+        <div className="flex flex-col gap-3 flex-1 min-h-0">
+          <div
+            className="flex gap-1 p-1 rounded-xl shrink-0"
+            style={{ background: "var(--bg-card)", border: "1px solid var(--border)" }}
+          >
+            {(["scanner", "storage"] as PageTab[]).map((id) => (
+              <button
+                key={id}
+                onClick={() => setTab(id)}
+                className="flex-1 py-1.5 text-xs font-semibold rounded-lg transition-all"
+                style={
+                  tab === id
+                    ? {
+                        background: "var(--accent-dim)",
+                        color: "var(--accent-text)",
+                        border: "1px solid rgba(255,0,0,0.15)",
+                      }
+                    : { color: "var(--text-3)", border: "1px solid transparent" }
+                }
+              >
+                {id === "scanner" ? t.scan_scanner_tab : "Stockage"}
+              </button>
+            ))}
           </div>
+          {tab === "storage" ? (
+            <div className="flex-1 min-h-0 overflow-y-auto">
+              <DiskTreemap />
+            </div>
+          ) : (
+            <div className="flex flex-1 justify-center items-center">
+              <div className="card rounded-2xl p-6 text-center max-w-sm">
+                <ShieldAlert
+                  size={32}
+                  className="mx-auto mb-3"
+                  style={{ color: "var(--accent)" }}
+                />
+                <p className="text-sm font-semibold mb-2" style={{ color: "var(--text-1)" }}>
+                  {t.scan_not_installed}
+                </p>
+                <p className="text-[11px] mb-4" style={{ color: "var(--text-3)" }}>
+                  {t.scan_sub}
+                </p>
+                <code
+                  className="block text-xs font-mono px-3 py-2 rounded-lg"
+                  style={{
+                    background: "var(--bg)",
+                    border: "1px solid var(--border)",
+                    color: "var(--text-2)",
+                  }}
+                >
+                  {t.scan_install_cmd}
+                </code>
+              </div>
+            </div>
+          )}
         </div>
       ) : (
         <div className="flex flex-col gap-3 flex-1 min-h-0 overflow-hidden">
@@ -533,7 +569,7 @@ export default function Scan() {
             className="flex gap-1 p-1 rounded-xl shrink-0"
             style={{ background: "var(--bg-card)", border: "1px solid var(--border)" }}
           >
-            {(["scanner", "quarantine"] as PageTab[]).map((id) => (
+            {(["scanner", "storage", "quarantine"] as PageTab[]).map((id) => (
               <button
                 key={id}
                 onClick={() => setTab(id)}
@@ -550,6 +586,8 @@ export default function Scan() {
               >
                 {id === "scanner" ? (
                   t.scan_scanner_tab
+                ) : id === "storage" ? (
+                  "Stockage"
                 ) : (
                   <>
                     {t.scan_quarantine_tab}
@@ -846,6 +884,17 @@ export default function Scan() {
                     </div>
                   )}
                 </div>
+              </motion.div>
+            ) : tab === "storage" ? (
+              <motion.div
+                key="storage"
+                initial={{ opacity: 0, y: 4 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -4 }}
+                transition={{ duration: 0.15 }}
+                className="flex-1 min-h-0 overflow-y-auto"
+              >
+                <DiskTreemap />
               </motion.div>
             ) : (
               /* Quarantine tab */
