@@ -18,6 +18,7 @@ source "$SCRIPT_DIR/../lib/clean/apps.sh"
 source "$SCRIPT_DIR/../lib/clean/dev.sh"
 source "$SCRIPT_DIR/../lib/clean/app_caches.sh"
 source "$SCRIPT_DIR/../lib/clean/hints.sh"
+source "$SCRIPT_DIR/../lib/clean/launch_services.sh"
 source "$SCRIPT_DIR/../lib/clean/system.sh"
 source "$SCRIPT_DIR/../lib/clean/user.sh"
 
@@ -27,7 +28,17 @@ PROTECT_FINDER_METADATA=false
 EXTERNAL_VOLUME_TARGET=""
 IS_M_SERIES=$([[ "$(uname -m)" == "arm64" ]] && echo "true" || echo "false")
 
-EXPORT_LIST_FILE="$HOME/.config/mole/clean-list.txt"
+# Whitelist and preview belong to the invoking user even when the whole
+# command runs as root. Root dry-runs stage preview content in a root-owned
+# file and publish it through an invoking-user process so user-controlled
+# symlinks are never opened for writing with root privileges. See #1210.
+MOLE_USER_HOME="$(get_invoking_home)"
+[[ -n "$MOLE_USER_HOME" ]] || MOLE_USER_HOME="$HOME"
+
+CLEAN_PREVIEW_FINAL_FILE="$MOLE_USER_HOME/.config/mole/clean-list.txt"
+CLEAN_PREVIEW_STAGING_FILE=""
+CLEAN_PREVIEW_LEDGER_FILE=""
+EXPORT_LIST_FILE="$CLEAN_PREVIEW_FINAL_FILE"
 CURRENT_SECTION=""
 readonly PROTECTED_SW_DOMAINS=(
     # Web editors
@@ -56,7 +67,7 @@ readonly PROTECTED_SW_DOMAINS=(
 
 declare -a WHITELIST_PATTERNS=()
 WHITELIST_WARNINGS=()
-if [[ -f "$HOME/.config/mole/whitelist" ]]; then
+if [[ -f "$MOLE_USER_HOME/.config/mole/whitelist" ]]; then
     while IFS= read -r line; do
         # shellcheck disable=SC2295
         line="${line#"${line%%[![:space:]]*}"}"
@@ -64,9 +75,9 @@ if [[ -f "$HOME/.config/mole/whitelist" ]]; then
         line="${line%"${line##*[![:space:]]}"}"
         [[ -z "$line" || "$line" =~ ^# ]] && continue
 
-        [[ "$line" == ~* ]] && line="${line/#~/$HOME}"
-        line="${line//\$HOME/$HOME}"
-        line="${line//\$\{HOME\}/$HOME}"
+        [[ "$line" == ~* ]] && line="${line/#~/$MOLE_USER_HOME}"
+        line="${line//\$HOME/$MOLE_USER_HOME}"
+        line="${line//\$\{HOME\}/$MOLE_USER_HOME}"
         if [[ "$line" =~ \.\. ]]; then
             WHITELIST_WARNINGS+=("Path traversal not allowed: $line")
             continue
@@ -107,7 +118,7 @@ if [[ -f "$HOME/.config/mole/whitelist" ]]; then
         fi
         [[ "$duplicate" == "true" ]] && continue
         WHITELIST_PATTERNS+=("$line")
-    done < "$HOME/.config/mole/whitelist"
+    done < "$MOLE_USER_HOME/.config/mole/whitelist"
 else
     WHITELIST_PATTERNS=("${DEFAULT_WHITELIST_PATTERNS[@]}")
 fi
@@ -118,13 +129,56 @@ expand_whitelist_patterns() {
         local -a EXPANDED_PATTERNS
         EXPANDED_PATTERNS=()
         for pattern in "${WHITELIST_PATTERNS[@]}"; do
-            local expanded="${pattern/#\~/$HOME}"
+            local expanded="${pattern/#\~/$MOLE_USER_HOME}"
             EXPANDED_PATTERNS+=("$expanded")
         done
         WHITELIST_PATTERNS=("${EXPANDED_PATTERNS[@]}")
     fi
 }
 expand_whitelist_patterns
+
+prepare_clean_preview_file() {
+    EXPORT_LIST_FILE="$CLEAN_PREVIEW_FINAL_FILE"
+    CLEAN_PREVIEW_STAGING_FILE=""
+    CLEAN_PREVIEW_LEDGER_FILE=""
+
+    if is_root_user && [[ -n "${SUDO_USER:-}" && "${SUDO_USER:-}" != "root" ]]; then
+        ensure_mole_temp_root || return 1
+        local root_temp_dir="$MOLE_RESOLVED_TMPDIR"
+
+        CLEAN_PREVIEW_STAGING_FILE=$(umask 077 && mktemp "$root_temp_dir/mole.clean-preview.XXXXXX") || return 1
+        [[ -f "$CLEAN_PREVIEW_STAGING_FILE" && ! -L "$CLEAN_PREVIEW_STAGING_FILE" && -O "$CLEAN_PREVIEW_STAGING_FILE" ]] || return 1
+        MOLE_TEMP_FILES+=("$CLEAN_PREVIEW_STAGING_FILE")
+        EXPORT_LIST_FILE="$CLEAN_PREVIEW_STAGING_FILE"
+    else
+        ensure_user_file "$EXPORT_LIST_FILE"
+    fi
+
+    CLEAN_PREVIEW_LEDGER_FILE=$(create_temp_file) || return 1
+    [[ -f "$CLEAN_PREVIEW_LEDGER_FILE" && ! -L "$CLEAN_PREVIEW_LEDGER_FILE" ]] || return 1
+    : > "$CLEAN_PREVIEW_LEDGER_FILE"
+}
+
+run_clean_preview_as_invoking_user() {
+    /usr/bin/sudo -u "$SUDO_USER" -- "$@"
+}
+
+publish_clean_preview_file() {
+    [[ -n "$CLEAN_PREVIEW_STAGING_FILE" ]] || return 0
+    [[ -f "$CLEAN_PREVIEW_STAGING_FILE" && ! -L "$CLEAN_PREVIEW_STAGING_FILE" && -O "$CLEAN_PREVIEW_STAGING_FILE" ]] || return 1
+    [[ -n "${SUDO_USER:-}" && "${SUDO_USER:-}" != "root" ]] || return 1
+
+    local final_dir
+    final_dir=$(dirname "$CLEAN_PREVIEW_FINAL_FILE")
+    run_clean_preview_as_invoking_user /bin/mkdir -p "$final_dir" 2> /dev/null || return 1
+    if ! /bin/cat "$CLEAN_PREVIEW_STAGING_FILE" |
+        run_clean_preview_as_invoking_user /usr/bin/tee "$CLEAN_PREVIEW_FINAL_FILE" > /dev/null; then
+        return 1
+    fi
+
+    EXPORT_LIST_FILE="$CLEAN_PREVIEW_FINAL_FILE"
+    return 0
+}
 
 if [[ ${#WHITELIST_PATTERNS[@]} -gt 0 ]]; then
     for entry in "${WHITELIST_PATTERNS[@]}"; do
@@ -139,6 +193,7 @@ fi
 total_items=0
 TRACK_SECTION=0
 SECTION_ACTIVITY=0
+SECTION_START_SIZE_KB=0
 files_cleaned=0
 total_size_cleaned=0
 whitelist_skipped_count=0
@@ -150,6 +205,8 @@ PROJECT_ARTIFACT_HINT_ESTIMATED_KB=0
 PROJECT_ARTIFACT_HINT_ESTIMATE_SAMPLES=0
 PROJECT_ARTIFACT_HINT_ESTIMATE_PARTIAL=false
 declare -a DRY_RUN_SEEN_IDENTITIES=()
+DRY_RUN_TOTAL_PARTIAL=false
+SECTION_START_UNKNOWN_COUNT=0
 
 # shellcheck disable=SC2329
 note_activity() {
@@ -160,6 +217,12 @@ note_activity() {
 
 # shellcheck disable=SC2329
 register_dry_run_cleanup_target() {
+    # Full clean runs deduplicate the file-backed ledger in one linear pass.
+    # Avoid an O(n²) Bash array scan while candidates are still being found.
+    if [[ -n "${CLEAN_PREVIEW_LEDGER_FILE:-}" && -f "$CLEAN_PREVIEW_LEDGER_FILE" ]]; then
+        return 0
+    fi
+
     local path="$1"
     local identity
     identity=$(mole_path_identity "$path")
@@ -170,6 +233,318 @@ register_dry_run_cleanup_target() {
 
     DRY_RUN_SEEN_IDENTITIES+=("$identity")
     return 0
+}
+
+# Append one candidate to the dry-run ledger. Final rendering deduplicates the
+# shared file, so timeout subprocess paths survive without an O(n²) hot loop.
+# Fields are NUL-delimited to preserve whitespace in paths.
+# Args: path, size_kb, item_count, size_known
+append_dry_run_cleanup_target() {
+    local path="$1"
+    local size_kb="${2:-0}"
+    local item_count="${3:-1}"
+    local size_known="${4:-true}"
+    local identity
+    identity=$(mole_path_identity "$path")
+
+    [[ "$size_kb" =~ ^[0-9]+$ ]] || {
+        size_kb=0
+        size_known=false
+    }
+    [[ "$item_count" =~ ^[0-9]+$ && "$item_count" -gt 0 ]] || item_count=1
+    [[ "$size_known" == "true" || "$size_known" == "false" ]] || size_known=false
+
+    if [[ -n "${CLEAN_PREVIEW_LEDGER_FILE:-}" && -f "$CLEAN_PREVIEW_LEDGER_FILE" && ! -L "$CLEAN_PREVIEW_LEDGER_FILE" ]]; then
+        printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+            "$identity" "$size_kb" "$item_count" "$size_known" "${CURRENT_SECTION:-Uncategorized}" "$path" \
+            >> "$CLEAN_PREVIEW_LEDGER_FILE"
+        return 0
+    fi
+
+    # Keep focused function tests and sourced-module callers useful even when
+    # start_cleanup has not prepared the full ledger.
+    if [[ -n "${EXPORT_LIST_FILE:-}" ]]; then
+        ensure_user_file "$EXPORT_LIST_FILE"
+        if [[ "$size_known" == "true" ]]; then
+            echo "$path  # $(bytes_to_human "$((size_kb * 1024))")" >> "$EXPORT_LIST_FILE"
+        else
+            echo "$path  # size unknown" >> "$EXPORT_LIST_FILE"
+        fi
+    fi
+}
+
+# Validate and append a candidate in one call. Focused callers without a
+# prepared ledger retain the legacy in-memory duplicate check.
+record_dry_run_cleanup_target() {
+    local path="$1"
+    if declare -f should_protect_path > /dev/null 2>&1 && should_protect_path "$path" 2> /dev/null; then
+        return 1
+    fi
+    if declare -f is_path_whitelisted > /dev/null 2>&1 && is_path_whitelisted "$path" 2> /dev/null; then
+        return 1
+    fi
+    if declare -f holds_compiled_model_cache > /dev/null 2>&1 && holds_compiled_model_cache "$path" 2> /dev/null; then
+        return 1
+    fi
+
+    if [[ -z "${CLEAN_PREVIEW_LEDGER_FILE:-}" || ! -f "$CLEAN_PREVIEW_LEDGER_FILE" ]]; then
+        register_dry_run_cleanup_target "$path" || return 1
+    fi
+    append_dry_run_cleanup_target "$@"
+}
+
+# Emit the first complete ledger record for each path identity. Perl keeps the
+# normal path linear for large clean previews; the Bash fallback preserves the
+# same NUL-safe format on systems without Perl.
+emit_deduplicated_dry_run_ledger() {
+    if [[ -z "${CLEAN_PREVIEW_LEDGER_FILE:-}" || ! -f "$CLEAN_PREVIEW_LEDGER_FILE" ]]; then
+        return 0
+    fi
+
+    local perl_bin=""
+    perl_bin=$(command -v perl 2> /dev/null || true)
+    if [[ -n "$perl_bin" && -x "$perl_bin" ]]; then
+        # shellcheck disable=SC2016  # Embedded Perl uses Perl variables inside single quotes.
+        "$perl_bin" -e '
+            use strict;
+            use warnings;
+            binmode STDIN;
+            binmode STDOUT;
+            local $/ = "\0";
+            my %seen;
+            while (defined(my $identity = <STDIN>)) {
+                chomp $identity;
+                my @record = ($identity);
+                for (1 .. 5) {
+                    my $field = <STDIN>;
+                    exit 0 unless defined $field;
+                    chomp $field;
+                    push @record, $field;
+                }
+                next if $seen{$identity}++;
+                print join("\0", @record), "\0";
+            }
+        ' < "$CLEAN_PREVIEW_LEDGER_FILE"
+        return 0
+    fi
+
+    local identity size_kb count size_known section path
+    local -a seen_identities=()
+    while IFS= read -r -d '' identity &&
+        IFS= read -r -d '' size_kb &&
+        IFS= read -r -d '' count &&
+        IFS= read -r -d '' size_known &&
+        IFS= read -r -d '' section &&
+        IFS= read -r -d '' path; do
+        if [[ ${#seen_identities[@]} -gt 0 ]] && mole_identity_in_list "$identity" "${seen_identities[@]}"; then
+            continue
+        fi
+        seen_identities+=("$identity")
+        printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+            "$identity" "$size_kb" "$count" "$size_known" "$section" "$path"
+    done < "$CLEAN_PREVIEW_LEDGER_FILE"
+}
+
+# Prints: known_size_kb item_count category_count unknown_size_count.
+dry_run_ledger_stats() {
+    local known_size_kb=0
+    local item_count=0
+    local category_count=0
+    local unknown_size_count=0
+    local identity size_kb count size_known section path
+    local -a seen_sections=()
+
+    if [[ -z "${CLEAN_PREVIEW_LEDGER_FILE:-}" || ! -f "$CLEAN_PREVIEW_LEDGER_FILE" ]]; then
+        printf '0 0 0 0\n'
+        return 0
+    fi
+
+    while IFS= read -r -d '' identity &&
+        IFS= read -r -d '' size_kb &&
+        IFS= read -r -d '' count &&
+        IFS= read -r -d '' size_known &&
+        IFS= read -r -d '' section &&
+        IFS= read -r -d '' path; do
+        [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
+        [[ "$count" =~ ^[0-9]+$ ]] || count=1
+        known_size_kb=$((known_size_kb + size_kb))
+        item_count=$((item_count + count))
+        [[ "$size_known" == "true" ]] || unknown_size_count=$((unknown_size_count + 1))
+
+        if [[ ${#seen_sections[@]} -eq 0 ]] || ! mole_identity_in_list "$section" "${seen_sections[@]}"; then
+            seen_sections+=("$section")
+            category_count=$((category_count + 1))
+        fi
+    done < <(emit_deduplicated_dry_run_ledger)
+
+    printf '%s %s %s %s\n' "$known_size_kb" "$item_count" "$category_count" "$unknown_size_count"
+}
+
+write_clean_preview_header() {
+    cat > "$EXPORT_LIST_FILE" << EOF
+# Mole Cleanup Preview - $(date '+%Y-%m-%d %H:%M:%S')
+#
+# How to protect files:
+# 1. Copy any path below to ~/.config/mole/whitelist
+# 2. Run: mo clean --whitelist
+#
+# Example:
+#   /Users/*/Library/Caches/com.example.app
+#
+
+EOF
+}
+
+render_clean_preview_from_ledger() {
+    write_clean_preview_header
+
+    local identity size_kb count size_known section path
+    local current_rendered_section=""
+    local known_size_kb=0
+    local rendered_items=0
+    local rendered_categories=0
+    local unknown_size_count=0
+    local -a seen_sections=()
+
+    if [[ -n "${CLEAN_PREVIEW_LEDGER_FILE:-}" && -f "$CLEAN_PREVIEW_LEDGER_FILE" ]]; then
+        while IFS= read -r -d '' identity &&
+            IFS= read -r -d '' size_kb &&
+            IFS= read -r -d '' count &&
+            IFS= read -r -d '' size_known &&
+            IFS= read -r -d '' section &&
+            IFS= read -r -d '' path; do
+            if [[ "$section" != "$current_rendered_section" ]]; then
+                echo "" >> "$EXPORT_LIST_FILE"
+                echo "=== $section ===" >> "$EXPORT_LIST_FILE"
+                current_rendered_section="$section"
+                if [[ ${#seen_sections[@]} -eq 0 ]] || ! mole_identity_in_list "$section" "${seen_sections[@]}"; then
+                    seen_sections+=("$section")
+                    rendered_categories=$((rendered_categories + 1))
+                fi
+            fi
+
+            [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
+            [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]] || count=1
+            local item_note=""
+            [[ "$count" -gt 1 ]] && item_note=", $count items"
+            if [[ "$size_known" == "true" ]]; then
+                echo "$path  # $(bytes_to_human "$((size_kb * 1024))")$item_note" >> "$EXPORT_LIST_FILE"
+            else
+                echo "$path  # size unknown$item_note" >> "$EXPORT_LIST_FILE"
+                unknown_size_count=$((unknown_size_count + 1))
+            fi
+
+            known_size_kb=$((known_size_kb + size_kb))
+            rendered_items=$((rendered_items + count))
+        done < <(emit_deduplicated_dry_run_ledger)
+    fi
+
+    total_size_cleaned=$known_size_kb
+    files_cleaned=$rendered_items
+    total_items=$rendered_categories
+    if [[ "$unknown_size_count" -gt 0 ]]; then
+        DRY_RUN_TOTAL_PARTIAL=true
+    else
+        DRY_RUN_TOTAL_PARTIAL=false
+    fi
+}
+
+read_clean_sudo_choice() {
+    local had_force_char=false
+    local previous_force_char="${MOLE_READ_KEY_FORCE_CHAR:-}"
+    if [[ ${MOLE_READ_KEY_FORCE_CHAR+x} ]]; then
+        had_force_char=true
+    fi
+
+    export MOLE_READ_KEY_FORCE_CHAR=1
+    local choice
+    choice=$(read_key)
+
+    if [[ "$had_force_char" == "true" ]]; then
+        export MOLE_READ_KEY_FORCE_CHAR="$previous_force_char"
+    else
+        unset MOLE_READ_KEY_FORCE_CHAR
+    fi
+
+    printf '%s\n' "$choice"
+}
+
+read_clean_sudo_password_remainder() {
+    local __remainder_var="$1"
+    local remainder=""
+
+    if [[ -r /dev/tty ]]; then
+        IFS= read -r -s remainder < /dev/tty || true
+    else
+        IFS= read -r -s remainder || true
+    fi
+
+    printf -v "$__remainder_var" '%s' "$remainder"
+}
+
+prompt_for_system_clean() {
+    local prompt_attempt=0
+    while true; do
+        echo -ne "${PURPLE}${ICON_ARROW}${NC} System caches need sudo. ${GREEN}Enter${NC} continue, ${GRAY}Space${NC} skip: "
+
+        local choice
+        choice=$(read_clean_sudo_choice)
+
+        # ESC aborts, Space skips, Enter (or any typed key, e.g. someone who
+        # starts typing their password) proceeds to authentication.
+        if [[ "$choice" == "QUIT" ]]; then
+            echo -e " ${GRAY}Canceled${NC}"
+            exit 0
+        fi
+
+        if [[ "$choice" == "SPACE" ]]; then
+            echo -e " ${GRAY}Skipped${NC}"
+            echo ""
+            SYSTEM_CLEAN=false
+            break
+        elif [[ "$choice" == "ENTER" ]]; then
+            printf "\r\033[K" # Clear the prompt line
+            if ensure_sudo_session "System cleanup requires admin access"; then
+                SYSTEM_CLEAN=true
+                echo -e "${GREEN}${ICON_SUCCESS}${NC} Admin access granted"
+                echo ""
+            else
+                SYSTEM_CLEAN=false
+                echo ""
+                echo -e "${YELLOW}Authentication failed${NC}, continuing with user-level cleanup"
+            fi
+            break
+        elif [[ "$choice" == CHAR:* ]]; then
+            local typed_password="${choice#CHAR:}"
+            local password_remainder=""
+            read_clean_sudo_password_remainder password_remainder
+            typed_password="${typed_password}${password_remainder}"
+
+            printf "\r\033[K" # Clear the prompt line
+            if ensure_sudo_session_with_password "$typed_password" "System cleanup requires admin access"; then
+                SYSTEM_CLEAN=true
+                echo -e "${GREEN}${ICON_SUCCESS}${NC} Admin access granted"
+                echo ""
+            else
+                SYSTEM_CLEAN=false
+                echo ""
+                echo -e "${YELLOW}Authentication failed${NC}, continuing with user-level cleanup"
+            fi
+            unset typed_password password_remainder
+            break
+        else
+            prompt_attempt=$((prompt_attempt + 1))
+            drain_pending_input 0.05
+            if [[ $prompt_attempt -ge 2 ]]; then
+                SYSTEM_CLEAN=false
+                echo -e " ${GRAY}Skipped${NC}"
+                echo ""
+                break
+            fi
+            printf "\r\033[K"
+            echo -e "${YELLOW}${ICON_WARNING}${NC} Press Enter to continue, or Space to skip"
+        fi
+    done
 }
 
 CLEANUP_DONE=false
@@ -198,17 +573,49 @@ trap 'cleanup TERM 143; exit 143' TERM
 
 # IMPORTANT: This file overrides start_section / end_section from
 # lib/core/base.sh by virtue of being sourced after it. The clean variant adds
-# CURRENT_SECTION tracking, dry-run EXPORT_LIST_FILE writes and a section
-# spinner stop. See the cross-reference block in lib/core/base.sh and the
-# differing purge variant in bin/purge.sh before changing any of these three.
+# CURRENT_SECTION tracking, dry-run EXPORT_LIST_FILE writes, a section
+# spinner stop, and idle-header recycling. See the cross-reference block in
+# lib/core/base.sh and the differing purge variant in bin/purge.sh before
+# changing any of these three.
+#
+# Idle-header recycling: an idle section used to erase its own header after
+# the fact, which made all content below jump up two lines per idle section.
+# Instead the header stays put and the NEXT start_section overwrites it in
+# place, so the screen never moves vertically. Any output that is not a
+# section header must clear a leftover idle header first via
+# flush_idle_section_slot.
+IDLE_SECTION_PENDING=0
+
+flush_idle_section_slot() {
+    if [[ "${IDLE_SECTION_PENDING:-0}" == "1" ]]; then
+        IDLE_SECTION_PENDING=0
+        safe_clear_lines 2 || true
+    fi
+}
+
 start_section() {
     TRACK_SECTION=1
     SECTION_ACTIVITY=0
+    if [[ "$DRY_RUN" == "true" && -n "${CLEAN_PREVIEW_LEDGER_FILE:-}" ]]; then
+        local _start_items _start_categories
+        read -r SECTION_START_SIZE_KB _start_items _start_categories SECTION_START_UNKNOWN_COUNT \
+            < <(dry_run_ledger_stats)
+    else
+        SECTION_START_SIZE_KB="${total_size_cleaned:-0}"
+        SECTION_START_UNKNOWN_COUNT=0
+    fi
     CURRENT_SECTION="$1"
-    echo ""
-    echo -e "${PURPLE_BOLD}${ICON_ARROW} $1${NC}"
+    if [[ "${IDLE_SECTION_PENDING:-0}" == "1" ]]; then
+        # Overwrite the previous idle section's header line in place (the
+        # pending flag is only ever set on an interactive ANSI terminal).
+        IDLE_SECTION_PENDING=0
+        printf '\033[1A\r\033[2K%b\n' "${PURPLE_BOLD}${ICON_ARROW} $1${NC}"
+    else
+        echo ""
+        echo -e "${PURPLE_BOLD}${ICON_ARROW} $1${NC}"
+    fi
 
-    if [[ "$DRY_RUN" == "true" ]]; then
+    if [[ "$DRY_RUN" == "true" && -z "${CLEAN_PREVIEW_LEDGER_FILE:-}" ]]; then
         ensure_user_file "$EXPORT_LIST_FILE"
         echo "" >> "$EXPORT_LIST_FILE"
         echo "=== $1 ===" >> "$EXPORT_LIST_FILE"
@@ -219,7 +626,44 @@ end_section() {
     stop_section_spinner
 
     if [[ "${TRACK_SECTION:-0}" == "1" && "${SECTION_ACTIVITY:-0}" == "0" ]]; then
-        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Nothing to clean"
+        # On an interactive ANSI terminal, leave the header on screen and let
+        # the next start_section recycle its line, so idle sections disappear
+        # without the erase-and-jump. Piped output keeps the explicit fallback
+        # so logs stay self-describing. MO_DEBUG interleaves stderr lines that
+        # line recycling would corrupt, so keep the fallback there too.
+        if [[ -t 1 && "${MO_DEBUG:-}" != "1" ]] && is_ansi_supported 2> /dev/null; then
+            IDLE_SECTION_PENDING=1
+        else
+            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Nothing to clean"
+        fi
+    else
+        IDLE_SECTION_PENDING=0
+        # Report-only sections (Large files, System Data clues, Project
+        # artifacts, hint-only App leftovers) mark activity without reclaiming
+        # anything, so a footer there would read "Category total · 0B" directly
+        # under a row quoting a 100GB directory. Only sections that actually
+        # moved the tracked total get one.
+        local section_size_kb=0
+        local section_unknown_count=0
+        if [[ "$DRY_RUN" == "true" && -n "${CLEAN_PREVIEW_LEDGER_FILE:-}" ]]; then
+            local current_size_kb _current_items _current_categories current_unknown_count
+            read -r current_size_kb _current_items _current_categories current_unknown_count \
+                < <(dry_run_ledger_stats)
+            section_size_kb=$((current_size_kb - SECTION_START_SIZE_KB))
+            section_unknown_count=$((current_unknown_count - SECTION_START_UNKNOWN_COUNT))
+        else
+            section_size_kb=$((total_size_cleaned - SECTION_START_SIZE_KB))
+        fi
+
+        if [[ "$section_unknown_count" -gt 0 ]]; then
+            if [[ "$section_size_kb" -gt 0 ]]; then
+                echo -e "  ${GRAY}${ICON_SUBLIST} Category total${NC} · at least $(colorize_human_size "$(bytes_to_human_kb "$section_size_kb")")"
+            else
+                echo -e "  ${GRAY}${ICON_SUBLIST} Category total${NC} · size unknown"
+            fi
+        elif [[ "$section_size_kb" -gt 0 ]]; then
+            echo -e "  ${GRAY}${ICON_SUBLIST} Category total${NC} · $(colorize_human_size "$(bytes_to_human_kb "$section_size_kb")")"
+        fi
     fi
     TRACK_SECTION=0
 }
@@ -261,6 +705,10 @@ normalize_paths_for_cleanup() {
     # Paths with embedded newlines cannot go through the newline-delimited pipeline;
     # they are output directly with null-byte delimiters and skipped by the sort pass.
     if [[ ${#input_paths[@]} -gt 50 ]]; then
+        # The gradle-DSL collapse below is intentionally inlined (not a call to
+        # _normalize_single_cleanup_path): this path runs for thousands of items
+        # and per-item function-call overhead trips the large-batch time budget
+        # in tests/regression.bats. Keep it in sync with that helper.
         local -a _fast_pipeline=()
         local _fast_path _fast_raw
         for _fast_path in "${input_paths[@]}"; do
@@ -368,26 +816,18 @@ normalize_paths_for_cleanup() {
 get_cleanup_path_size_kb() {
     local path="$1"
 
-    if [[ -f "$path" && ! -L "$path" ]]; then
-        if command -v stat > /dev/null 2>&1; then
-            local bytes
-            bytes=$(stat -f%z "$path" 2> /dev/null || echo "0")
-            if [[ "$bytes" =~ ^[0-9]+$ && "$bytes" -gt 0 ]]; then
-                echo $(((bytes + 1023) / 1024))
-                return 0
-            fi
+    # A plain file or a symlink is a single stat. Directories and the
+    # stat-unavailable case fall back to get_path_size_kb. For a regular file
+    # with a zero/invalid stat we also fall back; a symlink reports 0 directly.
+    if [[ -L "$path" || -f "$path" ]] && command -v stat > /dev/null 2>&1; then
+        local bytes
+        bytes=$(stat -f%z "$path" 2> /dev/null || echo "0")
+        if [[ "$bytes" =~ ^[0-9]+$ && "$bytes" -gt 0 ]]; then
+            echo $(((bytes + 1023) / 1024))
+            return 0
         fi
-    fi
-
-    if [[ -L "$path" ]]; then
-        if command -v stat > /dev/null 2>&1; then
-            local bytes
-            bytes=$(stat -f%z "$path" 2> /dev/null || echo "0")
-            if [[ "$bytes" =~ ^[0-9]+$ && "$bytes" -gt 0 ]]; then
-                echo $(((bytes + 1023) / 1024))
-            else
-                echo 0
-            fi
+        if [[ -L "$path" ]]; then
+            echo 0
             return 0
         fi
     fi
@@ -491,8 +931,8 @@ safe_clean() {
     local show_scan_feedback=false
     if [[ ${#targets[@]} -gt 20 && -t 1 ]]; then
         show_scan_feedback=true
-        stop_section_spinner
-        MOLE_SPINNER_PREFIX="  " start_inline_spinner "Scanning ${#targets[@]} items..."
+        # Updates a running section spinner in place instead of restarting it.
+        start_section_spinner "Scanning ${#targets[@]} items..."
     fi
 
     local _perf_scan_start
@@ -516,6 +956,14 @@ safe_clean() {
             log_operation "clean" "SKIPPED" "$path" "whitelist"
         fi
         [[ "$skip" == "true" ]] && continue
+
+        if holds_compiled_model_cache "$path"; then
+            skip=true
+            skipped_count=$((skipped_count + 1))
+            log_operation "clean" "SKIPPED" "$path" "compiled model cache"
+        fi
+        [[ "$skip" == "true" ]] && continue
+
         if [[ -e "$path" ]]; then
             if [[ "$DRY_RUN" == "true" ]]; then
                 register_dry_run_cleanup_target "$path" || continue
@@ -526,7 +974,9 @@ safe_clean() {
 
     debug_timer_end "$description: path scan" _perf_scan_start
 
-    if [[ "$show_scan_feedback" == "true" ]]; then
+    # Keep the spinner alive between phases; the next phase swaps its text in
+    # place. Under MO_DEBUG stop it so debug lines print on a clean line.
+    if [[ "$show_scan_feedback" == "true" && "${MO_DEBUG:-}" == "1" ]]; then
         stop_section_spinner
     fi
 
@@ -557,6 +1007,11 @@ safe_clean() {
     fi
 
     if [[ ${#existing_paths[@]} -eq 0 ]]; then
+        # The scan spinner we started (or took over) must not outlive this
+        # call; callers print rows without stopping spinners themselves.
+        if [[ "$show_scan_feedback" == "true" ]]; then
+            stop_section_spinner
+        fi
         return 0
     fi
 
@@ -577,7 +1032,7 @@ safe_clean() {
     if [[ ${#existing_paths[@]} -gt 10 ]]; then
         show_spinner=true
         local total_paths=${#existing_paths[@]}
-        if [[ -t 1 ]]; then MOLE_SPINNER_PREFIX="  " start_inline_spinner "Scanning items..."; fi
+        if [[ -t 1 ]]; then start_section_spinner "Scanning items..."; fi
     fi
 
     local cleaning_spinner_started=false
@@ -602,7 +1057,7 @@ safe_clean() {
         # Heuristic: mostly files -> bulk stat is faster than per-file subshells.
         if [[ $dir_count -lt 5 && ${#existing_paths[@]} -gt 20 ]]; then
             if [[ -t 1 && "$show_spinner" == "false" ]]; then
-                MOLE_SPINNER_PREFIX="  " start_inline_spinner "Scanning items..."
+                start_section_spinner "Scanning items..."
                 show_spinner=true
             fi
 
@@ -655,7 +1110,7 @@ safe_clean() {
                             echo "0 0" > "$tmp_file"
                         fi
                         mv "$tmp_file" "$temp_dir/result_${idx}" 2> /dev/null || true
-                    ) &
+                    ) < /dev/null &
                     pids+=($!)
                     idx=$((idx + 1))
 
@@ -691,7 +1146,7 @@ safe_clean() {
         # Read results back in original order.
         # Start spinner for cleaning phase
         if [[ "$DRY_RUN" != "true" && ${#existing_paths[@]} -gt 0 && -t 1 ]]; then
-            MOLE_SPINNER_PREFIX="  " start_inline_spinner "Cleaning..."
+            start_section_spinner "Cleaning..."
             cleaning_spinner_started=true
         fi
         idx=0
@@ -735,7 +1190,7 @@ safe_clean() {
 
         # Start spinner for cleaning phase (small batch)
         if [[ "$DRY_RUN" != "true" && ${#existing_paths[@]} -gt 0 && -t 1 ]]; then
-            MOLE_SPINNER_PREFIX="  " start_inline_spinner "Cleaning..."
+            start_section_spinner "Cleaning..."
             cleaning_spinner_started=true
         fi
         local idx=0
@@ -772,7 +1227,7 @@ safe_clean() {
         debug_timer_end "$description: deletion" _perf_del_start
     fi
 
-    if [[ "$show_spinner" == "true" || "$cleaning_spinner_started" == "true" ]]; then
+    if [[ "$show_spinner" == "true" || "$cleaning_spinner_started" == "true" || "$show_scan_feedback" == "true" ]]; then
         stop_inline_spinner
     fi
 
@@ -792,18 +1247,20 @@ safe_clean() {
         local size_human
         size_human=$(bytes_to_human "$((total_size_kb * 1024))")
 
-        local label="$description"
-        if [[ ${#targets[@]} -gt 1 ]]; then
-            label+=" ${#targets[@]} items"
+        # Multi-target cleanups report the item count as part of the detail
+        # column, keeping the label clean: "npm logs · 2 items, 2KB". Use the
+        # actually-cleaned count (total_count), not the raw target count, so it
+        # stays consistent with the reported size after protected, whitelisted,
+        # missing, and deduplicated targets have been dropped.
+        local count_note=""
+        if [[ $total_count -gt 1 ]]; then
+            count_note="$total_count items, "
         fi
 
         if [[ "$DRY_RUN" == "true" ]]; then
             local size_display
             size_display=$(colorize_human_size "$size_human")
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} $label${NC}, ${size_display} ${YELLOW}dry${NC}"
-
-            local paths_temp
-            paths_temp=$(create_temp_file)
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} $description${NC} · ${count_note}${size_display} ${YELLOW}dry${NC}"
 
             idx=0
             if [[ ${#existing_paths[@]} -gt 0 ]]; then
@@ -816,53 +1273,15 @@ safe_clean() {
                         size=$(get_cleanup_path_size_kb "$path" 2> /dev/null || echo "0")
                     fi
 
-                    [[ "$size" == "0" || -z "$size" ]] && {
-                        idx=$((idx + 1))
-                        continue
-                    }
-
-                    echo "$(dirname "$path")|$size|$path" >> "$paths_temp"
+                    [[ "$size" =~ ^[0-9]+$ ]] || size=0
+                    append_dry_run_cleanup_target "$path" "$size" 1 true
                     idx=$((idx + 1))
-                done
-            fi
-
-            # Group dry-run paths by parent for a compact export list.
-            if [[ -f "$paths_temp" && -s "$paths_temp" ]]; then
-                sort -t'|' -k1,1 "$paths_temp" | awk -F'|' '
-                {
-                    parent = $1
-                    size = $2
-                    path = $3
-
-                    parent_size[parent] += size
-                    if (parent_count[parent] == 0) {
-                        parent_first[parent] = path
-                    }
-                    parent_count[parent]++
-                }
-                END {
-                    for (parent in parent_size) {
-                        if (parent_count[parent] > 1) {
-                            printf "%s|%d|%d\n", parent, parent_size[parent], parent_count[parent]
-                        } else {
-                            printf "%s|%d|1\n", parent_first[parent], parent_size[parent]
-                        }
-                    }
-                }
-                ' | while IFS='|' read -r display_path total_size child_count; do
-                    local size_human
-                    size_human=$(bytes_to_human "$((total_size * 1024))")
-                    if [[ $child_count -gt 1 ]]; then
-                        echo "$display_path  # $size_human, $child_count items" >> "$EXPORT_LIST_FILE"
-                    else
-                        echo "$display_path  # $size_human" >> "$EXPORT_LIST_FILE"
-                    fi
                 done
             fi
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$total_size_kb")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} $label${NC}, ${line_color}$size_human${NC}"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} $description${NC} · ${count_note}${line_color}$size_human${NC}"
         fi
         files_cleaned=$((files_cleaned + total_count))
         total_size_cleaned=$((total_size_cleaned + total_size_kb))
@@ -878,6 +1297,7 @@ start_cleanup() {
     export MOLE_CURRENT_COMMAND="clean"
     log_operation_session_start "clean"
     DRY_RUN_SEEN_IDENTITIES=()
+    DRY_RUN_TOTAL_PARTIAL=false
 
     if [[ -t 1 ]]; then
         printf '\033[2J\033[H'
@@ -907,22 +1327,14 @@ start_cleanup() {
         echo -e "${YELLOW}Dry Run Mode${NC}, Preview only, no deletions"
         echo ""
 
-        ensure_user_file "$EXPORT_LIST_FILE"
-        cat > "$EXPORT_LIST_FILE" << EOF
-# Mole Cleanup Preview - $(date '+%Y-%m-%d %H:%M:%S')
-#
-# How to protect files:
-# 1. Copy any path below to ~/.config/mole/whitelist
-# 2. Run: mo clean --whitelist
-#
-# Example:
-#   /Users/*/Library/Caches/com.example.app
-#
-
-EOF
+        prepare_clean_preview_file || {
+            echo -e "${YELLOW}${ICON_WARNING}${NC} Unable to create a safe cleanup preview file" >&2
+            return 1
+        }
+        write_clean_preview_header
 
         # Preview system section when sudo is already cached (no password prompt).
-        if has_sudo_session; then
+        if adopt_sudo_session; then
             SYSTEM_CLEAN=true
             echo -e "${GREEN}${ICON_SUCCESS}${NC} Admin access available, system preview included"
             echo ""
@@ -935,47 +1347,17 @@ EOF
     fi
 
     if [[ -t 0 ]]; then
-        if has_sudo_session; then
+        if adopt_sudo_session; then
             SYSTEM_CLEAN=true
             echo -e "${GREEN}${ICON_SUCCESS}${NC} Admin access already available"
             echo ""
         else
-            echo -ne "${PURPLE}${ICON_ARROW}${NC} System caches need sudo. ${GREEN}Enter${NC} continue, ${GRAY}Space${NC} skip: "
-
-            local choice
-            choice=$(read_key)
-
-            # ESC/Q aborts, Space skips, Enter enables system cleanup.
-            if [[ "$choice" == "QUIT" ]]; then
-                echo -e " ${GRAY}Canceled${NC}"
-                exit 0
-            fi
-
-            if [[ "$choice" == "SPACE" ]]; then
-                echo -e " ${GRAY}Skipped${NC}"
-                echo ""
-                SYSTEM_CLEAN=false
-            elif [[ "$choice" == "ENTER" ]]; then
-                printf "\r\033[K" # Clear the prompt line
-                if ensure_sudo_session "System cleanup requires admin access"; then
-                    SYSTEM_CLEAN=true
-                    echo -e "${GREEN}${ICON_SUCCESS}${NC} Admin access granted"
-                    echo ""
-                else
-                    SYSTEM_CLEAN=false
-                    echo ""
-                    echo -e "${YELLOW}Authentication failed${NC}, continuing with user-level cleanup"
-                fi
-            else
-                SYSTEM_CLEAN=false
-                echo -e " ${GRAY}Skipped${NC}"
-                echo ""
-            fi
+            prompt_for_system_clean
         fi
     else
         echo ""
         echo "Running in non-interactive mode"
-        if has_sudo_session; then
+        if adopt_sudo_session; then
             SYSTEM_CLEAN=true
             echo "  ${ICON_LIST} System-level cleanup enabled, sudo session active"
         else
@@ -993,6 +1375,9 @@ perform_cleanup() {
         files_cleaned=0
         total_size_cleaned=0
     fi
+
+    local initial_free_space_kb=""
+    local initial_free_space_display="Unknown"
 
     # Test mode skips expensive scans and returns minimal output.
     local test_mode_enabled=false
@@ -1031,7 +1416,11 @@ perform_cleanup() {
     fi
 
     if [[ "$test_mode_enabled" == "false" && -z "$EXTERNAL_VOLUME_TARGET" ]]; then
-        echo -e "${BLUE}${ICON_ADMIN}${NC} $(detect_architecture) | Free space: $(get_free_space)"
+        if ! initial_free_space_kb=$(get_free_space_kb 2> /dev/null); then
+            initial_free_space_kb=""
+        fi
+        initial_free_space_display=$(format_free_space_kb "$initial_free_space_kb")
+        echo -e "${BLUE}${ICON_ADMIN}${NC} $(detect_architecture) | Free space: $initial_free_space_display"
     fi
 
     if [[ "$test_mode_enabled" == "true" ]]; then
@@ -1122,6 +1511,7 @@ perform_cleanup() {
         fi
 
         if [[ ${#WHITELIST_WARNINGS[@]} -gt 0 ]]; then
+            flush_idle_section_slot
             echo ""
             for warning in "${WHITELIST_WARNINGS[@]}"; do
                 echo -e "  ${GRAY}${ICON_WARNING}${NC} Whitelist: $warning"
@@ -1188,6 +1578,7 @@ perform_cleanup() {
         clean_orphaned_app_data
         clean_orphaned_system_services
         clean_orphaned_container_stubs
+        clean_stale_launch_services_registrations
         show_user_launch_agent_hint_notice
         show_orphan_dotdir_hint_notice
         end_section
@@ -1196,9 +1587,10 @@ perform_cleanup() {
         clean_apple_silicon_caches
 
         # ===== 12. Device backups & firmware =====
+        # iOS backups are reported once, in the Large files section; a second
+        # row here used a different size formatter and confused users.
         start_section "Device backups & firmware"
         clean_cached_device_firmware
-        check_ios_device_backups
         end_section
 
         # ===== 13. Time Machine =====
@@ -1223,7 +1615,12 @@ perform_cleanup() {
     fi
 
     # ===== Final summary =====
+    flush_idle_section_slot
     echo ""
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        render_clean_preview_from_ledger
+    fi
 
     local summary_heading=""
     local summary_status="success"
@@ -1235,12 +1632,40 @@ perform_cleanup() {
 
     local -a summary_details=()
 
-    if [[ $total_size_cleaned -gt 0 ]]; then
+    # Emit one "Free space" line, with the measured delta in parentheses when
+    # available. $1 is the free space in KB captured before cleanup started.
+    # Caller appends each printed line to summary_details.
+    emit_free_space_summary() {
+        local initial_kb="$1"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            printf 'Free space: %s\n' "$(get_free_space)"
+            return 0
+        fi
+
+        local final_kb
+        if ! final_kb=$(get_free_space_kb 2> /dev/null); then
+            final_kb=""
+        fi
+        local delta_note=""
+        if [[ "$initial_kb" =~ ^[0-9]+$ && "$final_kb" =~ ^[0-9]+$ && "$initial_kb" -ne "$final_kb" ]]; then
+            delta_note=" ($(format_free_space_delta_kb "$((final_kb - initial_kb))"))"
+        fi
+        printf 'Free space: %s%s\n' "$(format_free_space_kb "$final_kb")" "$delta_note"
+    }
+
+    if [[ $total_size_cleaned -gt 0 ||
+        ("$DRY_RUN" == "true" && ("$DRY_RUN_TOTAL_PARTIAL" == "true" || $files_cleaned -gt 0)) ]]; then
         local freed_size_human
         freed_size_human=$(bytes_to_human_kb "$total_size_cleaned")
 
         if [[ "$DRY_RUN" == "true" ]]; then
-            local stats="Potential space: $(colorize_human_size "$freed_size_human")"
+            local potential_label
+            if [[ "$DRY_RUN_TOTAL_PARTIAL" == "true" ]]; then
+                potential_label="At least $freed_size_human"
+            else
+                potential_label="$freed_size_human"
+            fi
+            local stats="Potential space: $(colorize_human_size "$potential_label")"
             [[ $files_cleaned -gt 0 ]] && stats+=" | Items: $files_cleaned"
             [[ $total_items -gt 0 ]] && stats+=" | Categories: $total_items"
             summary_details+=("$stats")
@@ -1250,15 +1675,13 @@ perform_cleanup() {
                 echo "# ============================================"
                 echo "# Summary"
                 echo "# ============================================"
-                echo "# Potential cleanup: ${freed_size_human}"
+                echo "# Potential cleanup: ${potential_label}"
                 echo "# Items: $files_cleaned"
                 echo "# Categories: $total_items"
             } >> "$EXPORT_LIST_FILE"
 
-            summary_details+=("Detailed file list: ${GRAY}$EXPORT_LIST_FILE${NC}")
-            summary_details+=("Use ${GRAY}mo clean --whitelist${NC} to add protection rules")
         else
-            local summary_line="Space freed: ${GREEN}${freed_size_human}${NC}"
+            local summary_line="Tracked cleanup: ${GREEN}${freed_size_human}${NC}"
 
             if [[ $files_cleaned -gt 0 && $total_items -gt 0 ]]; then
                 summary_line+=" | Items cleaned: $files_cleaned | Categories: $total_items"
@@ -1284,9 +1707,10 @@ perform_cleanup() {
                 fi
             fi
 
-            local final_free_space
-            final_free_space=$(get_free_space)
-            summary_details+=("Free space now: $final_free_space")
+            local free_space_line
+            while IFS= read -r free_space_line; do
+                summary_details+=("$free_space_line")
+            done < <(emit_free_space_summary "$initial_free_space_kb")
         fi
     else
         summary_status="info"
@@ -1295,7 +1719,22 @@ perform_cleanup() {
         else
             summary_details+=("System was already clean; no additional space freed.")
         fi
-        summary_details+=("Free space now: $(get_free_space)")
+        local free_space_line
+        while IFS= read -r free_space_line; do
+            summary_details+=("$free_space_line")
+        done < <(emit_free_space_summary "$initial_free_space_kb")
+    fi
+
+    if [[ "$DRY_RUN" == "true" &&
+        ($total_size_cleaned -gt 0 || "$DRY_RUN_TOTAL_PARTIAL" == "true" || $files_cleaned -gt 0) ]]; then
+        if publish_clean_preview_file; then
+            summary_details+=("Detailed file list: ${GRAY}$CLEAN_PREVIEW_FINAL_FILE${NC}")
+            summary_details+=("Use ${GRAY}mo clean --whitelist${NC} to add protection rules")
+        else
+            summary_details+=("Cleanup preview file could not be written safely")
+        fi
+    elif [[ "$DRY_RUN" == "true" ]]; then
+        publish_clean_preview_file || true
     fi
 
     if [[ $had_errexit -eq 1 ]]; then
@@ -1376,4 +1815,6 @@ main() {
     exit 0
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

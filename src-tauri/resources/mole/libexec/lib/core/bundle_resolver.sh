@@ -55,11 +55,17 @@ bundle_has_installed_app() {
     #   - Privileged helpers embedded in a parent .app under
     #     Contents/Library/LaunchServices/<helper-bundle-id> (e.g. the Adobe
     #     ARMDC helpers shipped inside Adobe Acrobat DC.app) -- issue #733
-    local parent_id=""
+    # Bundle IDs are case-insensitive on macOS and helper suffixes ship in both
+    # cases (com.foo.app.helper, com.stclairsoft.AppTamer.Helper), so derive the
+    # parent ID and compare identifiers on lowercased copies. See #1210.
+    local bundle_id_lower
+    bundle_id_lower=$(printf '%s' "$bundle_id" | tr '[:upper:]' '[:lower:]')
+
+    local parent_id_lower=""
     local suffix
-    for suffix in ".helper" ".daemon" ".agent" ".xpc"; do
-        if [[ "$bundle_id" == *"$suffix" ]]; then
-            parent_id="${bundle_id%"$suffix"}"
+    for suffix in ".helper" ".daemon" ".agent" ".xpc" ".service"; do
+        if [[ "$bundle_id_lower" == *"$suffix" ]]; then
+            parent_id_lower="${bundle_id_lower%"$suffix"}"
             break
         fi
     done
@@ -87,8 +93,11 @@ bundle_has_installed_app() {
             info="$app/Contents/Info.plist"
             [[ -f "$info" ]] || continue
             app_bundle=$(plutil -extract CFBundleIdentifier raw "$info" 2> /dev/null || echo "")
-            [[ "$app_bundle" == "$bundle_id" ]] && return 0
-            [[ -n "$parent_id" && "$app_bundle" == "$parent_id" ]] && return 0
+            [[ -n "$app_bundle" ]] || continue
+            local app_bundle_lower
+            app_bundle_lower=$(printf '%s' "$app_bundle" | tr '[:upper:]' '[:lower:]')
+            [[ "$app_bundle_lower" == "$bundle_id_lower" ]] && return 0
+            [[ -n "$parent_id_lower" && "$app_bundle_lower" == "$parent_id_lower" ]] && return 0
             if ((${#mapped_app_bundles[@]} > 0)); then
                 local mapped_bundle
                 for mapped_bundle in "${mapped_app_bundles[@]}"; do

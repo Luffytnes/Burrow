@@ -20,10 +20,24 @@ clean_trash() {
 
     if [[ "$DRY_RUN" == "true" ]]; then
         if [[ $trash_count -gt 0 ]]; then
+            if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                local trash_item
+                while IFS= read -r -d '' trash_item; do
+                    [[ -e "$trash_item" ]] || continue
+                    if should_protect_path "$trash_item" 2> /dev/null || is_path_whitelisted "$trash_item" 2> /dev/null; then
+                        continue
+                    fi
+                    local trash_item_kb
+                    trash_item_kb=$(get_path_size_kb "$trash_item" 2> /dev/null || echo "0")
+                    [[ "$trash_item_kb" =~ ^[0-9]+$ ]] || trash_item_kb=0
+                    record_dry_run_cleanup_target "$trash_item" "$trash_item_kb" 1 true || true
+                done < <(command find "$HOME/.Trash" -mindepth 1 -maxdepth 1 -print0 2> /dev/null || true)
+            fi
             echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Trash · would empty, $trash_count items"
         else
             echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Trash · already empty"
         fi
+        note_activity
         return 0
     fi
 
@@ -110,6 +124,7 @@ _clean_incomplete_downloads() {
             [[ -e "$f" ]] || continue
             if lsof -F n -- "$f" > /dev/null 2>&1; then
                 echo -e "  ${GRAY}${ICON_WARNING}${NC} Skipping active download: $(basename "$f")"
+                note_activity
                 continue
             fi
             safe_clean "$f" "$label" || true
@@ -136,6 +151,8 @@ _clean_mail_downloads() {
     local count=0
     local cleaned_kb=0
     local spinner_active=false
+    local dry_run_mode=false
+    [[ "${DRY_RUN:-false}" == "true" || "${MOLE_DRY_RUN:-0}" == "1" ]] && dry_run_mode=true
     for target_path in "${mail_dirs[@]}"; do
         if [[ -d "$target_path" ]]; then
             if [[ "$spinner_active" == "false" && -t 1 ]]; then
@@ -158,7 +175,16 @@ _clean_mail_downloads() {
                 if [[ -f "$file_path" ]]; then
                     local file_size_kb
                     file_size_kb=$(get_path_size_kb "$file_path")
-                    if safe_remove "$file_path" true; then
+                    local remove_rc=1
+                    if [[ "$dry_run_mode" == "true" ]]; then
+                        if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                            record_dry_run_cleanup_target "$file_path" "$file_size_kb" 1 true || continue
+                        fi
+                        MOLE_DRY_RUN=1 safe_remove "$file_path" true "$file_size_kb" && remove_rc=0
+                    elif safe_remove "$file_path" true "$file_size_kb"; then
+                        remove_rc=0
+                    fi
+                    if [[ $remove_rc -eq 0 ]]; then
                         count=$((count + 1))
                         cleaned_kb=$((cleaned_kb + file_size_kb))
                     fi
@@ -172,7 +198,11 @@ _clean_mail_downloads() {
     if [[ $count -gt 0 ]]; then
         local cleaned_mb
         cleaned_mb=$(echo "$cleaned_kb" | awk '{printf "%.1f", $1/1024}' || echo "0.0")
-        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Cleaned $count mail attachments older than ${mail_age_days}d, about ${cleaned_mb}MB"
+        if [[ "$dry_run_mode" == "true" ]]; then
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Would clean $count mail attachments older than ${mail_age_days}d, about ${cleaned_mb}MB"
+        else
+            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Cleaned $count mail attachments older than ${mail_age_days}d, about ${cleaned_mb}MB"
+        fi
         note_activity
     fi
 }
@@ -243,11 +273,24 @@ _clean_darwin_user_runtime_dir() {
                 ;;
         esac
 
+        # Never touch endpoint-security/EDR agent caches (tamper detection),
+        # even when the file is user-owned and old enough to qualify here.
+        if is_endpoint_security_cache_path "$item"; then
+            continue
+        fi
+
         local item_size_kb=0
         item_size_kb=$(get_path_size_kb "$item" 2> /dev/null || echo "0")
         [[ "$item_size_kb" =~ ^[0-9]+$ ]] || item_size_kb=0
 
-        if [[ "${DRY_RUN:-false}" == "true" ]] || safe_remove "$item" true "$item_size_kb" > /dev/null 2>&1; then
+        if [[ "${DRY_RUN:-false}" == "true" ]]; then
+            if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                record_dry_run_cleanup_target "$item" "$item_size_kb" 1 true || continue
+            fi
+            found_any=true
+            count=$((count + 1))
+            total_size_kb=$((total_size_kb + item_size_kb))
+        elif safe_remove "$item" true "$item_size_kb" > /dev/null 2>&1; then
             found_any=true
             count=$((count + 1))
             total_size_kb=$((total_size_kb + item_size_kb))
@@ -265,9 +308,21 @@ _clean_darwin_user_runtime_dir() {
     )
 
     if [[ "$count" -lt "$max_items" ]]; then
+        # Same safety contract as the file loop above: parent vetted,
+        # find narrowed to current UID + age + -type d -empty, and safe_remove
+        # still validates. Do not re-add per-item should_protect_path here.
         while IFS= read -r -d '' item; do
             [[ -d "$item" && ! -L "$item" ]] || continue
-            if [[ "${DRY_RUN:-false}" == "true" ]] || safe_remove "$item" true "0" > /dev/null 2>&1; then
+            if is_endpoint_security_cache_path "$item"; then
+                continue
+            fi
+            if [[ "${DRY_RUN:-false}" == "true" ]]; then
+                if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                    record_dry_run_cleanup_target "$item" 0 1 true || continue
+                fi
+                found_any=true
+                count=$((count + 1))
+            elif safe_remove "$item" true "0" > /dev/null 2>&1; then
                 found_any=true
                 count=$((count + 1))
             fi
@@ -288,11 +343,11 @@ _clean_darwin_user_runtime_dir() {
         local cap_note=""
         [[ "$hit_cap" == "true" ]] && cap_note=", capped"
         if [[ "${DRY_RUN:-false}" == "true" ]]; then
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} ${label}${NC}, ${YELLOW}${count} old items, $(colorize_human_size "$size_human") ${YELLOW}dry${cap_note}${NC}"
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} ${label}${NC} · ${YELLOW}${count} old items, $(colorize_human_size "$size_human") ${YELLOW}dry${cap_note}${NC}"
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$total_size_kb")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} ${label}${NC}, ${line_color}${count} old items, ${size_human}${cap_note}${NC}"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} ${label}${NC} · ${line_color}${count} old items, ${size_human}${cap_note}${NC}"
         fi
         files_cleaned=$((files_cleaned + count))
         total_size_cleaned=$((total_size_cleaned + total_size_kb))
@@ -320,55 +375,68 @@ _clean_darwin_user_runtime_dirs() {
     start_section_spinner "Cleaning runtime files..."
 }
 
-# Remove old Google Chrome versions while keeping Current.
-is_google_chrome_running() {
-    pgrep -x "Google Chrome" > /dev/null 2>&1 && return 0
-    pgrep -x "Google Chrome Helper" > /dev/null 2>&1 && return 0
-    pgrep -f "/Google Chrome.app/" > /dev/null 2>&1 && return 0
-    return 1
-}
+# Chrome, Edge, and Brave are all Chromium: same versioned framework layout
+# (Contents/Frameworks/<X>.framework/Versions with a Current symlink), same
+# keep-Current + keep-newer-staged-update rules, same removal and accounting.
+# Only four facts differ per browser, so they are parameters here and the three
+# public functions below are thin wrappers.
+#
+# clean_edge_updater_old_versions is deliberately NOT routed through this: it
+# keeps the latest by `sort -V` (no Current symlink at all) and never escalates
+# to a sudo removal. Merging it would change its semantics.
+_clean_chromium_old_versions() {
+    local label="$1"
+    local framework="$2"
+    local running_probe="$3"
+    shift 3
+    local -a app_paths=("$@")
 
-clean_chrome_old_versions() {
-    local -a app_paths
-    if [[ -n "${MOLE_CHROME_APP_PATHS:-}" ]]; then
-        IFS=':' read -ra app_paths <<< "$MOLE_CHROME_APP_PATHS"
-    else
-        app_paths=(
-            "/Applications/Google Chrome.app"
-            "$HOME/Applications/Google Chrome.app"
-        )
-    fi
-
-    if is_google_chrome_running; then
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Google Chrome running · old versions cleanup skipped"
+    if "$running_probe"; then
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} ${label} old versions · skipped (${label} running)"
+        note_activity
         return 0
     fi
 
     local cleaned_count=0
     local total_size=0
     local cleaned_any=false
+    local app_path
 
     for app_path in "${app_paths[@]}"; do
         [[ -d "$app_path" ]] || continue
 
-        local versions_dir="$app_path/Contents/Frameworks/Google Chrome Framework.framework/Versions"
-        [[ -d "$versions_dir" ]] || continue
+        # Every silent skip below logs its reason: "old versions not removed"
+        # reports are undiagnosable without knowing which gate bailed (#1216).
+        local versions_dir="$app_path/Contents/Frameworks/$framework/Versions"
+        if [[ ! -d "$versions_dir" ]]; then
+            debug_log "${label} old versions: no Versions dir at $versions_dir"
+            continue
+        fi
 
         local current_link="$versions_dir/Current"
-        [[ -L "$current_link" ]] || continue
+        if [[ ! -L "$current_link" ]]; then
+            debug_log "${label} old versions: no Current symlink in $versions_dir"
+            continue
+        fi
 
         local current_version
         current_version=$(readlink "$current_link" 2> /dev/null || true)
         current_version="${current_version##*/}"
-        [[ -n "$current_version" ]] || continue
+        if [[ -z "$current_version" ]]; then
+            debug_log "${label} old versions: Current symlink unreadable"
+            continue
+        fi
 
         # Verify the Current symlink target exists. If broken, skip to avoid
         # accidentally deleting the active browser version.
         if [[ ! -d "$versions_dir/$current_version" ]]; then
-            echo -e "  ${GRAY}${ICON_WARNING}${NC} Chrome Current symlink is broken · skipping version cleanup"
+            echo -e "  ${GRAY}${ICON_WARNING}${NC} ${label} old versions · skipped (Current symlink broken)"
+            note_activity
             continue
         fi
 
+        # Keep a version newer than Current: it is a freshly staged auto-update
+        # that Current will point at on next launch.
         local newest_version=""
         local newest_mtime=0
         local current_mtime
@@ -390,6 +458,8 @@ clean_chrome_old_versions() {
         done
         if [[ "$newest_mtime" -le "$current_mtime" ]]; then
             newest_version=""
+        elif [[ -n "$newest_version" ]]; then
+            debug_log "${label} old versions: keeping $newest_version (staged auto-update newer than Current=$current_version)"
         fi
 
         for dir in "$versions_dir"/*; do
@@ -405,6 +475,7 @@ clean_chrome_old_versions() {
         done
 
         if [[ ${#old_versions[@]} -eq 0 ]]; then
+            debug_log "${label} old versions: nothing to remove in $versions_dir (Current=$current_version)"
             continue
         fi
 
@@ -412,6 +483,9 @@ clean_chrome_old_versions() {
             local size_kb
             size_kb=$(get_path_size_kb "$dir" || echo 0)
             size_kb="${size_kb:-0}"
+            if [[ "$DRY_RUN" == "true" ]] && declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                record_dry_run_cleanup_target "$dir" "$size_kb" 1 true || continue
+            fi
             total_size=$((total_size + size_kb))
             cleaned_count=$((cleaned_count + 1))
             cleaned_any=true
@@ -429,11 +503,11 @@ clean_chrome_old_versions() {
         local size_human
         size_human=$(bytes_to_human "$((total_size * 1024))")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Chrome old versions${NC}, ${YELLOW}${cleaned_count} dirs, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} ${label} old versions${NC} · ${YELLOW}${cleaned_count} dirs, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$total_size")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Chrome old versions${NC}, ${line_color}${cleaned_count} dirs, $size_human${NC}"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} ${label} old versions${NC} · ${line_color}${cleaned_count} dirs, $size_human${NC}"
         fi
         files_cleaned=$((files_cleaned + cleaned_count))
         total_size_cleaned=$((total_size_cleaned + total_size))
@@ -442,9 +516,41 @@ clean_chrome_old_versions() {
     fi
 }
 
+# Chrome also runs under a helper process name, so the probe is wider than pgrep -x.
+is_google_chrome_running() {
+    pgrep -x "Google Chrome" > /dev/null 2>&1 && return 0
+    pgrep -x "Google Chrome Helper" > /dev/null 2>&1 && return 0
+    pgrep -f "/Google Chrome.app/" > /dev/null 2>&1 && return 0
+    return 1
+}
+
+# Exact process names only: "Microsoft Edge" must not match Microsoft Teams.
+is_microsoft_edge_running() {
+    pgrep -x "Microsoft Edge" > /dev/null 2>&1
+}
+
+is_brave_browser_running() {
+    pgrep -x "Brave Browser" > /dev/null 2>&1
+}
+
+# Remove old Google Chrome versions while keeping Current.
+clean_chrome_old_versions() {
+    local -a app_paths
+    if [[ -n "${MOLE_CHROME_APP_PATHS:-}" ]]; then
+        IFS=':' read -ra app_paths <<< "$MOLE_CHROME_APP_PATHS"
+    else
+        app_paths=(
+            "/Applications/Google Chrome.app"
+            "$HOME/Applications/Google Chrome.app"
+        )
+    fi
+
+    _clean_chromium_old_versions "Chrome" "Google Chrome Framework.framework" \
+        is_google_chrome_running "${app_paths[@]}"
+}
+
 # Remove old Microsoft Edge versions while keeping Current.
 clean_edge_old_versions() {
-    # Allow override for testing
     local -a app_paths
     if [[ -n "${MOLE_EDGE_APP_PATHS:-}" ]]; then
         IFS=':' read -ra app_paths <<< "$MOLE_EDGE_APP_PATHS"
@@ -455,86 +561,8 @@ clean_edge_old_versions() {
         )
     fi
 
-    # Match the exact Edge process name to avoid false positives (e.g., Microsoft Teams)
-    if pgrep -x "Microsoft Edge" > /dev/null 2>&1; then
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Microsoft Edge running · old versions cleanup skipped"
-        return 0
-    fi
-
-    local cleaned_count=0
-    local total_size=0
-    local cleaned_any=false
-
-    for app_path in "${app_paths[@]}"; do
-        [[ -d "$app_path" ]] || continue
-
-        local versions_dir="$app_path/Contents/Frameworks/Microsoft Edge Framework.framework/Versions"
-        [[ -d "$versions_dir" ]] || continue
-
-        local current_link="$versions_dir/Current"
-        [[ -L "$current_link" ]] || continue
-
-        local current_version
-        current_version=$(readlink "$current_link" 2> /dev/null || true)
-        current_version="${current_version##*/}"
-        [[ -n "$current_version" ]] || continue
-
-        # Verify the Current symlink target exists. If broken, skip to avoid
-        # accidentally deleting the active browser version.
-        if [[ ! -d "$versions_dir/$current_version" ]]; then
-            echo -e "  ${GRAY}${ICON_WARNING}${NC} Edge Current symlink is broken · skipping version cleanup"
-            continue
-        fi
-
-        local -a old_versions=()
-        local dir name
-        for dir in "$versions_dir"/*; do
-            [[ -d "$dir" ]] || continue
-            name=$(basename "$dir")
-            [[ "$name" == "Current" ]] && continue
-            [[ "$name" == "$current_version" ]] && continue
-            if is_path_whitelisted "$dir"; then
-                continue
-            fi
-            old_versions+=("$dir")
-        done
-
-        if [[ ${#old_versions[@]} -eq 0 ]]; then
-            continue
-        fi
-
-        for dir in "${old_versions[@]}"; do
-            local size_kb
-            size_kb=$(get_path_size_kb "$dir" || echo 0)
-            size_kb="${size_kb:-0}"
-            total_size=$((total_size + size_kb))
-            cleaned_count=$((cleaned_count + 1))
-            cleaned_any=true
-            if [[ "$DRY_RUN" != "true" ]]; then
-                if has_sudo_session; then
-                    safe_sudo_remove "$dir" > /dev/null 2>&1 || true
-                else
-                    safe_remove "$dir" true > /dev/null 2>&1 || true
-                fi
-            fi
-        done
-    done
-
-    if [[ "$cleaned_any" == "true" ]]; then
-        local size_human
-        size_human=$(bytes_to_human "$((total_size * 1024))")
-        if [[ "$DRY_RUN" == "true" ]]; then
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Edge old versions${NC}, ${YELLOW}${cleaned_count} dirs, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
-        else
-            local line_color
-            line_color=$(cleanup_result_color_kb "$total_size")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Edge old versions${NC}, ${line_color}${cleaned_count} dirs, $size_human${NC}"
-        fi
-        files_cleaned=$((files_cleaned + cleaned_count))
-        total_size_cleaned=$((total_size_cleaned + total_size))
-        total_items=$((total_items + 1))
-        note_activity
-    fi
+    _clean_chromium_old_versions "Edge" "Microsoft Edge Framework.framework" \
+        is_microsoft_edge_running "${app_paths[@]}"
 }
 
 # Remove old Microsoft EdgeUpdater versions while keeping latest.
@@ -543,7 +571,8 @@ clean_edge_updater_old_versions() {
     [[ -d "$updater_dir" ]] || return 0
 
     if pgrep -x "Microsoft Edge" > /dev/null 2>&1; then
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Microsoft Edge running · updater cleanup skipped"
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Edge updater old versions · skipped (Edge running)"
+        note_activity
         return 0
     fi
 
@@ -554,13 +583,32 @@ clean_edge_updater_old_versions() {
         version_dirs+=("$dir")
     done
 
-    if [[ ${#version_dirs[@]} -lt 2 ]]; then
+    if [[ ${#version_dirs[@]} -eq 0 ]]; then
         return 0
     fi
 
-    local latest_version
-    latest_version=$(printf '%s\n' "${version_dirs[@]##*/}" | sort -V | tail -n 1)
-    [[ -n "$latest_version" ]] || return 0
+    # A staged payload is only worth keeping while it is at least as new as
+    # the installed Edge. After Edge updates itself the updater leaves the
+    # previously staged copy behind, and a bare keep-the-newest rule keeps
+    # that stale copy forever when it is the only directory (#1216). With a
+    # known installed version, anything strictly older is removable; without
+    # one, fall back to the original conservative keep-latest rule.
+    local installed_version="" edge_app
+    for edge_app in "/Applications/Microsoft Edge.app" "$HOME/Applications/Microsoft Edge.app"; do
+        if [[ -f "$edge_app/Contents/Info.plist" ]]; then
+            installed_version=$(plutil -extract CFBundleShortVersionString raw "$edge_app/Contents/Info.plist" 2> /dev/null || echo "")
+            [[ -n "$installed_version" ]] && break
+        fi
+    done
+
+    local latest_version=""
+    if [[ -z "$installed_version" ]]; then
+        if [[ ${#version_dirs[@]} -lt 2 ]]; then
+            return 0
+        fi
+        latest_version=$(printf '%s\n' "${version_dirs[@]##*/}" | sort -V | tail -n 1)
+        [[ -n "$latest_version" ]] || return 0
+    fi
 
     local cleaned_count=0
     local total_size=0
@@ -569,13 +617,25 @@ clean_edge_updater_old_versions() {
     for dir in "${version_dirs[@]}"; do
         local name
         name=$(basename "$dir")
-        [[ "$name" == "$latest_version" ]] && continue
+        if [[ -n "$installed_version" ]]; then
+            # Keep any payload not strictly older than the installed Edge:
+            # an equal or newer copy is a pending update, not a leftover.
+            if [[ "$name" == "$installed_version" ]] ||
+                [[ "$(printf '%s\n%s\n' "$name" "$installed_version" | sort -V | head -n 1)" != "$name" ]]; then
+                continue
+            fi
+        else
+            [[ "$name" == "$latest_version" ]] && continue
+        fi
         if is_path_whitelisted "$dir"; then
             continue
         fi
         local size_kb
         size_kb=$(get_path_size_kb "$dir" || echo 0)
         size_kb="${size_kb:-0}"
+        if [[ "$DRY_RUN" == "true" ]] && declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+            record_dry_run_cleanup_target "$dir" "$size_kb" 1 true || continue
+        fi
         total_size=$((total_size + size_kb))
         cleaned_count=$((cleaned_count + 1))
         cleaned_any=true
@@ -588,11 +648,11 @@ clean_edge_updater_old_versions() {
         local size_human
         size_human=$(bytes_to_human "$((total_size * 1024))")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Edge updater old versions${NC}, ${YELLOW}${cleaned_count} dirs, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Edge updater old versions${NC} · ${YELLOW}${cleaned_count} dirs, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$total_size")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Edge updater old versions${NC}, ${line_color}${cleaned_count} dirs, $size_human${NC}"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Edge updater old versions${NC} · ${line_color}${cleaned_count} dirs, $size_human${NC}"
         fi
         files_cleaned=$((files_cleaned + cleaned_count))
         total_size_cleaned=$((total_size_cleaned + total_size))
@@ -613,134 +673,8 @@ clean_brave_old_versions() {
         )
     fi
 
-    # Match the exact Brave process name to avoid false positives
-    if pgrep -x "Brave Browser" > /dev/null 2>&1; then
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Brave Browser running · old versions cleanup skipped"
-        return 0
-    fi
-
-    local cleaned_count=0
-    local total_size=0
-    local cleaned_any=false
-
-    for app_path in "${app_paths[@]}"; do
-        [[ -d "$app_path" ]] || continue
-
-        local versions_dir="$app_path/Contents/Frameworks/Brave Browser Framework.framework/Versions"
-        [[ -d "$versions_dir" ]] || continue
-
-        local current_link="$versions_dir/Current"
-        [[ -L "$current_link" ]] || continue
-
-        local current_version
-        current_version=$(readlink "$current_link" 2> /dev/null || true)
-        current_version="${current_version##*/}"
-        [[ -n "$current_version" ]] || continue
-
-        if [[ ! -d "$versions_dir/$current_version" ]]; then
-            echo -e "  ${GRAY}${ICON_WARNING}${NC} Brave Browser Current symlink is broken · skipping version cleanup"
-            continue
-        fi
-
-        local -a old_versions=()
-        local dir name
-        for dir in "$versions_dir"/*; do
-            [[ -d "$dir" ]] || continue
-            name=$(basename "$dir")
-            [[ "$name" == "Current" ]] && continue
-            [[ "$name" == "$current_version" ]] && continue
-            if is_path_whitelisted "$dir"; then
-                continue
-            fi
-            old_versions+=("$dir")
-        done
-
-        if [[ ${#old_versions[@]} -eq 0 ]]; then
-            continue
-        fi
-
-        for dir in "${old_versions[@]}"; do
-            local size_kb
-            size_kb=$(get_path_size_kb "$dir" || echo 0)
-            size_kb="${size_kb:-0}"
-            total_size=$((total_size + size_kb))
-            cleaned_count=$((cleaned_count + 1))
-            cleaned_any=true
-            if [[ "$DRY_RUN" != "true" ]]; then
-                if has_sudo_session; then
-                    safe_sudo_remove "$dir" > /dev/null 2>&1 || true
-                else
-                    safe_remove "$dir" true > /dev/null 2>&1 || true
-                fi
-            fi
-        done
-    done
-
-    if [[ "$cleaned_any" == "true" ]]; then
-        local size_human
-        size_human=$(bytes_to_human "$((total_size * 1024))")
-        if [[ "$DRY_RUN" == "true" ]]; then
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Brave old versions${NC}, ${YELLOW}${cleaned_count} dirs, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
-        else
-            local line_color
-            line_color=$(cleanup_result_color_kb "$total_size")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Brave old versions${NC}, ${line_color}${cleaned_count} dirs, $size_human${NC}"
-        fi
-        files_cleaned=$((files_cleaned + cleaned_count))
-        total_size_cleaned=$((total_size_cleaned + total_size))
-        total_items=$((total_items + 1))
-        note_activity
-    fi
-}
-
-scan_external_volumes() {
-    [[ -d "/Volumes" ]] || return 0
-    local -a candidate_volumes=()
-    local -a network_volumes=()
-    for volume in /Volumes/*; do
-        [[ -d "$volume" && -w "$volume" && ! -L "$volume" ]] || continue
-        [[ "$volume" == "/" || "$volume" == "/Volumes/Macintosh HD" ]] && continue
-        local protocol=""
-        protocol=$(run_with_timeout 1 command diskutil info "$volume" 2> /dev/null | grep -i "Protocol:" | awk '{print $2}' || echo "") # 1s: volume protocol probe, see lib/core/timeouts.sh
-        case "$protocol" in
-            SMB | NFS | AFP | CIFS | WebDAV)
-                network_volumes+=("$volume")
-                continue
-                ;;
-        esac
-        local fs_type=""
-        fs_type=$(run_with_timeout 1 command df -T "$volume" 2> /dev/null | tail -1 | awk '{print $2}' || echo "") # 1s: volume FS-type probe, see lib/core/timeouts.sh
-        case "$fs_type" in
-            nfs | smbfs | afpfs | cifs | webdav)
-                network_volumes+=("$volume")
-                continue
-                ;;
-        esac
-        candidate_volumes+=("$volume")
-    done
-    local volume_count=${#candidate_volumes[@]}
-    local network_count=${#network_volumes[@]}
-    if [[ $volume_count -eq 0 ]]; then
-        if [[ $network_count -gt 0 ]]; then
-            echo -e "  ${GRAY}${ICON_LIST}${NC} External volumes, ${network_count} network volumes skipped"
-            note_activity
-        fi
-        return 0
-    fi
-    start_section_spinner "Scanning $volume_count external volumes..."
-    for volume in "${candidate_volumes[@]}"; do
-        [[ -d "$volume" && -r "$volume" ]] || continue
-        local volume_trash="$volume/.Trashes"
-        if [[ -d "$volume_trash" && "$DRY_RUN" != "true" ]] && ! is_path_whitelisted "$volume_trash"; then
-            while IFS= read -r -d '' item; do
-                safe_remove "$item" true || true
-            done < <(command find "$volume_trash" -mindepth 1 -maxdepth 1 -print0 2> /dev/null || true)
-        fi
-        if [[ "$PROTECT_FINDER_METADATA" != "true" ]]; then
-            clean_ds_store_tree "$volume" "$(basename "$volume") volume, .DS_Store"
-        fi
-    done
-    stop_section_spinner
+    _clean_chromium_old_versions "Brave" "Brave Browser Framework.framework" \
+        is_brave_browser_running "${app_paths[@]}"
 }
 
 # Finder metadata (.DS_Store).
@@ -771,7 +705,7 @@ clean_support_app_data() {
     local sys_idle_assets_dir="/Library/Application Support/com.apple.idleassetsd/Customer"
     # Skip sudo operations during tests to avoid password prompts
     if [[ "${MOLE_TEST_MODE:-0}" != "1" && "${MOLE_TEST_NO_AUTH:-0}" != "1" ]]; then
-        if sudo test -d "$sys_idle_assets_dir" 2> /dev/null; then
+        if sudo -n test -d "$sys_idle_assets_dir" 2> /dev/null; then
             safe_sudo_find_delete "$sys_idle_assets_dir" "*" "$support_age_days" "f" || true
         fi
     fi
@@ -869,7 +803,11 @@ clean_app_caches() {
     safe_clean ~/Library/Containers/com.apple.wallpaper.extension.aerials/Data/tmp/* "Wallpaper aerials temp files"
     safe_clean ~/Library/Containers/com.apple.geod/Data/tmp/* "Geod temp files"
     safe_clean ~/Library/Containers/com.apple.stocks/Data/Library/Caches/* "Stocks cache"
-    safe_clean ~/Library/Application\ Support/com.apple.wallpaper/aerials/thumbnails/* "Wallpaper aerials thumbnails"
+    # Do NOT clean ~/Library/Application Support/com.apple.wallpaper/aerials/
+    # thumbnails: those ~50KB PNGs are the wallpaper "cover" previews shown in
+    # System Settings > Wallpaper. Deleting them reclaims almost nothing yet
+    # blanks every cover into a cloud-download placeholder and forces a
+    # re-download on the next open (issue #1118).
     safe_clean ~/Library/Caches/com.apple.helpd/* "macOS Help system cache"
     safe_clean ~/Library/Caches/GeoServices/* "Maps geo tile cache"
     safe_clean ~/Library/Containers/com.apple.AvatarUI.AvatarPickerMemojiPicker/Data/Library/Caches/* "Memoji picker cache"
@@ -881,7 +819,9 @@ clean_app_caches() {
     safe_clean ~/Library/Caches/com.apple.duetexpertd/* "Duet Expert cache"
     safe_clean ~/Library/Caches/com.apple.parsecd/* "Parsecd cache"
     safe_clean ~/Library/Caches/com.apple.python/* "Apple Python cache"
-    safe_clean ~/Library/Caches/com.apple.e5rt.e5bundlecache/* "Apple Intelligence runtime cache"
+    # The E5RT bundle cache used to be cleaned here. It is now protected by
+    # holds_compiled_model_cache(): wiping it under a running daemon breaks
+    # recognition until that daemon restarts, for a few MB.
     local containers_dir="$HOME/Library/Containers"
     [[ ! -d "$containers_dir" ]] && return 0
     start_section_spinner "Scanning sandboxed apps..."
@@ -907,21 +847,21 @@ clean_app_caches() {
     if [[ "$found_any" == "true" ]]; then
         if [[ "$DRY_RUN" == "true" ]]; then
             if [[ "$total_size_partial" == "true" ]]; then
-                echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Sandboxed app caches${NC}, ${YELLOW}dry${NC}"
+                echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Sandboxed app caches${NC} · ${YELLOW}dry${NC}"
             else
                 local size_human
                 size_human=$(bytes_to_human "$((total_size * 1024))")
-                echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Sandboxed app caches${NC}, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+                echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Sandboxed app caches${NC} · $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
             fi
         else
             if [[ "$total_size_partial" == "true" ]]; then
-                echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Sandboxed app caches${NC}, ${GREEN}cleaned${NC}"
+                echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Sandboxed app caches${NC} · ${GREEN}cleaned${NC}"
             else
                 local size_human
                 size_human=$(bytes_to_human "$((total_size * 1024))")
                 local line_color
                 line_color=$(cleanup_result_color_kb "$total_size")
-                echo -e "  ${line_color}${ICON_SUCCESS}${NC} Sandboxed app caches${NC}, ${line_color}$size_human${NC}"
+                echo -e "  ${line_color}${ICON_SUCCESS}${NC} Sandboxed app caches${NC} · ${line_color}$size_human${NC}"
             fi
         fi
         files_cleaned=$((files_cleaned + cleaned_count))
@@ -931,6 +871,63 @@ clean_app_caches() {
     fi
 
     clean_group_container_caches
+    clean_handoff_pasteboard_cache
+}
+
+# Handoff / Universal Clipboard staging cache. useractivityd is supposed to
+# prune shared-pasteboard items itself but can leave hundreds of GB behind
+# after heavy Command+C use (#1178). Items are ephemeral transfer buffers by
+# design; anything modified within the last hour is kept so an in-flight
+# clipboard sync between devices is never cut off.
+clean_handoff_pasteboard_cache() {
+    local pasteboard_dir="$HOME/Library/Group Containers/group.com.apple.coreservices.useractivityd/shared-pasteboard"
+    [[ -d "$pasteboard_dir" ]] || return 0
+    [[ -L "$pasteboard_dir" ]] && return 0
+    if is_path_whitelisted "$pasteboard_dir" 2> /dev/null; then
+        return 0
+    fi
+
+    local cleaned_count=0
+    local total_kb=0
+    local item
+    while IFS= read -r -d '' item; do
+        [[ -e "$item" ]] || continue
+        [[ -L "$item" ]] && continue
+        if should_protect_path "$item" 2> /dev/null || is_path_whitelisted "$item" 2> /dev/null; then
+            continue
+        fi
+        local item_kb
+        item_kb=$(get_path_size_kb "$item" 2> /dev/null || echo 0)
+        [[ "$item_kb" =~ ^[0-9]+$ ]] || item_kb=0
+        if [[ "$DRY_RUN" == "true" ]]; then
+            if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                record_dry_run_cleanup_target "$item" "$item_kb" 1 true || continue
+            fi
+            cleaned_count=$((cleaned_count + 1))
+            total_kb=$((total_kb + item_kb))
+            continue
+        fi
+        if safe_remove "$item" true 2> /dev/null; then
+            cleaned_count=$((cleaned_count + 1))
+            total_kb=$((total_kb + item_kb))
+        fi
+    done < <(command find "$pasteboard_dir" -mindepth 1 -maxdepth 1 -mmin +60 -print0 2> /dev/null || true)
+
+    [[ $cleaned_count -gt 0 ]] || return 0
+
+    local size_human
+    size_human=$(bytes_to_human "$((total_kb * 1024))")
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Handoff clipboard cache${NC} · $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+    else
+        local line_color
+        line_color=$(cleanup_result_color_kb "$total_kb")
+        echo -e "  ${line_color}${ICON_SUCCESS}${NC} Handoff clipboard cache${NC} · ${line_color}$size_human${NC}"
+    fi
+    files_cleaned=$((files_cleaned + cleaned_count))
+    total_size_cleaned=$((total_size_cleaned + total_kb))
+    total_items=$((total_items + 1))
+    note_activity
 }
 
 # Process a single container cache directory.
@@ -953,6 +950,52 @@ process_container_cache() {
     [[ "$item_count" =~ ^[0-9]+$ ]] || item_count=0
     [[ "$item_count" -eq 0 ]] && return 0
 
+    if [[ "$DRY_RUN" == "true" ]]; then
+        local _nullglob_state
+        local _dotglob_state
+        _nullglob_state=$(shopt -p nullglob || true)
+        _dotglob_state=$(shopt -p dotglob || true)
+        shopt -s nullglob dotglob
+
+        local item
+        for item in "$cache_dir"/*; do
+            [[ -e "$item" ]] || continue
+            [[ -L "$item" ]] && continue
+            if holds_compiled_model_cache "$item"; then
+                continue
+            fi
+            if should_protect_path "$item" 2> /dev/null || is_path_whitelisted "$item" 2> /dev/null; then
+                continue
+            fi
+            if declare -f register_dry_run_cleanup_target > /dev/null 2>&1; then
+                register_dry_run_cleanup_target "$item" || continue
+            fi
+
+            local item_size_kb=0
+            local size_known=false
+            if [[ "$precise_size_used" -lt "$precise_size_limit" ]]; then
+                item_size_kb=$(get_path_size_kb "$item" 2> /dev/null || echo "0")
+                [[ "$item_size_kb" =~ ^[0-9]+$ ]] || item_size_kb=0
+                precise_size_used=$((precise_size_used + 1))
+                size_known=true
+            else
+                total_size_partial=true
+            fi
+
+            if declare -f append_dry_run_cleanup_target > /dev/null 2>&1; then
+                append_dry_run_cleanup_target "$item" "$item_size_kb" 1 "$size_known"
+            fi
+            total_size=$((total_size + item_size_kb))
+            cleaned_count=$((cleaned_count + 1))
+            found_any=true
+        done
+
+        # eval: restore shopt state captured by $(shopt -p)
+        eval "$_nullglob_state"
+        eval "$_dotglob_state"
+        return 0
+    fi
+
     if [[ "$item_count" -le 100 && "$precise_size_used" -lt "$precise_size_limit" ]]; then
         local size
         size=$(get_path_size_kb "$cache_dir" 2> /dev/null || echo "0")
@@ -965,21 +1008,29 @@ process_container_cache() {
 
     found_any=true
     cleaned_count=$((cleaned_count + 1))
-    if [[ "$DRY_RUN" != "true" ]]; then
-        local _nullglob_state
-        local _dotglob_state
-        _nullglob_state=$(shopt -p nullglob || true)
-        _dotglob_state=$(shopt -p dotglob || true)
-        shopt -s nullglob dotglob
-        local item
-        for item in "$cache_dir"/*; do
-            [[ -e "$item" ]] || continue
-            safe_remove "$item" true || true
-        done
-        # eval: restore shopt state captured by $(shopt -p)
-        eval "$_nullglob_state"
-        eval "$_dotglob_state"
-    fi
+    local _nullglob_state
+    local _dotglob_state
+    _nullglob_state=$(shopt -p nullglob || true)
+    _dotglob_state=$(shopt -p dotglob || true)
+    shopt -s nullglob dotglob
+    local item
+    for item in "$cache_dir"/*; do
+        [[ -e "$item" ]] || continue
+        [[ -L "$item" ]] && continue
+        if holds_compiled_model_cache "$item"; then
+            continue
+        fi
+        # Re-check each item, not just the parent bundle: a user may have
+        # whitelisted a specific cache path, and should_protect_path may
+        # cover a nested entry. Mirrors clean_group_container_caches.
+        if should_protect_path "$item" 2> /dev/null || is_path_whitelisted "$item" 2> /dev/null; then
+            continue
+        fi
+        safe_remove "$item" true || true
+    done
+    # eval: restore shopt state captured by $(shopt -p)
+    eval "$_nullglob_state"
+    eval "$_dotglob_state"
 }
 
 # Group Containers safe cleanup (logs for protected apps, caches/tmp for non-protected apps).
@@ -1082,6 +1133,9 @@ clean_group_container_caches() {
                     if should_protect_path "$item" 2> /dev/null || is_path_whitelisted "$item" 2> /dev/null; then
                         continue
                     fi
+                    if [[ "$DRY_RUN" == "true" ]] && declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                        record_dry_run_cleanup_target "$item" 0 1 false || continue
+                    fi
                     candidate_changed=true
                     if [[ "$DRY_RUN" != "true" ]]; then
                         safe_remove "$item" true 2> /dev/null || true
@@ -1098,6 +1152,9 @@ clean_group_container_caches() {
                     item_size=$(get_path_size_kb "$item" 2> /dev/null) || item_size=0
                     [[ "$item_size" =~ ^[0-9]+$ ]] || item_size=0
                     if [[ "$DRY_RUN" == "true" ]]; then
+                        if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                            record_dry_run_cleanup_target "$item" "$item_size" 1 true || continue
+                        fi
                         candidate_changed=true
                         candidate_size_kb=$((candidate_size_kb + item_size))
                         continue
@@ -1127,21 +1184,21 @@ clean_group_container_caches() {
     if [[ "$found_any" == "true" ]]; then
         if [[ "$DRY_RUN" == "true" ]]; then
             if [[ "$total_size_partial" == "true" ]]; then
-                echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Group Containers logs/caches${NC}, ${YELLOW}dry${NC}"
+                echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Group Containers logs/caches${NC} · ${YELLOW}dry${NC}"
             else
                 local size_human
                 size_human=$(bytes_to_human "$((total_size * 1024))")
-                echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Group Containers logs/caches${NC}, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+                echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Group Containers logs/caches${NC} · $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
             fi
         else
             if [[ "$total_size_partial" == "true" ]]; then
-                echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Group Containers logs/caches${NC}, ${GREEN}cleaned${NC}"
+                echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Group Containers logs/caches${NC} · ${GREEN}cleaned${NC}"
             else
                 local size_human
                 size_human=$(bytes_to_human "$((total_size * 1024))")
                 local line_color
                 line_color=$(cleanup_result_color_kb "$total_size")
-                echo -e "  ${line_color}${ICON_SUCCESS}${NC} Group Containers logs/caches${NC}, ${line_color}$size_human${NC}"
+                echo -e "  ${line_color}${ICON_SUCCESS}${NC} Group Containers logs/caches${NC} · ${line_color}$size_human${NC}"
             fi
         fi
         files_cleaned=$((files_cleaned + cleaned_count))
@@ -1263,6 +1320,9 @@ clean_external_volume_target() {
         [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
 
         if [[ "$DRY_RUN" == "true" ]]; then
+            if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                record_dry_run_cleanup_target "$target_path" "$size_kb" 1 true || continue
+            fi
             found_any=true
             cleaned_count=$((cleaned_count + 1))
             total_size=$((total_size + size_kb))
@@ -1290,6 +1350,9 @@ clean_external_volume_target() {
         [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
 
         if [[ "$DRY_RUN" == "true" ]]; then
+            if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                record_dry_run_cleanup_target "$metadata_file" "$size_kb" 1 true || continue
+            fi
             found_any=true
             cleaned_count=$((cleaned_count + 1))
             total_size=$((total_size + size_kb))
@@ -1306,11 +1369,11 @@ clean_external_volume_target() {
         local size_human
         size_human=$(bytes_to_human "$((total_size * 1024))")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} External volume cleanup${NC}, ${YELLOW}${volume_name}, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} External volume cleanup${NC} · ${YELLOW}${volume_name}, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$total_size")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} External volume cleanup${NC}, ${line_color}${volume_name}, $size_human${NC}"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} External volume cleanup${NC} · ${line_color}${volume_name}, $size_human${NC}"
         fi
         files_cleaned=$((files_cleaned + cleaned_count))
         total_size_cleaned=$((total_size_cleaned + total_size))
@@ -1326,9 +1389,10 @@ clean_browsers() {
     safe_clean ~/Library/Caches/com.apple.Safari/* "Safari cache"
     # Chrome/Chromium.
     safe_clean ~/Library/Caches/Google/Chrome/* "Chrome cache"
-    # Skip ScriptCache wipe while the browser is running: removing V8 bytecode
-    # under a live Chromium process breaks loaded MV3 extension service workers
-    # until the user toggles them in chrome://extensions. See #785.
+    # Do not clean Chromium Service Worker ScriptCache. Even when the browser is
+    # closed, removing MV3 extension bytecode can break extension service
+    # workers and trigger security warnings during dry-run scans. See #785,
+    # #964, and #968.
     local _chrome_running=false
     pgrep -x "Google Chrome" > /dev/null 2>&1 && _chrome_running=true
     if [[ "$_chrome_running" != "true" ]]; then
@@ -1343,15 +1407,18 @@ clean_browsers() {
         safe_clean ~/Library/Application\ Support/Google/Chrome/GrShaderCache/* "Chrome GR shader cache"
         safe_clean ~/Library/Application\ Support/Google/Chrome/GraphiteDawnCache/* "Chrome Dawn cache"
         safe_clean ~/Library/Application\ Support/Google/Chrome/Crashpad/completed/* "Chrome crash reports"
+        # On-device AI model stores managed by Chrome's component updater;
+        # re-downloaded on demand and often multiple GB (#1179).
+        safe_clean ~/Library/Application\ Support/Google/Chrome/OptGuideOnDeviceModel/* "Chrome on-device model cache"
+        safe_clean ~/Library/Application\ Support/Google/Chrome/OptGuideOnDeviceClassifierModel/* "Chrome on-device classifier cache"
+        safe_clean ~/Library/Application\ Support/Google/Chrome/optimization_guide_model_store/* "Chrome optimization guide models"
     else
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Chrome is running · Application Support cache cleanup skipped"
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Chrome Application Support cache · skipped (Chrome running)"
+        note_activity
     fi
     local _chrome_profile
     for _chrome_profile in "$HOME/Library/Application Support/Google/Chrome"/*/; do
-        clean_service_worker_cache "Chrome" "$_chrome_profile/Service Worker/CacheStorage"
-        if [[ "$_chrome_running" != "true" ]]; then
-            safe_clean "$_chrome_profile"/Service\ Worker/ScriptCache/* "Chrome Service Worker ScriptCache"
-        fi
+        clean_service_worker_cache "Chrome" "${_chrome_profile%/}/Service Worker/CacheStorage"
     done
     safe_clean ~/Library/Application\ Support/Google/GoogleUpdater/crx_cache/* "GoogleUpdater CRX cache"
     safe_clean ~/Library/Application\ Support/Google/GoogleUpdater/*.old "GoogleUpdater old files"
@@ -1387,20 +1454,50 @@ clean_browsers() {
             safe_clean ~/Library/Application\ Support/Arc/User\ Data/Crashpad/completed/* "Arc crash reports"
         fi
         for _arc_profile in "$HOME/Library/Application Support/Arc"/*/; do
-            clean_service_worker_cache "Arc" "$_arc_profile/Service Worker/CacheStorage"
-            if [[ "$_arc_running" != "true" ]]; then
-                safe_clean "$_arc_profile"/Service\ Worker/ScriptCache/* "Arc Service Worker ScriptCache"
-            fi
+            clean_service_worker_cache "Arc" "${_arc_profile%/}/Service Worker/CacheStorage"
         done
         for _arc_profile in "$HOME/Library/Application Support/Arc/User Data"/*/; do
             [[ -d "$_arc_profile" ]] || continue
-            clean_service_worker_cache "Arc" "$_arc_profile/Service Worker/CacheStorage"
-            if [[ "$_arc_running" != "true" ]]; then
-                safe_clean "$_arc_profile"/Service\ Worker/ScriptCache/* "Arc Service Worker ScriptCache"
-            fi
+            clean_service_worker_cache "Arc" "${_arc_profile%/}/Service Worker/CacheStorage"
         done
     fi
+    # Dia Browser. company.thebrowser.dia only holds Sentry crash state; the real
+    # caches are the Chromium ones under ~/Library/Caches/Dia/User Data (HTTP and
+    # code cache) and ~/Library/Application Support/Dia/User Data (GPU and CRX
+    # caches). Dia has no ShaderCache / GrShaderCache / DawnCache / Crashpad tree
+    # like Arc, so those rows are intentionally absent.
     safe_clean ~/Library/Caches/company.thebrowser.dia/* "Dia cache"
+    if [[ -d ~/Library/Application\ Support/Dia ]]; then
+        local _dia_profile
+        local _dia_process_state=2
+        if command -v pgrep > /dev/null 2>&1; then
+            if pgrep -x "Dia" > /dev/null 2>&1; then
+                _dia_process_state=0
+            else
+                _dia_process_state=$?
+            fi
+        fi
+        if [[ $_dia_process_state -eq 1 ]]; then
+            safe_clean ~/Library/Caches/Dia/User\ Data/*/Cache/* "Dia HTTP cache"
+            safe_clean ~/Library/Caches/Dia/User\ Data/*/Code\ Cache/* "Dia code cache"
+            safe_clean ~/Library/Application\ Support/Dia/User\ Data/GraphiteDawnCache/* "Dia Graphite Dawn cache"
+            safe_clean ~/Library/Application\ Support/Dia/User\ Data/GPUPersistentCache/* "Dia GPU cache"
+            safe_clean ~/Library/Application\ Support/Dia/User\ Data/component_crx_cache/* "Dia component CRX cache"
+            safe_clean ~/Library/Application\ Support/Dia/User\ Data/extensions_crx_cache/* "Dia extensions CRX cache"
+            safe_clean ~/Library/Application\ Support/Dia/User\ Data/*/DawnGraphiteCache/* "Dia Dawn Graphite cache"
+            safe_clean ~/Library/Application\ Support/Dia/User\ Data/*/DawnWebGPUCache/* "Dia Dawn WebGPU cache"
+            safe_clean ~/Library/Application\ Support/Dia/User\ Data/*/GPUCache/* "Dia GPU cache"
+        else
+            local _dia_skip_reason="Dia running"
+            [[ $_dia_process_state -gt 1 ]] && _dia_skip_reason="process state unknown"
+            echo -e "  ${GRAY}${ICON_WARNING}${NC} Dia Application Support cache · skipped ($_dia_skip_reason)"
+            note_activity
+        fi
+        for _dia_profile in "$HOME/Library/Application Support/Dia/User Data"/*/; do
+            [[ -d "$_dia_profile" ]] || continue
+            clean_service_worker_cache "Dia" "${_dia_profile%/}/Service Worker/CacheStorage"
+        done
+    fi
     if [[ -d ~/Library/Application\ Support/BraveSoftware ]]; then
         safe_clean ~/Library/Caches/BraveSoftware/Brave-Browser/* "Brave cache"
         local _brave_profile
@@ -1420,10 +1517,7 @@ clean_browsers() {
             safe_clean ~/Library/Application\ Support/BraveSoftware/Brave-Browser/Crashpad/completed/* "Brave crash reports"
         fi
         for _brave_profile in "$HOME/Library/Application Support/BraveSoftware/Brave-Browser"/*/; do
-            clean_service_worker_cache "Brave" "$_brave_profile/Service Worker/CacheStorage"
-            if [[ "$_brave_running" != "true" ]]; then
-                safe_clean "$_brave_profile"/Service\ Worker/ScriptCache/* "Brave Service Worker ScriptCache"
-            fi
+            clean_service_worker_cache "Brave" "${_brave_profile%/}/Service Worker/CacheStorage"
         done
     fi
     # Helium Browser.
@@ -1450,7 +1544,8 @@ clean_browsers() {
         firefox_running=true
     fi
     if [[ "$firefox_running" == "true" ]]; then
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Firefox is running · cache cleanup skipped"
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Firefox cache · skipped (Firefox running)"
+        note_activity
     else
         safe_clean ~/Library/Caches/Firefox/* "Firefox cache"
     fi
@@ -1473,17 +1568,15 @@ clean_browsers() {
             safe_clean ~/Library/Application\ Support/Vivaldi/Crashpad/completed/* "Vivaldi crash reports"
         fi
         for _vivaldi_profile in "$HOME/Library/Application Support/Vivaldi"/*/; do
-            clean_service_worker_cache "Vivaldi" "$_vivaldi_profile/Service Worker/CacheStorage"
-            if [[ "$_vivaldi_running" != "true" ]]; then
-                safe_clean "$_vivaldi_profile"/Service\ Worker/ScriptCache/* "Vivaldi Service Worker ScriptCache"
-            fi
+            clean_service_worker_cache "Vivaldi" "${_vivaldi_profile%/}/Service Worker/CacheStorage"
         done
     fi
     safe_clean ~/Library/Caches/Comet/* "Comet cache"
     safe_clean ~/Library/Caches/com.kagi.kagimacOS/* "Orion cache"
     safe_clean ~/Library/Caches/zen/* "Zen cache"
     if [[ "$firefox_running" == "true" ]]; then
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Firefox is running · profile cache cleanup skipped"
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Firefox profile cache · skipped (Firefox running)"
+        note_activity
     else
         safe_clean ~/Library/Application\ Support/Firefox/Profiles/*/cache2/* "Firefox profile cache"
     fi
@@ -1514,13 +1607,15 @@ clean_cloud_storage() {
         echo "[DEBUG] Cleaning cloud storage caches..." >&2
     fi
     if pgrep -x "Dropbox" > /dev/null 2>&1; then
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Dropbox is running · cache cleanup skipped"
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Dropbox cache · skipped (Dropbox running)"
+        note_activity
     else
         safe_clean ~/Library/Caches/com.dropbox.* "Dropbox cache"
         safe_clean ~/Library/Caches/com.getdropbox.dropbox "Dropbox cache"
     fi
     if pgrep -x "Google Drive" > /dev/null 2>&1; then
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Google Drive is running · cache cleanup skipped"
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Google Drive cache · skipped (Google Drive running)"
+        note_activity
     else
         safe_clean ~/Library/Caches/com.google.GoogleDrive "Google Drive cache"
     fi
@@ -1528,7 +1623,8 @@ clean_cloud_storage() {
     safe_clean ~/Library/Caches/com.alibaba.teambitiondisk "Alibaba Cloud cache"
     safe_clean ~/Library/Caches/com.box.desktop "Box cache"
     if pgrep -x "OneDrive" > /dev/null 2>&1; then
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} OneDrive is running · cache cleanup skipped"
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} OneDrive cache · skipped (OneDrive running)"
+        note_activity
     else
         safe_clean ~/Library/Caches/com.microsoft.OneDrive "OneDrive cache"
     fi
@@ -1573,6 +1669,69 @@ clean_utm_caches() {
     safe_clean ~/Library/Containers/com.utmapp.UTM/Data/tmp/* "UTM temporary files"
 }
 
+clean_tart_caches() {
+    local cache_root="$HOME/.tart/cache"
+    [[ -d "$cache_root" ]] || return 0
+    command -v tart > /dev/null 2>&1 || return 0
+
+    local cache_size_kb=0
+    cache_size_kb=$(get_path_size_kb "$cache_root" 2> /dev/null || echo 0)
+    [[ "$cache_size_kb" =~ ^[0-9]+$ ]] || cache_size_kb=0
+    [[ "$cache_size_kb" -gt 0 ]] || return 0
+
+    if is_path_whitelisted "$cache_root"; then
+        if [[ "${DRY_RUN:-false}" == "true" ]]; then
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Tart caches · would skip (whitelist)"
+        else
+            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Tart caches · skipped (whitelist)"
+        fi
+        note_activity
+        return 0
+    fi
+
+    if pgrep -x "tart" > /dev/null 2>&1; then
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Tart caches · skipped (Tart running)"
+        note_activity
+        return 0
+    fi
+
+    local cache_size_human
+    cache_size_human=$(bytes_to_human "$((cache_size_kb * 1024))")
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Tart caches · would prune items older than ${MOLE_ORPHAN_AGE_DAYS} days (${cache_size_human})"
+        echo -e "    ${GRAY}tart prune --entries caches --older-than ${MOLE_ORPHAN_AGE_DAYS}${NC}"
+        note_activity
+        return 0
+    fi
+
+    if [[ -t 1 ]]; then
+        start_section_spinner "Pruning Tart caches..."
+    fi
+    local prune_succeeded=false
+    if run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" tart prune --entries caches --older-than "$MOLE_ORPHAN_AGE_DAYS" > /dev/null 2>&1; then
+        prune_succeeded=true
+    fi
+    if [[ -t 1 ]]; then
+        stop_section_spinner
+    fi
+
+    if [[ "$prune_succeeded" != "true" ]]; then
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Tart caches · prune failed"
+        debug_log "tart prune failed for cache-only ${MOLE_ORPHAN_AGE_DAYS}-day policy"
+        note_activity
+        return 0
+    fi
+
+    local remaining_kb=0
+    remaining_kb=$(get_path_size_kb "$cache_root" 2> /dev/null || echo 0)
+    [[ "$remaining_kb" =~ ^[0-9]+$ ]] || remaining_kb=0
+    local reclaimed_kb=$((cache_size_kb - remaining_kb))
+    [[ "$reclaimed_kb" -ge 0 ]] || reclaimed_kb=0
+
+    echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Tart caches · pruned, $(bytes_to_human "$((reclaimed_kb * 1024))") reclaimed"
+    note_activity
+}
+
 clean_virtualization_tools() {
     stop_section_spinner
     safe_clean ~/Library/Caches/com.vmware.fusion "VMware Fusion cache"
@@ -1581,6 +1740,7 @@ clean_virtualization_tools() {
     safe_clean ~/VirtualBox\ VMs/.cache "VirtualBox cache"
     safe_clean ~/Library/Caches/lima/download/by-url-sha256/* "Lima download cache"
     safe_clean ~/.vagrant.d/tmp/* "Vagrant temporary files"
+    clean_tart_caches
 }
 
 # Estimate item size for Application Support cleanup.
@@ -1753,7 +1913,11 @@ clean_application_support_logs() {
                     fi
                     stop_section_spinner
                     start_section_spinner "Scanning Application Support... $app_count/$total_apps [$app_label, bulk clean]"
-                    if [[ "$DRY_RUN" != "true" ]]; then
+                    if [[ "$DRY_RUN" == "true" ]]; then
+                        if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                            record_dry_run_cleanup_target "$candidate" 0 1 false || continue
+                        fi
+                    else
                         # Remove entire candidate directory in one go
                         safe_remove "$candidate" true > /dev/null 2>&1 || true
                     fi
@@ -1772,13 +1936,14 @@ clean_application_support_logs() {
                     if should_protect_path "$item" 2> /dev/null || is_path_whitelisted "$item" 2> /dev/null; then
                         continue
                     fi
-                    item_found=true
-                    candidate_item_count=$((candidate_item_count + 1))
+                    local item_size_known=false
+                    local item_size_kb=0
+                    local item_size_bytes=""
                     if [[ ! -L "$item" && (-f "$item" || -d "$item") ]]; then
-                        local item_size_bytes=""
                         if item_size_bytes=$(app_support_item_size_bytes "$item" "$size_timeout_seconds"); then
                             if [[ "$item_size_bytes" =~ ^[0-9]+$ ]]; then
-                                candidate_size_bytes=$((candidate_size_bytes + item_size_bytes))
+                                item_size_kb=$(((item_size_bytes + 1023) / 1024))
+                                item_size_known=true
                             else
                                 candidate_size_partial=true
                             fi
@@ -1786,6 +1951,14 @@ clean_application_support_logs() {
                             candidate_size_partial=true
                         fi
                     fi
+                    if [[ "$DRY_RUN" == "true" ]] && declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                        record_dry_run_cleanup_target "$item" "$item_size_kb" 1 "$item_size_known" || continue
+                    fi
+                    if [[ "$item_size_known" == "true" ]]; then
+                        candidate_size_bytes=$((candidate_size_bytes + item_size_bytes))
+                    fi
+                    item_found=true
+                    candidate_item_count=$((candidate_item_count + 1))
                     if ((candidate_item_count % 250 == 0)); then
                         local current_time
                         current_time=$(get_epoch_seconds)
@@ -1831,7 +2004,11 @@ clean_application_support_logs() {
                     fi
                     stop_section_spinner
                     start_section_spinner "Scanning Application Support... group [$container_label, bulk clean]"
-                    if [[ "$DRY_RUN" != "true" ]]; then
+                    if [[ "$DRY_RUN" == "true" ]]; then
+                        if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                            record_dry_run_cleanup_target "$candidate" 0 1 false || continue
+                        fi
+                    else
                         safe_remove "$candidate" true > /dev/null 2>&1 || true
                     fi
                     found_any=true
@@ -1846,13 +2023,14 @@ clean_application_support_logs() {
                 local candidate_item_count=0
                 while IFS= read -r -d '' item; do
                     [[ -e "$item" ]] || continue
-                    item_found=true
-                    candidate_item_count=$((candidate_item_count + 1))
+                    local item_size_known=false
+                    local item_size_kb=0
+                    local item_size_bytes=""
                     if [[ ! -L "$item" && (-f "$item" || -d "$item") ]]; then
-                        local item_size_bytes=""
                         if item_size_bytes=$(app_support_item_size_bytes "$item" "$size_timeout_seconds"); then
                             if [[ "$item_size_bytes" =~ ^[0-9]+$ ]]; then
-                                candidate_size_bytes=$((candidate_size_bytes + item_size_bytes))
+                                item_size_kb=$(((item_size_bytes + 1023) / 1024))
+                                item_size_known=true
                             else
                                 candidate_size_partial=true
                             fi
@@ -1860,6 +2038,14 @@ clean_application_support_logs() {
                             candidate_size_partial=true
                         fi
                     fi
+                    if [[ "$DRY_RUN" == "true" ]] && declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                        record_dry_run_cleanup_target "$item" "$item_size_kb" 1 "$item_size_known" || continue
+                    fi
+                    if [[ "$item_size_known" == "true" ]]; then
+                        candidate_size_bytes=$((candidate_size_bytes + item_size_bytes))
+                    fi
+                    item_found=true
+                    candidate_item_count=$((candidate_item_count + 1))
                     if ((candidate_item_count % 250 == 0)); then
                         local current_time
                         current_time=$(get_epoch_seconds)
@@ -1899,17 +2085,17 @@ clean_application_support_logs() {
         local total_size_kb=$(((total_size_bytes + 1023) / 1024))
         if [[ "$DRY_RUN" == "true" ]]; then
             if [[ "$total_size_partial" == "true" ]]; then
-                echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Application Support logs/caches${NC}, ${YELLOW}at least $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+                echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Application Support logs/caches${NC} · ${YELLOW}at least $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
             else
-                echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Application Support logs/caches${NC}, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+                echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Application Support logs/caches${NC} · $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
             fi
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$total_size_kb")
             if [[ "$total_size_partial" == "true" ]]; then
-                echo -e "  ${line_color}${ICON_SUCCESS}${NC} Application Support logs/caches${NC}, ${line_color}at least $size_human${NC}"
+                echo -e "  ${line_color}${ICON_SUCCESS}${NC} Application Support logs/caches${NC} · ${line_color}at least $size_human${NC}"
             else
-                echo -e "  ${line_color}${ICON_SUCCESS}${NC} Application Support logs/caches${NC}, ${line_color}$size_human${NC}"
+                echo -e "  ${line_color}${ICON_SUCCESS}${NC} Application Support logs/caches${NC} · ${line_color}$size_human${NC}"
             fi
         fi
         files_cleaned=$((files_cleaned + cleaned_count))
@@ -1919,7 +2105,7 @@ clean_application_support_logs() {
     fi
 }
 # Remove cached device firmware (.ipsw) from iTunes, Finder, and Apple Configurator 2.
-# These are installers for firmware already applied (or superseded) — macOS will
+# These are installers for firmware already applied (or superseded); macOS will
 # re-download them on demand. Typical size: 5-8GB per file. Never touches backups.
 clean_cached_device_firmware() {
     local -a shallow_dirs=(
@@ -1950,6 +2136,9 @@ clean_cached_device_firmware() {
         size_kb=$(get_path_size_kb "$ipsw" || echo 0)
         size_kb="${size_kb:-0}"
         if [[ "$DRY_RUN" == "true" ]]; then
+            if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                record_dry_run_cleanup_target "$ipsw" "$size_kb" 1 true || return 0
+            fi
             total_size_kb=$((total_size_kb + size_kb))
             cleaned_count=$((cleaned_count + 1))
             cleaned_any=true
@@ -1986,11 +2175,11 @@ clean_cached_device_firmware() {
         local size_human
         size_human=$(bytes_to_human "$((total_size_kb * 1024))")
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Cached device firmware${NC}, ${YELLOW}${cleaned_count} files, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Cached device firmware${NC} · ${YELLOW}${cleaned_count} files, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$total_size_kb")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Cached device firmware${NC}, ${line_color}${cleaned_count} files, $size_human${NC}"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Cached device firmware${NC} · ${line_color}${cleaned_count} files, $size_human${NC}"
         fi
         files_cleaned=$((files_cleaned + cleaned_count))
         total_size_cleaned=$((total_size_cleaned + total_size_kb))
@@ -1999,22 +2188,57 @@ clean_cached_device_firmware() {
     fi
 }
 
-# iOS device backup info.
-check_ios_device_backups() {
-    local backup_dir="$HOME/Library/Application Support/MobileSync/Backup"
-    # Simplified check without find to avoid hanging.
-    if [[ -d "$backup_dir" ]]; then
-        local backup_kb
-        backup_kb=$(get_path_size_kb "$backup_dir")
-        if [[ -n "${backup_kb:-}" && "$backup_kb" -gt 102400 ]]; then
-            local backup_human
-            backup_human=$(command du -shP "$backup_dir" 2> /dev/null | awk '{print $1}')
-            if [[ -n "$backup_human" ]]; then
-                note_activity
-                echo -e "  ${YELLOW}${ICON_WARNING}${NC} iOS backups: ${GREEN}${backup_human}${NC}${GRAY}, Path: $backup_dir${NC}"
-            fi
-        fi
-    fi
+# List JetBrains per-version data dirs that are not the newest version of
+# their IDE (e.g. GoLand2025.1 when GoLand2025.2 exists). Prints one dir name
+# per line; never prints the newest version, unversioned dirs, or Toolbox.
+# Data source for the review-only large-dir report (#1179).
+jetbrains_stale_version_dirs() {
+    local jetbrains_support="$1"
+    [[ -d "$jetbrains_support" ]] || return 0
+    command find "$jetbrains_support" -mindepth 1 -maxdepth 1 -type d 2> /dev/null |
+        awk -F'/' '
+            {
+                name = $NF
+                if (match(name, /[0-9][0-9][0-9][0-9]\.[0-9]+$/) && RSTART > 1) {
+                    base = substr(name, 1, RSTART - 1)
+                    split(substr(name, RSTART), v, ".")
+                    key = v[1] * 100 + v[2]
+                    n[base]++
+                    names[base, n[base]] = name
+                    keys[base, n[base]] = key
+                    if (key > maxk[base]) maxk[base] = key
+                }
+            }
+            END {
+                for (b in n)
+                    for (i = 1; i <= n[b]; i++)
+                        if (keys[b, i] < maxk[b]) print names[b, i]
+            }
+        '
+}
+
+# AI coding agents (Claude Code and similar) create full checkouts under
+# <project>/.claude/worktrees/ that accumulate silently across repos. Report
+# only, same 1GB bar as other large candidates; removal stays a manual
+# `git worktree remove` decision because a worktree may hold agent work.
+report_agent_worktree_candidates() {
+    local threshold_kb=$((1024 * 1024)) # 1GB
+    local -a roots=(
+        "$HOME/code" "$HOME/Code" "$HOME/dev" "$HOME/Projects"
+        "$HOME/GitHub" "$HOME/Workspace" "$HOME/Repos"
+        "$HOME/Development" "$HOME/www" "$HOME/src"
+    )
+    local root container size_kb
+    for root in "${roots[@]}"; do
+        [[ -d "$root" ]] || continue
+        while IFS= read -r -d '' container; do
+            size_kb=$(get_path_size_kb "$container" 2> /dev/null || echo 0)
+            [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
+            [[ "$size_kb" -ge "$threshold_kb" ]] || continue
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} AI agent worktrees · ${GREEN}$(bytes_to_human "$((size_kb * 1024))")${NC} · ${GRAY}$(format_path_link "$container")${NC}"
+            note_activity
+        done < <(run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" command find "$root" -maxdepth 6 -type d -path "*/.claude/worktrees" -prune -print0 2> /dev/null)
+    done
     return 0
 }
 
@@ -2025,7 +2249,7 @@ check_large_file_candidates() {
 
     _large_candidate_size_kb() {
         local path="$1"
-        local timeout_seconds="${MOLE_LARGE_CANDIDATE_SIZE_TIMEOUT:-3}"
+        local timeout_seconds="${2:-${MOLE_LARGE_CANDIDATE_SIZE_TIMEOUT:-3}}"
         [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || timeout_seconds=3
         local du_output=""
         du_output=$(run_with_timeout "$timeout_seconds" du -skP "$path" 2> /dev/null || true)
@@ -2034,18 +2258,35 @@ check_large_file_candidates() {
         printf '%s\n' "$size_kb"
     }
 
+    # One row per large item: "label · size · path". The ◎ icon carries the
+    # review-only semantics; format_path_link keeps the path clickable even
+    # with spaces (OSC 8 link, not terminal auto-linking).
+    _report_large_review_row() {
+        local label="$1"
+        local size_human="$2"
+        local path="$3"
+        stop_section_spinner
+        echo -e "  ${YELLOW}${ICON_WARNING}${NC} ${label} · ${GREEN}${size_human}${NC} · ${GRAY}$(format_path_link "$path")${NC}"
+        found_any=true
+        start_section_spinner "Scanning large files..."
+    }
+
     _report_large_review_dir() {
         local label="$1"
         local path="$2"
+        local probe_timeout="${3:-}"
         [[ -d "$path" ]] || return 0
         local size_kb=""
-        size_kb=$(_large_candidate_size_kb "$path") || return 0
+        size_kb=$(_large_candidate_size_kb "$path" "$probe_timeout") || return 0
         [[ "$size_kb" -ge "$threshold_kb" ]] || return 0
         local size_human
         size_human=$(bytes_to_human "$((size_kb * 1024))")
-        echo -e "  ${YELLOW}${ICON_WARNING}${NC} ${label}: ${GREEN}${size_human}${NC}${GRAY}, Path: $path${NC}"
-        found_any=true
+        _report_large_review_row "$label" "$size_human" "$path"
     }
+
+    # The du probes below (Mail, backups, package stores) take seconds in
+    # total; keep loading feedback on screen between rows.
+    start_section_spinner "Scanning large files..."
 
     local mail_dir="$HOME/Library/Mail"
     if [[ -d "$mail_dir" ]]; then
@@ -2054,8 +2295,7 @@ check_large_file_candidates() {
         if [[ "$mail_kb" -ge "$threshold_kb" ]]; then
             local mail_human
             mail_human=$(bytes_to_human "$((mail_kb * 1024))")
-            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Mail data: ${GREEN}${mail_human}${NC}${GRAY}, Path: $mail_dir${NC}"
-            found_any=true
+            _report_large_review_row "Mail data" "$mail_human" "$mail_dir"
         fi
     fi
 
@@ -2066,8 +2306,7 @@ check_large_file_candidates() {
         if [[ "$downloads_kb" -ge "$threshold_kb" ]]; then
             local downloads_human
             downloads_human=$(bytes_to_human "$((downloads_kb * 1024))")
-            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Mail downloads: ${GREEN}${downloads_human}${NC}${GRAY}, Path: $mail_downloads${NC}"
-            found_any=true
+            _report_large_review_row "Mail downloads" "$downloads_human" "$mail_downloads"
         fi
     fi
 
@@ -2079,8 +2318,7 @@ check_large_file_candidates() {
             if [[ "$installer_kb" -gt 0 ]]; then
                 local installer_human
                 installer_human=$(bytes_to_human "$((installer_kb * 1024))")
-                echo -e "  ${YELLOW}${ICON_WARNING}${NC} macOS installer: ${GREEN}${installer_human}${NC}${GRAY}, Path: $installer_path${NC}"
-                found_any=true
+                _report_large_review_row "macOS installer" "$installer_human" "$installer_path"
             fi
         fi
     done
@@ -2092,8 +2330,7 @@ check_large_file_candidates() {
         if [[ "$updates_kb" -ge "$threshold_kb" ]]; then
             local updates_human
             updates_human=$(bytes_to_human "$((updates_kb * 1024))")
-            echo -e "  ${YELLOW}${ICON_WARNING}${NC} macOS updates cache: ${GREEN}${updates_human}${NC}${GRAY}, Path: $updates_dir${NC}"
-            found_any=true
+            _report_large_review_row "macOS updates cache" "$updates_human" "$updates_dir"
         fi
     fi
 
@@ -2104,9 +2341,10 @@ check_large_file_candidates() {
         if [[ -n "$snapshot_list" ]]; then
             snapshot_count=$(echo "$snapshot_list" | { grep -Eo 'com\.apple\.TimeMachine\.[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}' || true; } | wc -l | awk '{print $1}')
             if [[ "$snapshot_count" =~ ^[0-9]+$ && "$snapshot_count" -gt 0 ]]; then
-                echo -e "  ${YELLOW}${ICON_WARNING}${NC} Time Machine local snapshots: ${GREEN}${snapshot_count}${NC}"
-                echo -e "  ${GRAY}${ICON_REVIEW}${NC} ${GRAY}Review: tmutil listlocalsnapshots /${NC}"
+                stop_section_spinner
+                echo -e "  ${YELLOW}${ICON_WARNING}${NC} Time Machine local snapshots · ${GREEN}${snapshot_count}${NC}"
                 found_any=true
+                start_section_spinner "Scanning large files..."
             fi
         fi
     fi
@@ -2115,39 +2353,69 @@ check_large_file_candidates() {
         local docker_output
         docker_output=$(run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" docker system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}' 2> /dev/null || true)
         if [[ -n "$docker_output" ]]; then
-            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Docker storage:"
+            local docker_detail=""
             while IFS=$'\t' read -r dtype dsize dreclaim; do
                 [[ -z "$dtype" ]] && continue
-                echo -e "    ${GRAY}${ICON_LIST} $dtype: $dsize, Reclaimable: $dreclaim${NC}"
+                docker_detail+="${docker_detail:+ · }${dtype} ${dsize} (${dreclaim} reclaimable)"
             done <<< "$docker_output"
-            found_any=true
+            if [[ -n "$docker_detail" ]]; then
+                stop_section_spinner
+                echo -e "  ${YELLOW}${ICON_WARNING}${NC} Docker storage · ${GRAY}${docker_detail}${NC}"
+                found_any=true
+                start_section_spinner "Scanning large files..."
+            fi
         else
             docker_output=$(run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" docker system df 2> /dev/null || true)
             if [[ -n "$docker_output" ]]; then
-                echo -e "  ${YELLOW}${ICON_WARNING}${NC} Docker storage:"
-                echo -e "  ${GRAY}${ICON_REVIEW}${NC} ${GRAY}Run: docker system df${NC}"
+                stop_section_spinner
+                echo -e "  ${YELLOW}${ICON_WARNING}${NC} Docker storage · ${GRAY}docker system df${NC}"
                 found_any=true
+                start_section_spinner "Scanning large files..."
             fi
         fi
     fi
 
-    _report_large_review_dir "Xcode archives (review only)" "$HOME/Library/Developer/Xcode/Archives"
-    _report_large_review_dir "iOS backups (review only)" "$HOME/Library/Application Support/MobileSync/Backup"
-    _report_large_review_dir "LM Studio models (review only)" "$HOME/.lmstudio/models"
-    _report_large_review_dir "OrbStack data (review only)" "$HOME/OrbStack"
-    _report_large_review_dir "Lima data (review only)" "$HOME/.lima"
-    _report_large_review_dir "Maven local repository (review only)" "$HOME/.m2/repository"
-    _report_large_review_dir "pnpm store (review only)" "$HOME/Library/pnpm/store"
-    _report_large_review_dir "Conda packages (review only)" "$HOME/.conda/pkgs"
-    _report_large_review_dir "Anaconda packages (review only)" "$HOME/anaconda3/pkgs"
+    _report_large_review_dir "Xcode archives" "$HOME/Library/Developer/Xcode/Archives"
+    # Device backups reach 100GB+ with millions of small files; the default
+    # 3s du budget times out cold and silently drops the most valuable row,
+    # so give this probe the hint-scan budget instead.
+    _report_large_review_dir "iOS backups" "$HOME/Library/Application Support/MobileSync/Backup" "$MOLE_TIMEOUT_HINT_SCAN_SEC"
+    _report_large_review_dir "LM Studio models" "$HOME/.lmstudio/models"
+    local orbstack_data
+    for orbstack_data in "$HOME"/Library/Group\ Containers/*dev.orbstack/data "$HOME/OrbStack"; do
+        _report_large_review_dir "OrbStack data" "$orbstack_data"
+    done
+    _report_large_review_dir "Lima data" "$HOME/.lima"
+    _report_large_review_dir "Maven local repository" "$HOME/.m2/repository"
+    _report_large_review_dir "pnpm store" "$HOME/Library/pnpm/store"
+    _report_large_review_dir "Conda packages" "$HOME/.conda/pkgs"
+    _report_large_review_dir "Anaconda packages" "$HOME/anaconda3/pkgs"
 
-    if [[ "$found_any" == "false" ]]; then
-        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} No large items detected in common locations"
+    # JetBrains keeps one data dir per IDE version (GoLand2025.1, ...). After
+    # an upgrade the previous version's dir lingers forever with plugins and
+    # settings inside. Report every dir that is not the newest version of its
+    # IDE, review-only: these enable downgrades and must never be auto-deleted
+    # (#1179).
+    local jetbrains_support="$HOME/Library/Application Support/JetBrains"
+    local jb_stale
+    while IFS= read -r jb_stale; do
+        [[ -n "$jb_stale" ]] || continue
+        _report_large_review_dir "JetBrains old version data" "$jetbrains_support/$jb_stale"
+    done < <(jetbrains_stale_version_dirs "$jetbrains_support")
+
+    report_agent_worktree_candidates
+
+    stop_section_spinner
+
+    unset -f _large_candidate_size_kb _report_large_review_dir _report_large_review_row
+
+    # Only mark activity when something was reported so an empty section can
+    # collapse instead of printing a reassurance row.
+    if [[ "$found_any" == "true" ]]; then
+        note_activity
+    else
+        debug_log "Large files: no candidates above threshold"
     fi
-
-    unset -f _large_candidate_size_kb _report_large_review_dir
-
-    note_activity
     return 0
 }
 

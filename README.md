@@ -12,7 +12,7 @@
     <img src="https://img.shields.io/badge/Apple%20Silicon-arm64-111111?logo=apple&logoColor=white" alt="Apple Silicon arm64">
     <img src="https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white" alt="Tauri 2">
     <img src="https://img.shields.io/badge/Rust-native-000000?logo=rust&logoColor=white" alt="Rust">
-    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-22c55e.svg" alt="MIT License"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue.svg" alt="GNU GPL version 3 License"></a>
   </p>
   <p>
     <a href="#-everything-your-mac-needs-in-one-place">Features</a> ·
@@ -88,7 +88,7 @@ Burrow brings the tools you would normally collect across several apps and comma
 - **Local by default.** Scans, hardware monitoring, cleanup analysis and application inventory stay on your Mac.
 - **Recoverable by policy.** User-facing cleanup and removal actions use the macOS Trash, results are presented for review and sensitive paths are guarded in the Rust backend.
 - **One coherent toolbox.** System health, cleanup, security, applications, storage and networking share the same fast interface.
-- **Open and inspectable.** Burrow's source is MIT-licensed, with third-party components and exact license texts documented separately.
+- **Open and inspectable.** Burrow is free software under GPL-3.0, with third-party components and exact license texts documented separately.
 
 > **Privacy note:** network access is limited to features that need it, such as app-update discovery, ClamAV definition updates and provider-backed encrypted DNS. See [PRIVACY.md](PRIVACY.md) for the complete data-flow summary.
 
@@ -166,11 +166,13 @@ Burrow
 ├── Tauri 2                   narrow desktop bridge and capabilities
 ├── Rust                      validation, scanning and system operations
 ├── ClamAV                    bundled malware-scanning engine
-├── Mole                      bundled maintenance primitives
+├── Mole 1.48.1               bundled GPL maintenance engine
 └── Apple Silicon helpers     SMC and Touch ID integrations
 ```
 
 The initial standalone `arm64` resources are versioned with the repository so builds are reproducible. ClamAV databases, generated bundles and local caches remain excluded. Component versions, checksums, source references and license texts are tracked in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Burrow is an independent project and is not the official Mole Mac application. It embeds and credits the open-source [Mole CLI](https://github.com/tw93/Mole) as an upstream engine while adding its own interface, Rust validation boundary and recoverable-operation policy.
 
 <details>
 <summary><strong>Development checks</strong></summary>
@@ -208,7 +210,7 @@ Thoughtful bug reports, security reviews, translations and focused pull requests
 
 ## 📄 License
 
-Burrow's own source code is available under the [MIT License](LICENSE). Bundled third-party components retain their respective licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Burrow is free software distributed under the [GNU General Public License version 3](LICENSE). Mole remains credited as the upstream maintenance engine used by Burrow, and bundled third-party components retain their respective licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ---
 

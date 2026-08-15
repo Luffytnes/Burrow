@@ -148,6 +148,12 @@ opt_diag_parse_image_mount_pairs() {
     local info="${1:-}"
     awk '
     function extract_mount(line) {
+        # Only /dev/disk* lines list real mount points. Other fields like
+        # image-alias / icon-path / shadow-path may contain absolute paths
+        # but are not mounts and previously produced phantom detach offers.
+        if (line !~ /^\/dev\/disk/) {
+            return ""
+        }
         if (line ~ /[[:space:]]\/.*/) {
             sub(/^.*[[:space:]]\//, "/", line)
             return line
@@ -290,11 +296,11 @@ opt_diag_detach_candidates() {
         fi
     done <<< "$candidates"
 
-    if [[ $detached -gt 0 ]]; then
-        echo -e "  ${GRAY}${ICON_REVIEW}${NC} Detached ${detached} mounted image(s)"
+    if [[ $detached -gt 1 ]]; then
+        echo -e "  ${GRAY}${ICON_REVIEW}${NC} Detached ${detached} mounted images"
     fi
-    if [[ $failed -gt 0 ]]; then
-        echo -e "  ${GRAY}${ICON_REVIEW}${NC} ${failed} mounted image(s) still need manual review"
+    if [[ $failed -gt 1 ]]; then
+        echo -e "  ${GRAY}${ICON_REVIEW}${NC} ${failed} mounted images still need manual review"
     fi
 }
 
@@ -309,10 +315,14 @@ opt_diag_offer_detach_candidates() {
         count=$((count + 1))
     done <<< "$candidates"
 
-    echo -e "  ${GRAY}${ICON_LIST}${NC} Mounted image detach candidates:"
+    if [[ "$count" -eq 1 ]]; then
+        echo -e "  ${GRAY}${ICON_LIST}${NC} Mounted image adds assessment overhead:"
+    else
+        echo -e "  ${GRAY}${ICON_LIST}${NC} Mounted images add assessment overhead:"
+    fi
     while IFS=$'\t' read -r image_path mount_path; do
         [[ -z "$mount_path" ]] && continue
-        echo -e "    ${GRAY}${mount_path}${NC} ← ${image_path}"
+        echo -e "    ${image_path##*/} ${GRAY}→${NC} ${mount_path}"
     done <<< "$candidates"
 
     if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
@@ -328,7 +338,7 @@ opt_diag_offer_detach_candidates() {
     echo -ne "  ${GRAY}${ICON_REVIEW}${NC} ${YELLOW}Detach now?${NC} ${GRAY}Enter confirm / Space cancel${NC}: "
     local key=""
     if ! key=$(read_key); then
-        echo -e "\n  ${GRAY}${ICON_WARNING}${NC} Mounted image detach skipped"
+        echo -e "\n  ${GRAY}${ICON_WARNING}${NC} Kept mounted, whitelist via ${NC}mo optimize --whitelist${GRAY}${NC}"
         return 0
     fi
 
@@ -336,7 +346,7 @@ opt_diag_offer_detach_candidates() {
         echo ""
         opt_diag_detach_candidates "$candidates"
     else
-        echo -e "\n  ${GRAY}${ICON_WARNING}${NC} Mounted image detach skipped"
+        echo -e "\n  ${GRAY}${ICON_WARNING}${NC} Kept mounted, whitelist via ${NC}mo optimize --whitelist${GRAY}${NC}"
     fi
 }
 
@@ -378,7 +388,7 @@ run_optimize_diagnostics() {
     done
 
     if [[ -z "$primary_family" ]]; then
-        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} No obvious sustained high-CPU bottleneck detected"
+        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} No sustained high-CPU bottleneck detected"
     else
         label=$(opt_diag_family_label "$primary_family")
         echo -e "  ${YELLOW}${ICON_WARNING}${NC} Likely bottleneck: ${label} (~${primary_avg}% CPU sustained)"
@@ -393,14 +403,16 @@ run_optimize_diagnostics() {
         fi
     fi
 
-    local spctl_status hdiutil_info image_pairs detach_candidates
-    spctl_status=$(opt_diag_get_spctl_status)
-    hdiutil_info=$(opt_diag_get_hdiutil_info)
-    image_pairs=$(opt_diag_parse_image_mount_pairs "$hdiutil_info")
-    detach_candidates=$(opt_diag_collect_detach_candidates "$image_pairs")
-
+    # Mounted-image checks are scoped to sustained syspolicyd pressure: a
+    # mounted DMG on an otherwise healthy system is not a diagnosis finding,
+    # so healthy runs end at the summary line without probing spctl/hdiutil.
     if [[ "$primary_family" == "syspolicyd" || "$sustained_details" == *$'syspolicyd\t'* ]]; then
+        local spctl_status hdiutil_info image_pairs detach_candidates
         local managed_count coresim_count detach_count
+        spctl_status=$(opt_diag_get_spctl_status)
+        hdiutil_info=$(opt_diag_get_hdiutil_info)
+        image_pairs=$(opt_diag_parse_image_mount_pairs "$hdiutil_info")
+        detach_candidates=$(opt_diag_collect_detach_candidates "$image_pairs")
         managed_count=$(opt_diag_count_matches "$image_pairs" system_managed)
         coresim_count=$(opt_diag_count_matches "$image_pairs" coresim_only)
         detach_count=$(printf '%s\n' "$detach_candidates" | awk 'NF { count++ } END { print count + 0 }')
@@ -410,10 +422,8 @@ run_optimize_diagnostics() {
         fi
         if [[ "$managed_count" -gt 0 && "$managed_count" == "$coresim_count" && "$detach_count" -eq 0 ]]; then
             echo -e "  ${GRAY}${ICON_INFO}${NC} Only system-managed CoreSimulator images are mounted, informational only, not a detach target"
-        elif [[ "$detach_count" -gt 0 ]]; then
-            echo -e "  ${GRAY}${ICON_INFO}${NC} User-mounted disk images may contribute to assessment overhead"
         fi
-    fi
 
-    opt_diag_offer_detach_candidates "$detach_candidates"
+        opt_diag_offer_detach_candidates "$detach_candidates"
+    fi
 }

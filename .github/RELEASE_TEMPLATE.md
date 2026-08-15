@@ -1,7 +1,7 @@
 # Burrow vX.Y.Z — macOS Apple Silicon
 
 > **Platform:** macOS 13 Ventura or later · Apple Silicon (arm64) only
-> **License:** MIT · [Third-party notices](THIRD_PARTY_NOTICES.md)
+> **License:** GPL-3.0-only · [Third-party notices](THIRD_PARTY_NOTICES.md)
 
 ## What's changed
 
@@ -20,9 +20,9 @@
 | Component      | Version | License |
 | -------------- | ------- | ------- |
 | ClamAV         | 1.5.4   | GPLv2+  |
-| Mole           | 1.39.1  | MIT     |
-| burrow-smc     | —       | MIT     |
-| burrow-touchid | —       | MIT     |
+| Mole           | 1.48.1  | GPLv3   |
+| burrow-smc     | —       | GPLv3   |
+| burrow-touchid | —       | GPLv3   |
 
 All bundled Mach-O binaries are verified as arm64. SHA-256 checksums are
 published with the artifacts.

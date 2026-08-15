@@ -40,10 +40,6 @@ is_critical_system_component() {
     esac
 }
 
-# Legacy function - preserved for backward compatibility
-# Use should_protect_from_uninstall() or should_protect_data() instead
-readonly PRESERVED_BUNDLE_PATTERNS=("${SYSTEM_CRITICAL_BUNDLES[@]}" "${DATA_PROTECTED_BUNDLES[@]}")
-
 # Check if bundle ID matches pattern (glob support)
 bundle_matches_pattern() {
     local bundle_id="$1"
@@ -87,20 +83,11 @@ build_regex_var() {
 # Lazy-loaded regex (only built when needed)
 APPLE_UNINSTALLABLE_REGEX=""
 SYSTEM_CRITICAL_REGEX=""
-SYSTEM_CRITICAL_FAST_REGEX=""
-DATA_PROTECTED_REGEX=""
 
 _ensure_uninstall_regex() {
     if [[ -z "$SYSTEM_CRITICAL_REGEX" ]]; then
         build_regex_var APPLE_UNINSTALLABLE_REGEX "${APPLE_UNINSTALLABLE_APPS[@]}"
         build_regex_var SYSTEM_CRITICAL_REGEX "${SYSTEM_CRITICAL_BUNDLES[@]}"
-    fi
-}
-
-_ensure_data_protection_regex() {
-    if [[ -z "$SYSTEM_CRITICAL_FAST_REGEX" ]]; then
-        build_regex_var SYSTEM_CRITICAL_FAST_REGEX "${SYSTEM_CRITICAL_BUNDLES_FAST[@]}"
-        build_regex_var DATA_PROTECTED_REGEX "${DATA_PROTECTED_BUNDLES[@]}"
     fi
 }
 
@@ -117,6 +104,42 @@ should_protect_from_uninstall() {
     if [[ "$bundle_id" =~ $SYSTEM_CRITICAL_REGEX ]]; then
         return 0
     fi
+
+    return 1
+}
+
+# Print the vendor name when an app must be removed through its official
+# uninstaller instead of Mole's generic Trash/delete path.
+official_uninstaller_vendor() {
+    local bundle_id="${1:-}"
+    local display_name="${2:-}"
+    local app_path="${3:-}"
+    local normalized_bundle normalized_name normalized_path
+    normalized_bundle=$(printf '%s' "$bundle_id" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+    normalized_name=$(printf '%s' "$display_name" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+    normalized_path=$(basename "${app_path:-}" .app | LC_ALL=C tr '[:upper:]' '[:lower:]')
+
+    local rule vendor prefixes fragments prefix fragment
+    local -a _prefixes _fragments
+    for rule in "${OFFICIAL_UNINSTALLER_RULES[@]}"; do
+        IFS='|' read -r vendor prefixes fragments <<< "$rule"
+        IFS=',' read -r -a _prefixes <<< "$prefixes"
+        for prefix in "${_prefixes[@]}"; do
+            [[ -n "$prefix" && "$normalized_bundle" == "$prefix"* ]] && {
+                printf '%s\n' "$vendor"
+                return 0
+            }
+        done
+
+        IFS=',' read -r -a _fragments <<< "$fragments"
+        for fragment in "${_fragments[@]}"; do
+            if [[ -n "$fragment" ]] &&
+                { [[ "$normalized_name" == *"$fragment"* ]] || [[ "$normalized_path" == *"$fragment"* ]]; }; then
+                printf '%s\n' "$vendor"
+                return 0
+            fi
+        done
+    done
 
     return 1
 }
@@ -193,6 +216,88 @@ should_protect_data() {
     return 1
 }
 
+# Endpoint security / EDR / MDM agents (CrowdStrike Falcon, SentinelOne, ESET,
+# Jamf, GlobalProtect, Cisco Secure Client) tamper-protect their on-disk state.
+# Deleting anything that belongs to them under the per-user Darwin folder -- a
+# rebuildable Metal/GPU shader cache (.../C/...), a code-signature clone
+# (.../X/<bundle-id>.code_sign_clone), or temp (.../T/...) -- trips sensor tamper
+# detection (e.g. CrowdStrike "MacFalconSensorTamper", MITRE T1562.001) that
+# corporate security reports as malware. Reclaim is only a few MB, so never touch
+# these. The vendor prefixes live in ENDPOINT_SECURITY_BUNDLE_PREFIXES
+# (app_protection_data.sh); matching a vendor id anywhere under var/folders is
+# protection-only, so a wide match is safe. Shared by should_protect_path() and
+# the cache/clone sweeps in lib/clean/system.sh and lib/clean/user.sh.
+is_endpoint_security_cache_path() {
+    local path="$1"
+    # Fast reject: only the per-user Darwin folders are in scope (the real
+    # /private/var/folders and its /var/folders symlink form). Anchored to the
+    # absolute root so an unrelated ".../var/folders/..." path cannot match.
+    case "$path" in
+        /private/var/folders/* | /var/folders/*) ;;
+        *)
+            if ! declare -f _mole_path_is_within_existing_root > /dev/null 2>&1 ||
+                ! _mole_path_is_within_existing_root "$path" "/private/var/folders"; then
+                return 1
+            fi
+            ;;
+    esac
+    local restore_nocasematch=false
+    if ! shopt -q nocasematch; then
+        shopt -s nocasematch
+        restore_nocasematch=true
+    fi
+    local prefix
+    for prefix in "${ENDPOINT_SECURITY_BUNDLE_PREFIXES[@]}"; do
+        if [[ "$path" == *"$prefix"* ]]; then
+            [[ "$restore_nocasematch" == "true" ]] && shopt -u nocasematch
+            return 0
+        fi
+    done
+    [[ "$restore_nocasematch" == "true" ]] && shopt -u nocasematch
+    return 1
+}
+
+is_orbstack_runtime_path() {
+    local path="$1"
+    local restore_nocasematch=false
+    if ! shopt -q nocasematch; then
+        shopt -s nocasematch
+        restore_nocasematch=true
+    fi
+
+    local matched=false
+    case "$path" in
+        */Library/Group\ Containers/*dev.orbstack | */Library/Group\ Containers/*dev.orbstack/* | */.orbstack | */.orbstack/*)
+            matched=true
+            ;;
+    esac
+
+    [[ "$restore_nocasematch" == "true" ]] && shopt -u nocasematch
+    [[ "$matched" == "true" ]]
+}
+
+# E5RT (Apple's Espresso runtime, behind Vision/TextRecognition) keeps compiled
+# model bundles in a com.apple.e5rt.e5bundlecache directory, usually one level
+# below the owning app's or daemon's cache directory. A process that already
+# resolved that cache does not rebuild it: deleting it under a running app makes
+# every later recognition call fail with E5RT Code 13 until the app restarts.
+# Reclaims little, breaks visibly, so treat the directory and its immediate
+# parent as off limits. Shared by safe_clean() and process_container_cache().
+#
+# Args: $1 - path to check
+# Returns: 0 if the path is or directly holds a compiled model cache
+holds_compiled_model_cache() {
+    local path="$1"
+    [[ -z "$path" ]] && return 1
+    if [[ "${path%/}" == *"/com.apple.e5rt.e5bundlecache" ]]; then
+        return 0
+    fi
+    if [[ -d "$path/com.apple.e5rt.e5bundlecache" ]]; then
+        return 0
+    fi
+    return 1
+}
+
 # Check if a path is protected from deletion
 # Centralized logic to protect system settings, control center, and critical apps
 #
@@ -206,6 +311,10 @@ should_protect_path() {
     [[ -z "$path" ]] && return 1
 
     local _container_cache_path=false
+
+    if is_orbstack_runtime_path "$path"; then
+        return 0
+    fi
 
     # 1. Keyword-based matching for system components (case-insensitive via character classes)
     case "$path" in
@@ -238,6 +347,10 @@ should_protect_path() {
         */Library/Group\ Containers/com.apple.systempreferences* | */Library/Group\ Containers/com.apple.Settings*)
             return 0
             ;;
+        # OrbStack group containers hold live container filesystem images.
+        */Library/Group\ Containers/*dev.orbstack | */Library/Group\ Containers/*dev.orbstack/* | */.orbstack | */.orbstack/*)
+            return 0
+            ;;
         # Shared file lists for System Settings (macOS Sequoia) - Issue #136
         */com.apple.sharedfilelist/*com.apple.Settings* | */com.apple.sharedfilelist/*com.apple.SystemSettings* | */com.apple.sharedfilelist/*systempreferences*)
             return 0
@@ -266,6 +379,13 @@ should_protect_path() {
             ;;
     esac
 
+    # 4b. Endpoint security / EDR agent caches (CrowdStrike Falcon, SentinelOne,
+    # etc.). Dedicated predicate so the same vendor list is reused by the
+    # GPU-cache sweep in lib/clean/system.sh and matches deterministically.
+    if is_endpoint_security_cache_path "$path"; then
+        return 0
+    fi
+
     # 5. Protect critical preference files and user data
     case "$path" in
         */Library/Preferences/com.apple.dock.plist | */Library/Preferences/com.apple.finder.plist)
@@ -273,6 +393,17 @@ should_protect_path() {
             ;;
         # Protect Mole's own runtime logs so cleanup cannot delete its active log targets.
         */Library/Logs/mole | */Library/Logs/mole/ | */Library/Logs/mole/*)
+            return 0
+            ;;
+        # Codex Desktop and CLI keep conversation indexes and app state in cache-
+        # shaped paths. Default cleanup must not remove those records.
+        */Library/Application\ Support/Codex | */Library/Application\ Support/Codex/* | \
+            */Library/Logs/com.openai.codex | */Library/Logs/com.openai.codex/* | \
+            */.codex/sessions | */.codex/sessions/* | \
+            */.codex/auth.json | */.codex/history.jsonl | \
+            */.codex/state_*.sqlite | */.codex/logs_*.sqlite | \
+            */.codex/session_index.jsonl | */.codex/cache/session_index.jsonl | \
+            */.codex/cache/codex_app_directory | */.codex/cache/codex_app_directory/*)
             return 0
             ;;
         # Bluetooth and WiFi configurations
@@ -569,10 +700,95 @@ find_shared_app_paths() {
     done | sort -u
 }
 
+# Return 0 when `path` looks like a dotdir / XDG state directory belonging to
+# a standalone CLI tool shipped independently of any same-named GUI app.
+# find_app_files uses this to skip candidates that would otherwise nuke
+# unrelated CLI state when uninstalling a same-named GUI app (#993).
+#
+# Lowercase comparison so case-insensitive APFS (~/.Claude vs ~/.claude) is
+# handled. Scope is restricted to four well-known parents so we never skip
+# legitimate non-dotdir locations.
+#
+# The deny-list is inlined rather than read from an array because bats 1.x
+# does not carry readonly arrays from setup() into the @test body, and a
+# regression in any of these names is destructive enough that we never want
+# the safeguard to silently no-op in a fresh subshell.
+_path_belongs_to_independent_cli() {
+    local path="$1"
+    [[ -z "$path" ]] && return 1
+
+    local base parent lc_name
+    base="${path##*/}"
+    parent="${path%/*}"
+    lc_name=$(printf '%s' "${base#.}" | tr '[:upper:]' '[:lower:]')
+    [[ -z "$lc_name" ]] && return 1
+
+    case "$lc_name" in
+        # Standalone CLI tools shipped independently of a same-named GUI app:
+        # never delete their dotdirs when uninstalling the GUI namesake.
+        # Issue #993: uninstalling Claude.app wiped ~/.claude (Claude Code CLI),
+        # OpenCode.app wiped ~/.local/share/opencode. Case-insensitive APFS makes
+        # the collision worse. Add new GUI/CLI namesakes here.
+        claude | opencode | codex | gemini) ;;
+        *) return 1 ;;
+    esac
+
+    case "$parent" in
+        "$HOME" | "$HOME/.config" | "$HOME/.local/share" | "$HOME/.cache")
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+_mole_uninstall_embedded_bundle_ids() {
+    local app_path="${1:-}"
+    local primary_bundle_id="${2:-}"
+    local max_info_plists=128
+    local scanned=0
+
+    [[ -n "$app_path" && -d "$app_path/Contents" ]] || return 0
+    [[ "$app_path" == /* && "$app_path" != *$'\n'* && "$app_path" != *"/.."* ]] || return 0
+
+    local info bundle_root bundle_name ext embedded_id
+    while IFS= read -r -d '' info; do
+        scanned=$((scanned + 1))
+        [[ $scanned -le $max_info_plists ]] || break
+
+        bundle_root="${info%/Contents/Info.plist}"
+        [[ "$bundle_root" != "$app_path" ]] || continue
+        bundle_name="${bundle_root##*/}"
+        ext=$(printf '%s' "${bundle_name##*.}" | tr '[:upper:]' '[:lower:]')
+
+        case "$ext" in
+            xpc | appex) ;;
+            app)
+                case "$bundle_root" in
+                    "$app_path/Contents/Library/LoginItems/"*) ;;
+                    *) continue ;;
+                esac
+                ;;
+            *) continue ;;
+        esac
+
+        embedded_id=$(plutil -extract CFBundleIdentifier raw "$info" 2> /dev/null || true)
+        mole_is_reverse_dns_bundle_id "$embedded_id" || continue
+        [[ "$embedded_id" == "$primary_bundle_id" ]] && continue
+        # Shared framework services are not owned by every app that embeds them.
+        case "$embedded_id" in
+            org.sparkle-project.*)
+                continue
+                ;;
+        esac
+        printf '%s\n' "$embedded_id"
+    done < <(command find "$app_path/Contents" -maxdepth 12 -type f -path "*/Contents/Info.plist" -print0 2> /dev/null || true) | sort -u
+}
+
 # Locate files associated with an application
 find_app_files() {
     local bundle_id="$1"
     local app_name="$2"
+    local app_path="${3:-}"
 
     # Early validation: require at least one valid identifier
     # Skip scanning if both bundle_id and app_name are invalid
@@ -612,35 +828,45 @@ find_app_files() {
         bundle_id_valid="true"
     fi
 
-    # Standard path patterns for user-level files
-    local -a user_patterns=(
-        "$HOME/Library/Application Support/$app_name"
-        "$HOME/Library/Caches/$app_name"
-        "$HOME/Library/Logs/$app_name"
-        "$HOME/Library/Application Support/CrashReporter/$app_name"
-        "$HOME/Library/Services/$app_name.workflow"
-        "$HOME/Library/QuickLook/$app_name.qlgenerator"
-        "$HOME/Library/Internet Plug-Ins/$app_name.plugin"
-        "$HOME/Library/Audio/Plug-Ins/Components/$app_name.component"
-        "$HOME/Library/Audio/Plug-Ins/VST/$app_name.vst"
-        "$HOME/Library/Audio/Plug-Ins/VST3/$app_name.vst3"
-        "$HOME/Library/Audio/Plug-Ins/Digidesign/$app_name.dpm"
-        "$HOME/Library/PreferencePanes/$app_name.prefPane"
-        "$HOME/Library/Input Methods/$app_name.app"
-        "$HOME/Library/Screen Savers/$app_name.saver"
-        "$HOME/Library/Frameworks/$app_name.framework"
-        "$HOME/Library/Contextual Menu Items/$app_name.plugin"
-        "$HOME/Library/Spotlight/$app_name.mdimporter"
-        "$HOME/Library/ColorPickers/$app_name.colorPicker"
-        "$HOME/Library/Workflows/$app_name.workflow"
-        "$HOME/.config/$app_name"
-        "$HOME/.local/share/$app_name"
-        "$HOME/.$app_name"
-        "$HOME/.$app_name"rc
-        "$HOME/Library/Address Book Plug-Ins/$app_name.bundle"
-        "$HOME/Library/Accessibility/$app_name.bundle"
-        "$HOME/Library/Mail/Bundles/$app_name.mailbundle"
-    )
+    # Standard path patterns for user-level files. App-name templates must never
+    # be built from an empty display name, otherwise dotdir/XDG paths collapse to
+    # broad roots like "$HOME/." or "$HOME/.config/".
+    local -a user_patterns=()
+    if [[ -n "$app_name" && ${#app_name} -ge 2 ]]; then
+        user_patterns+=(
+            "$HOME/Library/Application Support/$app_name"
+            "$HOME/Library/Caches/$app_name"
+            "$HOME/Library/Logs/$app_name"
+            "$HOME/Library/Preferences/$app_name"
+            "$HOME/Library/Preferences/$app_name.plist"
+            "$HOME/Library/Saved Application State/$app_name.savedState"
+
+            "$HOME/Library/Services/$app_name.workflow"
+            "$HOME/Library/QuickLook/$app_name.qlgenerator"
+            "$HOME/Library/Internet Plug-Ins/$app_name.plugin"
+            "$HOME/Library/Audio/Plug-Ins/Components/$app_name.component"
+            "$HOME/Library/Audio/Plug-Ins/VST/$app_name.vst"
+            "$HOME/Library/Audio/Plug-Ins/VST3/$app_name.vst3"
+            "$HOME/Library/Audio/Plug-Ins/Digidesign/$app_name.dpm"
+            "$HOME/Library/PreferencePanes/$app_name.prefPane"
+            "$HOME/Library/Input Methods/$app_name.app"
+            "$HOME/Library/Screen Savers/$app_name.saver"
+            "$HOME/Library/Frameworks/$app_name.framework"
+            "$HOME/Library/Contextual Menu Items/$app_name.plugin"
+            "$HOME/Library/Spotlight/$app_name.mdimporter"
+            "$HOME/Library/ColorPickers/$app_name.colorPicker"
+            "$HOME/Library/Workflows/$app_name.workflow"
+            "$HOME/.config/$app_name"
+            "$HOME/.cache/$app_name"
+            "$HOME/.cache/$lowercase_name"
+            "$HOME/.local/share/$app_name"
+            "$HOME/.$app_name"
+            "$HOME/.$app_name"rc
+            "$HOME/Library/Address Book Plug-Ins/$app_name.bundle"
+            "$HOME/Library/Accessibility/$app_name.bundle"
+            "$HOME/Library/Mail/Bundles/$app_name.mailbundle"
+        )
+    fi
 
     if [[ "$bundle_id_valid" == "true" ]]; then
         user_patterns+=(
@@ -669,12 +895,22 @@ find_app_files() {
             "$HOME/Library/Application Support/$nospace_name"
             "$HOME/Library/Caches/$nospace_name"
             "$HOME/Library/Logs/$nospace_name"
+            "$HOME/Library/Preferences/$nospace_name"
+            "$HOME/Library/Preferences/$nospace_name.plist"
+            "$HOME/Library/Saved Application State/$nospace_name.savedState"
             "$HOME/Library/Application Support/$underscore_name"
             "$HOME/Library/Application Support/$hyphen_name"
+            "$HOME/Library/Preferences/$underscore_name"
+            "$HOME/Library/Preferences/$underscore_name.plist"
+            "$HOME/Library/Preferences/$hyphen_name"
+            "$HOME/Library/Preferences/$hyphen_name.plist"
             # Lowercase variants (maestrostudio, maestro-studio, maestro_studio)
             "$HOME/.config/$lowercase_nospace"
             "$HOME/.config/$lowercase_hyphen"
             "$HOME/.config/$lowercase_underscore"
+            "$HOME/.cache/$lowercase_nospace"
+            "$HOME/.cache/$lowercase_hyphen"
+            "$HOME/.cache/$lowercase_underscore"
             "$HOME/.local/share/$lowercase_nospace"
             "$HOME/.local/share/$lowercase_hyphen"
             "$HOME/.local/share/$lowercase_underscore"
@@ -687,7 +923,11 @@ find_app_files() {
             "$HOME/Library/Application Support/$base_name"
             "$HOME/Library/Caches/$base_name"
             "$HOME/Library/Logs/$base_name"
+            "$HOME/Library/Preferences/$base_name"
+            "$HOME/Library/Preferences/$base_name.plist"
+            "$HOME/Library/Saved Application State/$base_name.savedState"
             "$HOME/.config/$base_lowercase"
+            "$HOME/.cache/$base_lowercase"
             "$HOME/.local/share/$base_lowercase"
             "$HOME/.$base_lowercase"
         )
@@ -701,8 +941,10 @@ find_app_files() {
         done < <(command find "$HOME/Library/HTTPStorages" -maxdepth 1 -name "dev.zed.Zed-*" -print0 2> /dev/null)
     fi
 
-    # Process standard patterns
-    for p in "${user_patterns[@]}"; do
+    # Process standard patterns. user_patterns can be empty when app_name is
+    # too short and bundle_id is invalid; bash 3.2 under set -u treats an empty
+    # "${arr[@]}" expansion as an unbound variable, so use the +-guard idiom.
+    for p in "${user_patterns[@]+"${user_patterns[@]}"}"; do
         local expanded_path="${p/#\~/$HOME}"
         # Skip if path doesn't exist
         [[ ! -e "$expanded_path" ]] && continue
@@ -713,15 +955,28 @@ find_app_files() {
             */Library/Application\ Support | */Library/Application\ Support/ | \
                 */Library/Caches | */Library/Caches/ | \
                 */Library/Logs | */Library/Logs/ | \
+                */Library/Preferences | */Library/Preferences/ | \
+                */Library/Preferences/ByHost | */Library/Preferences/ByHost/ | \
                 */Library/Containers | */Library/Containers/ | \
                 */Library/WebKit | */Library/WebKit/ | \
                 */Library/HTTPStorages | */Library/HTTPStorages/ | \
                 */Library/Application\ Scripts | */Library/Application\ Scripts/ | \
                 */Library/Autosave\ Information | */Library/Autosave\ Information/ | \
-                */Library/Group\ Containers | */Library/Group\ Containers/)
+                */Library/Group\ Containers | */Library/Group\ Containers/ | \
+                */.config | */.config/ | \
+                */.cache | */.cache/ | \
+                */.local/share | */.local/share/ | \
+                "$HOME" | "$HOME"/ | "$HOME"/.)
                 continue
                 ;;
         esac
+
+        # Skip XDG dotdirs that belong to independent CLI tools sharing a name
+        # with the GUI app being uninstalled (issue #993).
+        if _path_belongs_to_independent_cli "$expanded_path"; then
+            debug_log "Skipping independent CLI dotdir: $expanded_path"
+            continue
+        fi
 
         files_to_clean+=("$expanded_path")
     done
@@ -801,12 +1056,43 @@ find_app_files() {
         done
     fi
 
-    # Shared file lists (.sfl4 - recent documents etc.)
+    # Shared file lists (recent documents etc.). Keep the root exact: only
+    # per-app ApplicationRecentDocuments files named by bundle id are owned by
+    # the uninstall target.
     if [[ "$bundle_id_valid" == "true" ]] &&
-        [[ -d "$HOME/Library/Application Support/com.apple.sharedfilelist" ]]; then
-        while IFS= read -r -d '' sfl4_file; do
-            files_to_clean+=("$sfl4_file")
-        done < <(command find "$HOME/Library/Application Support/com.apple.sharedfilelist" -maxdepth 2 -name "${bundle_id}.sfl4" -print0 2> /dev/null)
+        [[ -d "$HOME/Library/Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments" ]]; then
+        while IFS= read -r -d '' sfl_file; do
+            files_to_clean+=("$sfl_file")
+        done < <(command find "$HOME/Library/Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments" \
+            -maxdepth 1 -type f \
+            \( -name "${bundle_id}.sfl2" -o -name "${bundle_id}.sfl3" -o -name "${bundle_id}.sfl4" \) \
+            -print0 2> /dev/null)
+    fi
+
+    # Helper extensions and XPC services can persist their own bundle-id keyed
+    # user data. Read only bounded embedded bundle ids from the selected app,
+    # then map them to exact ~/Library paths. Keep this stricter than the Mac
+    # app's review-only scanner because CLI leftovers are deletable after the
+    # single uninstall confirmation.
+    if [[ "$bundle_id_valid" == "true" && -n "$app_path" ]]; then
+        local embedded_id embedded_candidate
+        while IFS= read -r embedded_id; do
+            [[ -n "$embedded_id" ]] || continue
+            for embedded_candidate in \
+                "$HOME/Library/Application Scripts/$embedded_id" \
+                "$HOME/Library/Application Support/FileProvider/$embedded_id" \
+                "$HOME/Library/Caches/$embedded_id" \
+                "$HOME/Library/Containers/$embedded_id" \
+                "$HOME/Library/HTTPStorages/$embedded_id" \
+                "$HOME/Library/HTTPStorages/$embedded_id.binarycookies" \
+                "$HOME/Library/Preferences/$embedded_id.plist" \
+                "$HOME/Library/WebKit/$embedded_id"; do
+                [[ -e "$embedded_candidate" ]] && files_to_clean+=("$embedded_candidate")
+            done
+            [[ -d "$HOME/Library/Preferences/ByHost" ]] && while IFS= read -r -d '' embedded_candidate; do
+                files_to_clean+=("$embedded_candidate")
+            done < <(command find "$HOME/Library/Preferences/ByHost" -maxdepth 1 -type f -name "${embedded_id}.*.plist" -print0 2> /dev/null)
+        done < <(_mole_uninstall_embedded_bundle_ids "$app_path" "$bundle_id")
     fi
 
     # Launch Agents by name (special handling)
@@ -815,10 +1101,10 @@ find_app_files() {
     # Short-name apps (e.g., Zoom, Arc) are still cleaned via bundle_id matching above
     # Security: Common words are excluded to prevent matching unrelated plist files
     if [[ ${#app_name} -ge 5 ]] && [[ -d ~/Library/LaunchAgents ]]; then
-        # Skip common words that could match many unrelated LaunchAgents
-        # These are either generic terms or names that overlap with system/common utilities
-        local common_words="Music|Notes|Photos|Finder|Safari|Preview|Calendar|Contacts|Messages|Reminders|Clock|Weather|Stocks|Books|News|Podcasts|Voice|Files|Store|System|Helper|Agent|Daemon|Service|Update|Sync|Backup|Cloud|Manager|Monitor|Server|Client|Worker|Runner|Launcher|Driver|Plugin|Extension|Widget|Utility"
-        if [[ "$app_name" =~ ^($common_words)$ ]]; then
+        # Skip generic words that collide with many unrelated LaunchAgents.
+        # Shared with the system-level scan in find_app_system_files();
+        # defined in app_protection_data.sh.
+        if [[ "$app_name" =~ ^(${LAUNCH_AGENT_NAME_COMMON_WORDS})$ ]]; then
             debug_log "Skipping LaunchAgent name search for common word: $app_name"
         else
             while IFS= read -r -d '' plist; do
@@ -837,8 +1123,21 @@ find_app_files() {
     # tokens, AVD images, SDK installs, or other manually-curated data. Only
     # regenerable cache/derived paths belong here. If a toolchain dir is mixed
     # (config + cache), skip the whole tree rather than guess.
+    #
+    # MOLE_UNINSTALL_SIBLING_SURVIVES=1 skips the whole heuristic section
+    # below (through Raycast). The batch uninstall sibling guard sets it when
+    # another install sharing this bundle id stays on disk (Xcode.app vs
+    # Xcode-beta.app): these blocks match by regex substring, so the demoted
+    # bundle id alone does not stop them, and every path they collect is a
+    # toolchain cache the surviving install still uses.
+    local collect_toolchain_leftovers=true
+    if [[ "${MOLE_UNINSTALL_SIBLING_SURVIVES:-0}" == "1" ]]; then
+        collect_toolchain_leftovers=false
+    fi
+
     # 1. DevEco-Studio (Huawei)
-    if [[ "$app_name" =~ DevEco|deveco ]] || [[ "$bundle_id" =~ huawei.*deveco ]]; then
+    if [[ "$collect_toolchain_leftovers" == "true" ]] &&
+        { [[ "$app_name" =~ DevEco|deveco ]] || [[ "$bundle_id" =~ huawei.*deveco ]]; }; then
         # Skipped: ~/DevEcoStudioProjects, ~/HarmonyOS, ~/Huawei (project
         # source); ~/DevEco-Studio (IDE config + license state); ~/Library/
         # Application Support/Huawei, ~/Library/Huawei, ~/.huawei, ~/.ohos
@@ -850,7 +1149,8 @@ find_app_files() {
     fi
 
     # 2. Android Studio (Google)
-    if [[ "$app_name" =~ Android.*Studio|android.*studio ]] || [[ "$bundle_id" =~ google.*android.*studio|jetbrains.*android ]]; then
+    if [[ "$collect_toolchain_leftovers" == "true" ]] &&
+        { [[ "$app_name" =~ Android.*Studio|android.*studio ]] || [[ "$bundle_id" =~ google.*android.*studio|jetbrains.*android ]]; }; then
         # Skipped: ~/AndroidStudioProjects (project source), ~/Library/Android
         # (SDK installs, multi-GB), ~/.android root (debug.keystore signing
         # key, adbkey device pairing, avd/ images). Only sweep regenerable
@@ -862,7 +1162,8 @@ find_app_files() {
     fi
 
     # 3. Xcode (Apple)
-    if [[ "$app_name" =~ Xcode|xcode ]] || [[ "$bundle_id" =~ apple.*xcode ]]; then
+    if [[ "$collect_toolchain_leftovers" == "true" ]] &&
+        { [[ "$app_name" =~ Xcode|xcode ]] || [[ "$bundle_id" =~ apple.*xcode ]]; }; then
         # Skipped: ~/Library/Developer root (Toolchains, Archives, UserData,
         # CoreSimulator/Devices, provisioning profiles). Only sweep
         # regenerable build/device caches.
@@ -880,16 +1181,19 @@ find_app_files() {
     fi
 
     # 4. JetBrains (IDE settings)
-    if [[ "$bundle_id" =~ jetbrains ]] || [[ "$app_name" =~ IntelliJ|PyCharm|WebStorm|GoLand|RubyMine|PhpStorm|CLion|DataGrip|Rider ]]; then
+    if [[ "$collect_toolchain_leftovers" == "true" ]] &&
+        { [[ "$bundle_id" =~ jetbrains ]] || [[ "$app_name" =~ IntelliJ|PyCharm|WebStorm|GoLand|RubyMine|PhpStorm|CLion|DataGrip|Rider ]]; }; then
         for base in ~/Library/Application\ Support/JetBrains ~/Library/Caches/JetBrains ~/Library/Logs/JetBrains; do
             [[ -d "$base" ]] && while IFS= read -r -d '' d; do files_to_clean+=("$d"); done < <(command find "$base" -maxdepth 1 -name "${app_name}*" -print0 2> /dev/null)
         done
     fi
 
     # 5. Unity / Unreal / Godot
-    [[ "$app_name" =~ Unity|unity ]] && [[ -d ~/Library/Unity ]] && files_to_clean+=("$HOME/Library/Unity")
-    [[ "$app_name" =~ Unreal|unreal ]] && [[ -d ~/Library/Application\ Support/Epic ]] && files_to_clean+=("$HOME/Library/Application Support/Epic")
-    [[ "$app_name" =~ Godot|godot ]] && [[ -d ~/Library/Application\ Support/Godot ]] && files_to_clean+=("$HOME/Library/Application Support/Godot")
+    if [[ "$collect_toolchain_leftovers" == "true" ]]; then
+        [[ "$app_name" =~ Unity|unity ]] && [[ -d ~/Library/Unity ]] && files_to_clean+=("$HOME/Library/Unity")
+        [[ "$app_name" =~ Unreal|unreal ]] && [[ -d ~/Library/Application\ Support/Epic ]] && files_to_clean+=("$HOME/Library/Application Support/Epic")
+        [[ "$app_name" =~ Godot|godot ]] && [[ -d ~/Library/Application\ Support/Godot ]] && files_to_clean+=("$HOME/Library/Application Support/Godot")
+    fi
 
     # 6. Tools
     # VS Code stores user data under folder names that don't match the app name
@@ -912,15 +1216,23 @@ find_app_files() {
     # Docker: ~/.docker holds config.json (Docker Hub auth tokens), contexts/
     # (kubeconfig-style endpoints, possibly with credentials), and cli-plugins.
     # Only sweep regenerable cache subtrees, never the whole tree.
-    if [[ "$app_name" =~ Docker ]]; then
+    if [[ "$collect_toolchain_leftovers" == "true" ]] && [[ "$app_name" =~ Docker ]]; then
         for d in ~/.docker/buildx ~/.docker/scan; do
             [[ -d "$d" ]] && files_to_clean+=("$d")
         done
     fi
 
     # 6.1 Maestro Studio
-    if [[ "$bundle_id" == "com.maestro.studio" ]] || [[ "$lowercase_name" =~ maestro[[:space:]]*studio ]]; then
+    if [[ "$collect_toolchain_leftovers" == "true" ]] &&
+        { [[ "$bundle_id" == "com.maestro.studio" ]] || [[ "$lowercase_name" =~ maestro[[:space:]]*studio ]]; }; then
         [[ -d ~/.mobiledev ]] && files_to_clean+=("$HOME/.mobiledev")
+    fi
+
+    # Anki's profile directory (Anki2) contains decks, media, and backups.
+    # Only collect the launcher-managed support files here.
+    if [[ "$collect_toolchain_leftovers" == "true" ]] &&
+        { [[ "$bundle_id" == "net.ankiweb.anki" ]] || [[ "$app_name" == "Anki" ]]; }; then
+        [[ -d "$HOME/Library/Application Support/AnkiProgramFiles" ]] && files_to_clean+=("$HOME/Library/Application Support/AnkiProgramFiles")
     fi
 
     # 7. Raycast
@@ -931,10 +1243,12 @@ find_app_files() {
             "$HOME/Library/Application Scripts"
             "$HOME/Library/Containers"
         )
+        # Raycast v2 ships as a separate app (bundle id com.raycast-x.macos);
+        # exclude its directories from every v1 "*raycast*" sweep (#1202).
         for dir in "${raycast_dirs[@]}"; do
             [[ -d "$dir" ]] && while IFS= read -r -d '' p; do
                 files_to_clean+=("$p")
-            done < <(command find "$dir" -maxdepth 1 -type d -iname "*raycast*" -print0 2> /dev/null)
+            done < <(command find "$dir" -maxdepth 1 -type d -iname "*raycast*" ! -iname "*raycast-x*" -print0 2> /dev/null)
         done
 
         # Explicit Raycast container directories (hardcoded leftovers)
@@ -944,13 +1258,23 @@ find_app_files() {
         # Cache (deeper search)
         [[ -d "$HOME/Library/Caches" ]] && while IFS= read -r -d '' p; do
             files_to_clean+=("$p")
-        done < <(command find "$HOME/Library/Caches" -maxdepth 2 -type d -iname "*raycast*" -print0 2> /dev/null)
+        done < <(command find "$HOME/Library/Caches" -maxdepth 2 -type d -iname "*raycast*" ! -iname "*raycast-x*" -print0 2> /dev/null)
 
         # VSCode extension storage
         local vscode_global="$HOME/Library/Application Support/Code/User/globalStorage"
         [[ -d "$vscode_global" ]] && while IFS= read -r -d '' p; do
             files_to_clean+=("$p")
-        done < <(command find "$vscode_global" -maxdepth 1 -type d -iname "*raycast*" -print0 2> /dev/null)
+        done < <(command find "$vscode_global" -maxdepth 1 -type d -iname "*raycast*" ! -iname "*raycast-x*" -print0 2> /dev/null)
+    fi
+
+    # CrashReporter plists: named AppName_UUID.plist (not subdirectories)
+    local crash_reporter_dir="$HOME/Library/Application Support/CrashReporter"
+    if [[ -d "$crash_reporter_dir" && ${#nospace_name} -ge 3 ]]; then
+        while IFS= read -r -d '' cr; do
+            files_to_clean+=("$cr")
+        done < <(command find "$crash_reporter_dir" -maxdepth 1 -type f \
+            \( -name "${app_name}_*.plist" -o -name "${nospace_name}_*.plist" \) \
+            -print0 2> /dev/null)
     fi
 
     # Output results
@@ -972,13 +1296,20 @@ get_diagnostic_report_paths_for_app() {
     [[ ! -d "$directory" ]] && return 0
 
     if [[ -f "$app_path/Contents/Info.plist" ]]; then
-        exec_name=$(defaults read "$app_path/Contents/Info.plist" CFBundleExecutable 2> /dev/null || echo "")
+        # plutil -extract reads one key; defaults read deserializes the whole
+        # plist and routes through cfprefsd. Measured on this plist: ~4.1ms vs
+        # ~2.3ms per call, and this runs per app inside protection loops.
+        exec_name=$(plutil -extract CFBundleExecutable raw "$app_path/Contents/Info.plist" 2> /dev/null || echo "")
         if [[ -z "$exec_name" ]]; then
             exec_name=$(grep -A1 "CFBundleExecutable" "$app_path/Contents/Info.plist" 2> /dev/null | grep "<string>" | sed -n 's/.*<string>\([^<]*\)<\/string>.*/\1/p' | head -1)
         fi
     fi
     prefix="${exec_name:-$nospace_name}"
     [[ -z "$prefix" || ${#prefix} -lt 3 ]] && return 0
+    local -a prefixes=("$prefix")
+    if [[ "$prefix" != *" Helper" ]]; then
+        prefixes+=("$prefix Helper")
+    fi
 
     local dir_abs
     dir_abs=$(cd "$directory" 2> /dev/null && pwd -P 2> /dev/null) || return 0
@@ -986,19 +1317,24 @@ get_diagnostic_report_paths_for_app() {
         [[ -z "$f" ]] && continue
         local base
         base=$(basename "$f" 2> /dev/null)
-        case "$base" in
-            "$prefix".* | "$prefix"_* | "$prefix"-*) ;;
-            *) continue ;;
-        esac
+        local matched_prefix=false
+        local report_prefix
+        for report_prefix in "${prefixes[@]}"; do
+            case "$base" in
+                "$report_prefix".* | "$report_prefix"_* | "$report_prefix"-*)
+                    matched_prefix=true
+                    break
+                    ;;
+            esac
+        done
+        [[ "$matched_prefix" == "true" ]] || continue
         case "$base" in
             *.ips | *.crash | *.spin | *.diag) ;;
             *) continue ;;
         esac
         printf '%s\n' "$f"
     done < <(
-        find "$dir_abs" -maxdepth 1 -type f \
-            \( -name "${prefix}.*" -o -name "${prefix}_*" -o -name "${prefix}-*" \) \
-            -print0 2> /dev/null || true
+        find "$dir_abs" -maxdepth 1 -type f -print0 2> /dev/null || true
     )
     return 0
 }
@@ -1013,7 +1349,10 @@ find_app_system_files() {
     local nospace_name="${app_name// /}"
     local underscore_name="${app_name// /_}"
     local hyphen_name="${app_name// /-}"
+    local lowercase_name=$(echo "$app_name" | tr '[:upper:]' '[:lower:]')
+    local lowercase_nospace=$(echo "$nospace_name" | tr '[:upper:]' '[:lower:]')
     local lowercase_hyphen=$(echo "$hyphen_name" | tr '[:upper:]' '[:lower:]')
+    local lowercase_underscore=$(echo "$underscore_name" | tr '[:upper:]' '[:lower:]')
 
     # Standard system path patterns
     local -a system_patterns=(
@@ -1022,6 +1361,8 @@ find_app_system_files() {
         "/Library/LaunchAgents/$bundle_id.plist"
         "/Library/LaunchDaemons/$bundle_id.plist"
         "/Library/Preferences/$bundle_id.plist"
+        "/Library/Preferences/$app_name"
+        "/Library/Preferences/$app_name.plist"
         "/Library/Receipts/$bundle_id.bom"
         "/Library/Receipts/$bundle_id.plist"
         "/Library/Frameworks/$app_name.framework"
@@ -1051,6 +1392,12 @@ find_app_system_files() {
             "/Library/Logs/$nospace_name"
             "/Library/Application Support/$underscore_name"
             "/Library/Application Support/$hyphen_name"
+            "/Library/Preferences/$nospace_name"
+            "/Library/Preferences/$nospace_name.plist"
+            "/Library/Preferences/$underscore_name"
+            "/Library/Preferences/$underscore_name.plist"
+            "/Library/Preferences/$hyphen_name"
+            "/Library/Preferences/$hyphen_name.plist"
             "/Library/Caches/$hyphen_name"
             "/Library/Caches/$lowercase_hyphen"
         )
@@ -1064,7 +1411,8 @@ find_app_system_files() {
         case "$p" in
             /Library/Application\ Support | /Library/Application\ Support/ | \
                 /Library/Caches | /Library/Caches/ | \
-                /Library/Logs | /Library/Logs/)
+                /Library/Logs | /Library/Logs/ | \
+                /Library/Preferences | /Library/Preferences/)
                 continue
                 ;;
         esac
@@ -1105,10 +1453,16 @@ find_app_system_files() {
         done
     fi
 
-    # System LaunchAgents/LaunchDaemons by name
-    if [[ ${#app_name} -gt 3 ]]; then
+    # System LaunchAgents/LaunchDaemons by name. These live under /Library and
+    # are removed with sudo, so mirror the (stricter) user-level guard above:
+    # require >=5 chars, skip generic collision words, and skip Apple's own
+    # plists. A short or generic app name must not match unrelated system agents.
+    if [[ ${#app_name} -ge 5 ]] && ! [[ "$app_name" =~ ^(${LAUNCH_AGENT_NAME_COMMON_WORDS})$ ]]; then
         for base in /Library/LaunchAgents /Library/LaunchDaemons; do
             [[ -d "$base" ]] && while IFS= read -r -d '' plist; do
+                local plist_name
+                plist_name=$(basename "$plist")
+                [[ "$plist_name" =~ ^com\.apple\. ]] && continue
                 system_files+=("$plist")
             done < <(command find "$base" -maxdepth 1 \( -name "*$app_name*.plist" \) -print0 2> /dev/null)
         done
@@ -1130,11 +1484,38 @@ find_app_system_files() {
         done < <(command find /private/var/db/receipts -maxdepth 1 -print0 2> /dev/null)
     fi
 
-    # Raycast system-level files
+    # Some vendors name privileged helpers after the product rather than the
+    # bundle id. System remnants are review-only in the CLI, but keep
+    # conservative name guards to avoid noisy system matches: reject common app
+    # words case-insensitively and require each matched variant to be at least
+    # 5 characters, since nospace variants can be shorter than app_name itself.
+    local -a helper_name_variants=()
+    if ! _mole_uninstall_is_common_app_name "$app_name"; then
+        local name_variant
+        for name_variant in "$lowercase_name" "$lowercase_nospace" "$lowercase_hyphen" "$lowercase_underscore"; do
+            if [[ ${#name_variant} -ge 5 ]]; then
+                helper_name_variants+=("$name_variant")
+            fi
+        done
+    fi
+    if [[ ${#helper_name_variants[@]} -gt 0 && -d /Library/PrivilegedHelperTools ]]; then
+        while IFS= read -r -d '' helper; do
+            local helper_name
+            local helper_lower
+            helper_name=$(basename "$helper")
+            [[ "$helper_name" =~ ^com\.apple\. ]] && continue
+            helper_lower=$(_mole_uninstall_lower "$helper_name")
+            if _mole_uninstall_name_variant_matches "$helper_lower" "${helper_name_variants[@]}"; then
+                system_files+=("$helper")
+            fi
+        done < <(command find /Library/PrivilegedHelperTools -maxdepth 1 -print0 2> /dev/null)
+    fi
+
+    # Raycast system-level files (v2 dirs excluded, see find_app_files)
     if [[ "$bundle_id" == "com.raycast.macos" ]]; then
         [[ -d "/Library/Application Support" ]] && while IFS= read -r -d '' p; do
             system_files+=("$p")
-        done < <(command find "/Library/Application Support" -maxdepth 1 -type d -iname "*raycast*" -print0 2> /dev/null)
+        done < <(command find "/Library/Application Support" -maxdepth 1 -type d -iname "*raycast*" ! -iname "*raycast-x*" -print0 2> /dev/null)
     fi
 
     local receipt_files=""
@@ -1212,31 +1593,7 @@ find_app_receipt_files() {
                 # Normalize path (remove duplicate slashes)
                 clean_path=$(tr -s "/" <<< "$clean_path")
 
-                # ------------------------------------------------------------------------
-                # Safety check: restrict removal to trusted paths
-                # ------------------------------------------------------------------------
-                local is_safe=false
-
-                # Whitelisted prefixes (exclude /Users, /usr, /opt)
-                case "$clean_path" in
-                    /Applications/*) is_safe=true ;;
-                    /Library/Application\ Support/*) is_safe=true ;;
-                    /Library/Caches/*) is_safe=true ;;
-                    /Library/Logs/*) is_safe=true ;;
-                    /Library/Preferences/*) is_safe=true ;;
-                    /Library/LaunchAgents/*) is_safe=true ;;
-                    /Library/LaunchDaemons/*) is_safe=true ;;
-                    /Library/PrivilegedHelperTools/*) is_safe=true ;;
-                    /Library/Extensions/*) is_safe=false ;;
-                    *) is_safe=false ;;
-                esac
-
-                # Hard blocks
-                case "$clean_path" in
-                    /System/* | /usr/bin/* | /usr/lib/* | /bin/* | /sbin/* | /private/*) is_safe=false ;;
-                esac
-
-                if [[ "$is_safe" == "true" && -e "$clean_path" ]]; then
+                if receipt_payload_path_is_allowlisted "$clean_path" "$bundle_id" && [[ -e "$clean_path" ]]; then
                     # Skip top-level directories
                     if [[ "$clean_path" == "/Applications" || "$clean_path" == "/Library" ]]; then
                         continue
@@ -1257,6 +1614,33 @@ find_app_receipt_files() {
     if [[ ${#receipt_files[@]} -gt 0 ]]; then
         printf '%s\n' "${receipt_files[@]}"
     fi
+}
+
+receipt_payload_path_is_allowlisted() {
+    local clean_path="$1"
+    local bundle_id="$2"
+    local base
+    base=$(basename "$clean_path")
+
+    [[ -n "$clean_path" && -n "$bundle_id" ]] || return 1
+    mole_is_reverse_dns_bundle_id "$bundle_id" || return 1
+
+    case "$clean_path" in
+        /Library/LaunchAgents/*.plist | /Library/LaunchDaemons/*.plist)
+            [[ "$base" == "$bundle_id.plist" || "$base" == "$bundle_id."*.plist ]]
+            return
+            ;;
+        /Library/PrivilegedHelperTools/*)
+            mole_name_starts_with_bundle_id_boundary "$base" "$bundle_id"
+            return
+            ;;
+        /private/var/db/receipts/*)
+            [[ "$base" == "$bundle_id.bom" || "$base" == "$bundle_id.plist" || "$base" == "$bundle_id."* ]]
+            return
+            ;;
+    esac
+
+    return 1
 }
 
 # Terminate a running application during uninstall.
@@ -1281,12 +1665,28 @@ force_kill_app() {
     local exec_name=""
     local bundle_id=""
     if [[ -n "$app_path" && -e "$app_path/Contents/Info.plist" ]]; then
-        exec_name=$(defaults read "$app_path/Contents/Info.plist" CFBundleExecutable 2> /dev/null || echo "")
-        bundle_id=$(defaults read "$app_path/Contents/Info.plist" CFBundleIdentifier 2> /dev/null || echo "")
+        # Targeted key reads (see the CFBundleExecutable note above): defaults
+        # read parses the entire plist for one value.
+        exec_name=$(plutil -extract CFBundleExecutable raw "$app_path/Contents/Info.plist" 2> /dev/null || echo "")
+        bundle_id=$(plutil -extract CFBundleIdentifier raw "$app_path/Contents/Info.plist" 2> /dev/null || echo "")
     fi
 
     # Use executable name for precise matching, fallback to app name
     local match_pattern="${exec_name:-$app_name}"
+
+    # Defensive guard: even though should_protect_from_uninstall (bin/uninstall.sh)
+    # filters protected bundle IDs out of the selection list, match_pattern comes
+    # from CFBundleExecutable (a string a third-party .app can set freely). Refuse
+    # to AppleScript-Quit or pkill any pattern that exactly matches a critical
+    # system process name. force_kill_app is a public function; future callers
+    # must not be able to weaponise a spoofed executable name to take down Finder,
+    # Dock, loginwindow, etc.
+    case "$match_pattern" in
+        Finder | Dock | loginwindow | WindowServer | SystemUIServer | launchd | coreaudiod | NotificationCenter | ControlCenter | Spotlight)
+            debug_log "force_kill_app: refusing to operate on system process name '$match_pattern'"
+            return 1
+            ;;
+    esac
 
     # Check if process is running using exact match only
     if ! pgrep -x "$match_pattern" > /dev/null 2>&1; then
@@ -1311,7 +1711,7 @@ force_kill_app() {
             escaped_name="${escaped_name//\"/\\\"}"
             quit_target="\"$escaped_name\""
         fi
-        run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" osascript -e "tell application $quit_target to quit" > /dev/null 2>&1 &
+        run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" osascript -e "tell application $quit_target to quit" > /dev/null 2>&1 < /dev/null &
         local quit_pid=$!
         # Poll briefly so the kill ladder skips when the app exits cleanly.
         local quit_wait=20

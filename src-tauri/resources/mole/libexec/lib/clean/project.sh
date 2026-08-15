@@ -306,6 +306,26 @@ is_safe_project_artifact() {
     return 0
 }
 
+# Revalidate a selected artifact against the configured scan roots immediately
+# before deletion. Purge supports explicit roots outside HOME (for example
+# /var/www), so HOME containment is neither sufficient nor correct here.
+is_safe_configured_purge_artifact() {
+    local path="$1"
+
+    [[ -n "$path" && "$path" != "/" && "$path" != "$HOME" ]] || return 1
+    [[ ${#PURGE_SEARCH_PATHS[@]} -gt 0 ]] || return 1
+
+    local search_path
+    for search_path in "${PURGE_SEARCH_PATHS[@]}"; do
+        [[ -n "$search_path" ]] || continue
+        if is_safe_project_artifact "$path" "$search_path"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 # Detect if directory is a Rails project root
 is_rails_project_root() {
     local dir="$1"
@@ -577,28 +597,104 @@ filter_protected_artifacts() {
         fi
     done
 }
-# Args: $1 - path
-# Check if a path was modified recently (safety check).
-is_recently_modified() {
+# Args: $1 - path, $2 - optional current epoch
+# Classify artifact activity as recent, old, or uncertain. Only a complete
+# bounded scan may return old; timeouts and read failures fail closed.
+classify_purge_activity() {
     local path="$1"
     local current_time="${2:-}"
     local age_days=$MIN_AGE_DAYS
+    _PURGE_ACTIVITY_STATE="uncertain"
+
     if [[ ! -e "$path" ]]; then
-        return 1
+        _PURGE_ACTIVITY_STATE="old"
+        return 0
     fi
+
     local mod_time
-    mod_time=$(get_file_mtime "$path")
+    mod_time=$(get_file_mtime "$path" 2> /dev/null || true)
+    if [[ ! "$mod_time" =~ ^[0-9]+$ ]]; then
+        debug_log "Unable to read purge activity timestamp: $path"
+        return 0
+    fi
     if [[ -z "$current_time" || ! "$current_time" =~ ^[0-9]+$ ]]; then
         current_time=$(get_epoch_seconds)
     fi
+
     local age_seconds=$((current_time - mod_time))
     local age_in_days=$((age_seconds / 86400))
     if [[ $age_in_days -lt $age_days ]]; then
-        return 0 # Recently modified
+        _PURGE_ACTIVITY_STATE="recent"
+        return 0
+    fi
+
+    if [[ ! -d "$path" ]]; then
+        _PURGE_ACTIVITY_STATE="old"
+        return 0
+    fi
+
+    local probe_timeout="${MO_PURGE_ACTIVITY_TIMEOUT_SEC:-$MOLE_TIMEOUT_MEDIUM_PROBE_SEC}"
+    if [[ ! "$probe_timeout" =~ ^[1-9][0-9]*$ ]]; then
+        probe_timeout="$MOLE_TIMEOUT_MEDIUM_PROBE_SEC"
+    fi
+
+    # clean_project_artifacts sets one deadline for the whole classification
+    # pass. A standalone caller still gets the per-item ceiling above.
+    if [[ "${_PURGE_ACTIVITY_DEADLINE_EPOCH:-}" =~ ^[0-9]+$ ]]; then
+        local now_epoch remaining
+        now_epoch=$(get_epoch_seconds)
+        remaining=$((_PURGE_ACTIVITY_DEADLINE_EPOCH - now_epoch))
+        if [[ $remaining -le 0 ]]; then
+            debug_log "Purge activity scan budget exhausted before: $path"
+            return 0
+        fi
+        if [[ $probe_timeout -gt $remaining ]]; then
+            probe_timeout=$remaining
+        fi
+    fi
+
+    local recent_file=""
+    local probe_status=0
+    recent_file=$(run_with_timeout "$probe_timeout" \
+        find "$path" -type f -mtime "-$age_days" -print -quit 2> /dev/null) || probe_status=$?
+
+    if [[ $probe_status -ne 0 ]]; then
+        debug_log "Purge activity scan failed closed (exit $probe_status): $path"
+        return 0
+    fi
+    if [[ -n "$recent_file" ]]; then
+        _PURGE_ACTIVITY_STATE="recent"
     else
-        return 1 # Old enough to clean
+        _PURGE_ACTIVITY_STATE="old"
     fi
 }
+
+# Args: $1 - path, $2 - optional current epoch
+# Check whether a path must be protected from default purge selection.
+is_recently_modified() {
+    classify_purge_activity "$@"
+    [[ "$_PURGE_ACTIVITY_STATE" != "old" ]]
+}
+
+# An artifact that was old when the menu opened can become active before the
+# user confirms deletion. Recheck only those default-safe rows; a user who
+# explicitly selected an already-recent row has already overridden that hint.
+purge_target_activity_still_safe() {
+    local path="$1"
+    local was_recent="${2:-true}"
+    [[ "$was_recent" == "true" ]] && return 0
+
+    # Do not inherit the menu pass's expired shared deadline.
+    local _PURGE_ACTIVITY_DEADLINE_EPOCH=""
+    local _PURGE_ACTIVITY_STATE="uncertain"
+    if is_recently_modified "$path" "$(get_epoch_seconds)"; then
+        return 1
+    fi
+    # Preserve the established test/caller seam where an override returning 1
+    # means old without setting the newer classification detail.
+    [[ "$_PURGE_ACTIVITY_STATE" == "old" || "$_PURGE_ACTIVITY_STATE" == "uncertain" ]]
+}
+
 # Args: $1 - path
 # Get directory size in KB.
 get_dir_size_kb() {
@@ -826,7 +922,7 @@ select_purge_categories() {
             printf "%s\n" "$clear_line"
         fi
 
-        # Adaptive footer hints — mirrors menu_paginated.sh pattern
+        # Adaptive footer hints, mirrors menu_paginated.sh pattern
         local _term_w
         _term_w=$(tput cols 2> /dev/null || echo 80)
         [[ "$_term_w" =~ ^[0-9]+$ ]] || _term_w=80
@@ -967,11 +1063,13 @@ confirm_purge_cleanup() {
     local item_count="${1:-0}"
     local total_size_kb="${2:-0}"
     local unknown_count="${3:-0}"
-    local -a selected_paths=("${@:4}")
+    local cloud_count="${4:-0}"
+    local -a selected_paths=("${@:5}")
 
     [[ "$item_count" =~ ^[0-9]+$ ]] || item_count=0
     [[ "$total_size_kb" =~ ^[0-9]+$ ]] || total_size_kb=0
     [[ "$unknown_count" =~ ^[0-9]+$ ]] || unknown_count=0
+    [[ "$cloud_count" =~ ^[0-9]+$ ]] || cloud_count=0
 
     local item_text="artifact"
     [[ $item_count -ne 1 ]] && item_text="artifacts"
@@ -993,6 +1091,12 @@ confirm_purge_cleanup() {
         for selected_path in "${selected_paths[@]}"; do
             echo "  $selected_path"
         done
+    fi
+
+    if [[ $cloud_count -gt 0 ]]; then
+        echo ""
+        echo -e "${YELLOW}${ICON_WARNING}${NC} Cloud-synced artifacts may also be removed from other devices."
+        echo -e "${GRAY}Use 'mo purge --paths' to exclude cloud storage roots.${NC}"
     fi
 
     echo -ne "${PURPLE}${ICON_ARROW}${NC} Remove ${item_count} ${item_text}, ${size_display}${unknown_hint}  ${GREEN}Enter${NC} confirm, ${GRAY}ESC${NC} cancel: "
@@ -1018,6 +1122,7 @@ clean_project_artifacts() {
     local -a all_found_items=()
     local -a safe_to_clean=()
     local -a safe_recent_flags=()
+    local -a safe_activity_states=()
     local previous_int_trap=""
     local previous_term_trap=""
     local trap_installed_by_this_call=false
@@ -1057,7 +1162,7 @@ clean_project_artifacts() {
             scan_output=$(mktemp)
             scan_temps+=("$scan_output")
             # Launch scan in background for true parallelism
-            scan_purge_targets "$path" "$scan_output" &
+            scan_purge_targets "$path" "$scan_output" < /dev/null &
             local scan_pid=$!
             scan_pids+=("$scan_pid")
         fi
@@ -1106,17 +1211,38 @@ clean_project_artifacts() {
         return 2 # Special code: nothing to clean
     fi
     # Mark recently modified items (for default selection state)
+    if [[ -t 1 ]]; then
+        start_inline_spinner "Checking recent activity..."
+    fi
     local _now_epoch
     _now_epoch=$(get_epoch_seconds)
+    local _activity_total_timeout="${MO_PURGE_ACTIVITY_TOTAL_TIMEOUT_SEC:-$MOLE_TIMEOUT_HINT_SCAN_SEC}"
+    if [[ ! "$_activity_total_timeout" =~ ^[1-9][0-9]*$ ]]; then
+        _activity_total_timeout="$MOLE_TIMEOUT_HINT_SCAN_SEC"
+    fi
+    local _PURGE_ACTIVITY_DEADLINE_EPOCH=$((_now_epoch + _activity_total_timeout))
     for item in "${all_found_items[@]}"; do
         local is_recent=false
+        _PURGE_ACTIVITY_STATE="uncertain"
         if is_recently_modified "$item" "$_now_epoch"; then
             is_recent=true
+        fi
+        local activity_state="${_PURGE_ACTIVITY_STATE:-uncertain}"
+        if [[ "$activity_state" != "recent" && "$activity_state" != "old" && "$activity_state" != "uncertain" ]]; then
+            activity_state="uncertain"
+        elif [[ "$activity_state" == "uncertain" && "$is_recent" == "false" ]]; then
+            # Preserve the long-standing is_recently_modified test/mocking seam:
+            # a legacy override returning 1 means definitely old.
+            activity_state="old"
         fi
         # Add all items to safe_to_clean, let user choose
         safe_to_clean+=("$item")
         safe_recent_flags+=("$is_recent")
+        safe_activity_states+=("$activity_state")
     done
+    if [[ -t 1 ]]; then
+        stop_inline_spinner
+    fi
     # Build menu options - one per artifact
     if [[ -t 1 ]]; then
         start_inline_spinner "Calculating sizes..."
@@ -1164,7 +1290,7 @@ clean_project_artifacts() {
         _stmp=$(mktemp)
         register_temp_file "$_stmp"
         _size_tmpfiles+=("$_stmp")
-        (get_dir_size_kb "$_sz_item" > "$_stmp" 2> /dev/null) &
+        (get_dir_size_kb "$_sz_item" > "$_stmp" 2> /dev/null) < /dev/null &
         _size_pids+=($!)
 
         if [[ ${#_size_pids[@]} -ge $_max_size_jobs ]]; then
@@ -1181,6 +1307,7 @@ clean_project_artifacts() {
     local -a item_size_unknown_flags=()
     local -a item_recent_flags=()
     local -a item_age_labels=()
+    local -a item_cloud_flags=()
     # Find the best project root for an artifact once; callers decide how to
     # display it. Monorepo indicators win over plain project indicators.
     find_purge_project_root_for_artifact() {
@@ -1344,6 +1471,12 @@ clean_project_artifacts() {
         local max_path_width="${5:-}"
         local artifact_col="${6:-12}"
         local available_width
+        local path_prefix=""
+
+        if [[ "$project_path" == "[cloud] "* ]]; then
+            path_prefix="[cloud] "
+            project_path="${project_path#"[cloud] "}"
+        fi
 
         if [[ -n "$max_path_width" ]]; then
             available_width="$max_path_width"
@@ -1366,7 +1499,9 @@ clean_project_artifacts() {
 
         # Truncate project path if needed
         local truncated_path
-        truncated_path=$(compact_purge_menu_path "$project_path" "$available_width")
+        local compact_width=$((available_width - ${#path_prefix}))
+        [[ $compact_width -lt 4 ]] && compact_width=4
+        truncated_path="${path_prefix}$(compact_purge_menu_path "$project_path" "$compact_width")"
         local current_width
         current_width=$(get_display_width "$truncated_path")
 
@@ -1434,20 +1569,37 @@ clean_project_artifacts() {
             continue
         fi
 
-        local is_recent="${safe_recent_flags[$item_index]:-false}"
-        raw_project_paths+=("$project_path")
+        local is_recent="${safe_recent_flags[$item_index]:-true}"
+        local activity_state="${safe_activity_states[$item_index]:-uncertain}"
+        local is_cloud=false
+        if mole_purge_is_cloud_synced_path "$item"; then
+            is_cloud=true
+        fi
+        local display_project_path="$project_path"
+        local display_item_path
+        display_item_path=$(format_purge_target_path "$item")
+        if [[ "$is_cloud" == "true" ]]; then
+            display_project_path="[cloud] $display_project_path"
+            display_item_path="[cloud] $display_item_path"
+        fi
+        raw_project_paths+=("$display_project_path")
         raw_artifact_types+=("$artifact_type")
         item_paths+=("$item")
-        item_display_paths+=("$(format_purge_target_path "$item")")
+        item_display_paths+=("$display_item_path")
         item_sizes+=("$size_kb")
         item_size_unknown_flags+=("$size_unknown")
         item_recent_flags+=("$is_recent")
-        # Build human-readable age label (bash 3.2 compatible — no assoc arrays).
+        item_cloud_flags+=("$is_cloud")
+        # Build human-readable age label (bash 3.2 compatible, no assoc arrays).
         local _mod_time _age_secs _age_d
         _mod_time=$(get_file_mtime "$item" 2> /dev/null || echo "0")
         _age_secs=$((_now_epoch - _mod_time))
         _age_d=$((_age_secs / 86400))
-        if [[ $_age_d -lt 1 ]]; then
+        if [[ "$activity_state" == "uncertain" ]]; then
+            item_age_labels+=("unknown")
+        elif [[ "$activity_state" == "recent" && $_age_d -ge $MIN_AGE_DAYS ]]; then
+            item_age_labels+=("<${MIN_AGE_DAYS}d")
+        elif [[ $_age_d -lt 1 ]]; then
             item_age_labels+=("<1d")
         elif [[ $_age_d -lt 30 ]]; then
             item_age_labels+=("${_age_d}d")
@@ -1534,6 +1686,7 @@ clean_project_artifacts() {
         local -a sorted_item_recent_flags=()
         local -a sorted_item_display_paths=()
         local -a sorted_item_age_labels=()
+        local -a sorted_item_cloud_flags=()
 
         for idx in "${sorted_indices[@]}"; do
             sorted_menu_options+=("${menu_options[idx]}")
@@ -1543,6 +1696,7 @@ clean_project_artifacts() {
             sorted_item_recent_flags+=("${item_recent_flags[idx]}")
             sorted_item_display_paths+=("${item_display_paths[idx]}")
             sorted_item_age_labels+=("${item_age_labels[idx]}")
+            sorted_item_cloud_flags+=("${item_cloud_flags[idx]}")
         done
 
         # Replace original arrays with sorted versions
@@ -1553,6 +1707,7 @@ clean_project_artifacts() {
         item_recent_flags=("${sorted_item_recent_flags[@]}")
         item_display_paths=("${sorted_item_display_paths[@]}")
         item_age_labels=("${sorted_item_age_labels[@]}")
+        item_cloud_flags=("${sorted_item_cloud_flags[@]}")
     fi
     if [[ -t 1 ]]; then
         stop_inline_spinner
@@ -1589,12 +1744,23 @@ clean_project_artifacts() {
         fi
     else
         # Non-interactive: select all non-recent items
+        local skipped_cloud_count=0
         for ((i = 0; i < ${#menu_options[@]}; i++)); do
+            if [[ "${item_cloud_flags[i]:-false}" == "true" && "${MOLE_DRY_RUN:-0}" != "1" ]]; then
+                skipped_cloud_count=$((skipped_cloud_count + 1))
+                continue
+            fi
             if [[ ${item_recent_flags[i]} != "true" ]]; then
                 [[ -n "$PURGE_SELECTION_RESULT" ]] && PURGE_SELECTION_RESULT+=","
                 PURGE_SELECTION_RESULT+="$i"
             fi
         done
+        if [[ $skipped_cloud_count -gt 0 ]]; then
+            local skipped_cloud_text="artifact"
+            [[ $skipped_cloud_count -ne 1 ]] && skipped_cloud_text="artifacts"
+            echo ""
+            echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped ${skipped_cloud_count} cloud-synced ${skipped_cloud_text} in non-interactive mode (confirmation required)"
+        fi
     fi
     if [[ -z "$PURGE_SELECTION_RESULT" ]]; then
         echo ""
@@ -1607,6 +1773,7 @@ clean_project_artifacts() {
     IFS=',' read -r -a selected_indices <<< "$PURGE_SELECTION_RESULT"
     local selected_total_kb=0
     local selected_unknown_count=0
+    local selected_cloud_count=0
     local -a selected_display_paths=()
     for idx in "${selected_indices[@]}"; do
         local selected_size_kb="${item_sizes[idx]:-0}"
@@ -1615,11 +1782,14 @@ clean_project_artifacts() {
         if [[ "${item_size_unknown_flags[idx]:-false}" == "true" ]]; then
             selected_unknown_count=$((selected_unknown_count + 1))
         fi
+        if [[ "${item_cloud_flags[idx]:-false}" == "true" ]]; then
+            selected_cloud_count=$((selected_cloud_count + 1))
+        fi
         selected_display_paths+=("${item_display_paths[idx]}")
     done
 
     if [[ -t 0 ]]; then
-        if ! confirm_purge_cleanup "${#selected_indices[@]}" "$selected_total_kb" "$selected_unknown_count" "${selected_display_paths[@]}"; then
+        if ! confirm_purge_cleanup "${#selected_indices[@]}" "$selected_total_kb" "$selected_unknown_count" "$selected_cloud_count" "${selected_display_paths[@]}"; then
             echo -e "${GRAY}Purge cancelled${NC}"
             printf '\n'
             PURGE_CATEGORY_FULL_PATHS_ARRAY=()
@@ -1636,8 +1806,7 @@ clean_project_artifacts() {
     local dry_run_mode="${MOLE_DRY_RUN:-0}"
     for idx in "${selected_indices[@]}"; do
         local item_path="${item_paths[idx]}"
-        local display_item_path
-        display_item_path=$(format_purge_target_path "$item_path")
+        local display_item_path="${item_display_paths[idx]}"
         local size_kb="${item_sizes[idx]}"
         local size_unknown="${item_size_unknown_flags[idx]:-false}"
         local size_human
@@ -1647,7 +1816,12 @@ clean_project_artifacts() {
             size_human=$(bytes_to_human "$((size_kb * 1024))")
         fi
         # Safety checks
-        if [[ -z "$item_path" || "$item_path" == "/" || "$item_path" == "$HOME" || "$item_path" != "$HOME/"* ]]; then
+        if ! is_safe_configured_purge_artifact "$item_path"; then
+            debug_log "Skipping purge target outside configured safe roots: ${item_path:-<empty>}"
+            continue
+        fi
+        if ! purge_target_activity_still_safe "$item_path" "${item_recent_flags[idx]:-true}"; then
+            echo -e "${YELLOW}${ICON_WARNING}${NC} Skipped $display_item_path (activity changed after review)"
             continue
         fi
         if [[ -t 1 ]]; then
@@ -1667,12 +1841,12 @@ clean_project_artifacts() {
         fi
         if [[ -t 1 ]]; then
             stop_inline_spinner
-            if [[ "$removal_recorded" == "true" ]]; then
-                if [[ "$dry_run_mode" == "1" ]]; then
-                    echo -e "${GREEN}${ICON_SUCCESS}${NC} [DRY RUN] $display_item_path${NC}, ${GREEN}$size_human${NC}"
-                else
-                    echo -e "${GREEN}${ICON_SUCCESS}${NC} $display_item_path${NC}, ${GREEN}$size_human${NC}"
-                fi
+        fi
+        if [[ "$removal_recorded" == "true" ]]; then
+            if [[ "$dry_run_mode" == "1" ]]; then
+                echo -e "${GREEN}${ICON_SUCCESS}${NC} [DRY RUN] $display_item_path${NC}, ${GREEN}$size_human${NC}"
+            elif [[ -t 1 ]]; then
+                echo -e "${GREEN}${ICON_SUCCESS}${NC} $display_item_path${NC}, ${GREEN}$size_human${NC}"
             fi
         fi
     done

@@ -1,11 +1,11 @@
 [package]
 name = "burrow"
-version = "0.2.3"
+version = "0.2.4"
 publish = false
 description = "macOS cleaning & maintenance toolbox"
 authors = ["karimachi"]
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-only"
 repository = "https://github.com/Luffytnes/Burrow"
 homepage = "https://github.com/Luffytnes/Burrow"
 
@@ -32,3 +32,4 @@ sha2 = "0.11"
 libc = "0.2"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
+trash = { version = "5.2.6", default-features = false }

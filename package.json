@@ -1,9 +1,9 @@
 {
   "name": "burrow",
   "private": true,
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "macOS cleaning & maintenance toolbox built with Tauri",
-  "license": "MIT",
+  "license": "GPL-3.0-only",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Luffytnes/Burrow.git"

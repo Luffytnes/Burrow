@@ -888,11 +888,11 @@ function NettoyerTab({ onToast }: { onToast: (ok: boolean, msg: string) => void 
 
   const handleRun = async () => {
     mo.reset();
-    await mo.runCmd("run_clean_selection", {
+    const code = await mo.runCmd("run_clean_selection", {
       categories: Array.from(selected),
       installerPaths: Array.from(selectedInst),
     });
-    const ok = mo.status !== "error";
+    const ok = code === 0;
     onToast(ok, ok ? "Nettoyage terminé avec succès" : (mo.error ?? "Erreur lors du nettoyage"));
     setSelected(new Set());
     setSelectedInst(new Set());
@@ -2178,13 +2178,14 @@ function BinairesTab({ onToast }: { onToast: (ok: boolean, msg: string) => void 
     setThinningPath(entry.path);
     setConfirmPath(null);
     try {
-      const result = await invoke<{ bytes_saved: number; binary_count: number }>(
-        "thin_universal_app",
-        { name: entry.name, appPath: entry.path }
-      );
+      const result = await invoke<{
+        bytes_saved: number;
+        binary_count: number;
+        locally_resigned: boolean;
+      }>("thin_universal_app", { name: entry.name, appPath: entry.path });
       onToast(
         true,
-        `${entry.name} allégé : ${fmtBytes(result.bytes_saved)} récupérés · original dans la Corbeille`
+        `${entry.name} allégé : ${fmtBytes(result.bytes_saved)} récupérés · original dans la Corbeille${result.locally_resigned ? " · copie resignée localement" : ""}`
       );
       await load();
     } catch (error) {
@@ -2245,9 +2246,11 @@ function BinairesTab({ onToast }: { onToast: (ok: boolean, msg: string) => void 
           />
           <div className="text-[11px] leading-relaxed" style={{ color: "var(--text-3)" }}>
             <strong style={{ color: "var(--warning)" }}>Opération récupérable</strong> — Burrow
-            travaille sur une copie, préserve la signature de l'éditeur et vérifie son intégrité
-            avant l'installation. Si la signature ne peut pas être conservée, l'opération est
-            refusée et l'application originale reste intacte.
+            travaille sur une copie et conserve l'application originale dans la Corbeille. Lorsque
+            l'enveloppe signée change, la copie allégée est resignée localement puis entièrement
+            vérifiée. Certaines autorisations ou mises à jour peuvent alors être redemandées ;
+            restaurez l'original si l'application ne fonctionne plus comme prévu. Les applications
+            App Store ou provisionnées sont exclues.
           </div>
         </div>
       </div>
@@ -2301,7 +2304,7 @@ function BinairesTab({ onToast }: { onToast: (ok: boolean, msg: string) => void 
                     className="text-[10px] px-2 py-1 rounded-lg font-semibold"
                     style={{ background: "var(--warning)", color: "#1c1917" }}
                   >
-                    Confirmer
+                    Amincir la copie
                   </button>
                   <button
                     onClick={() => setConfirmPath(null)}

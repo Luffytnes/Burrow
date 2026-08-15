@@ -94,6 +94,7 @@ _detect_cask_via_resolved_path() {
 # Only succeeds if exactly one cask matches (avoids wrong uninstall)
 _detect_cask_via_caskroom_search() {
     local app_bundle_name="$1"
+    local app_path="${2:-}"
     [[ -z "$app_bundle_name" ]] && return 1
 
     local -a tokens=()
@@ -118,6 +119,14 @@ _detect_cask_via_caskroom_search() {
     # Only succeed if exactly one unique token found and it's installed
     if ((${#uniq[@]} == 1)) && [[ -n "${uniq[0]}" ]]; then
         HOMEBREW_NO_ENV_HINTS=1 brew list --cask 2> /dev/null | grep -qxF "${uniq[0]}" || return 1
+        local info_output
+        info_output=$(HOMEBREW_NO_ENV_HINTS=1 brew info --cask "${uniq[0]}" 2> /dev/null) || return 1
+        if [[ -n "$app_path" ]] &&
+            ! grep -qF "$app_path" <<< "$info_output" &&
+            ! grep -qF "/Applications/$app_bundle_name" <<< "$info_output" &&
+            ! grep -qF "$app_bundle_name" <<< "$info_output"; then
+            return 1
+        fi
         echo "${uniq[0]}"
         return 0
     fi
@@ -145,8 +154,13 @@ _detect_cask_via_brew_list() {
     local cask_name
     cask_name=$(HOMEBREW_NO_ENV_HINTS=1 brew list --cask 2> /dev/null | grep -Fix "$app_name_lower") || return 1
 
-    # Verify this cask actually owns this app path
-    HOMEBREW_NO_ENV_HINTS=1 brew info --cask "$cask_name" 2> /dev/null | grep -qF "$app_path" || return 1
+    # Verify this cask actually owns this app path or app bundle.
+    local info_output
+    info_output=$(HOMEBREW_NO_ENV_HINTS=1 brew info --cask "$cask_name" 2> /dev/null) || return 1
+    grep -qF "$app_path" <<< "$info_output" ||
+        grep -qF "/Applications/$app_bundle_name" <<< "$info_output" ||
+        grep -qF "$app_bundle_name" <<< "$info_output" ||
+        return 1
     echo "$cask_name"
 }
 
@@ -170,7 +184,7 @@ get_brew_cask_name() {
 
     # Try each detection method in order (fast to slow)
     _detect_cask_via_resolved_path "$app_path" && return 0
-    _detect_cask_via_caskroom_search "$app_bundle_name" && return 0
+    _detect_cask_via_caskroom_search "$app_bundle_name" "$app_path" && return 0
     _detect_cask_via_symlink_check "$app_path" && return 0
     _detect_cask_via_brew_list "$app_path" "$app_bundle_name" && return 0
 
@@ -178,21 +192,31 @@ get_brew_cask_name() {
 }
 
 # Uninstall a Homebrew cask and verify removal
-# Args: $1 - cask_name, $2 - app_path (optional, for verification)
+# Args: $1 - cask_name, $2 - app_path (optional, for verification),
+#       $3 - zap mode: "nozap" runs a plain uninstall without --zap. Used when
+#            another install shares the cask's bundle id: zap stanzas delete
+#            bundle-id-keyed prefs/caches that the surviving install still
+#            uses (iterm2 and iterm2-beta both zap com.googlecode.iterm2).
 # Returns: 0 on success, 1 on failure
 brew_uninstall_cask() {
     local cask_name="$1"
     local app_path="${2:-}"
+    local zap_mode="${3:-zap}"
+
+    local -a uninstall_args=(uninstall --cask)
+    if [[ "$zap_mode" != "nozap" ]]; then
+        uninstall_args+=(--zap)
+    fi
 
     if [[ "${MOLE_DRY_RUN:-0}" == "1" ]]; then
-        debug_log "[DRY RUN] Would brew uninstall --cask --zap $cask_name"
+        debug_log "[DRY RUN] Would brew ${uninstall_args[*]} $cask_name"
         return 0
     fi
 
     is_homebrew_available || return 1
     [[ -z "$cask_name" ]] && return 1
 
-    debug_log "Attempting brew uninstall --cask --zap $cask_name"
+    debug_log "Attempting brew ${uninstall_args[*]} $cask_name"
 
     local uninstall_ok=false
     local brew_exit=0
@@ -213,13 +237,13 @@ brew_uninstall_cask() {
     if [[ -n "${SUDO_USER:-}" ]]; then
         if run_with_timeout "$timeout" sudo -u "$SUDO_USER" env \
             HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_AUTO_UPDATE=1 NONINTERACTIVE=1 \
-            brew uninstall --cask --zap "$cask_name" 2>&1; then
+            brew "${uninstall_args[@]}" "$cask_name" 2>&1; then
             uninstall_ok=true
         else
             brew_exit=$?
         fi
     elif HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_AUTO_UPDATE=1 NONINTERACTIVE=1 \
-        run_with_timeout "$timeout" brew uninstall --cask --zap "$cask_name" 2>&1; then
+        run_with_timeout "$timeout" brew "${uninstall_args[@]}" "$cask_name" 2>&1; then
         uninstall_ok=true
     else
         brew_exit=$?

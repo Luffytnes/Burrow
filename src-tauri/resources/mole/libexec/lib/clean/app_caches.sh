@@ -2,7 +2,7 @@
 # User GUI Applications Cleanup Module (desktop apps, media, utilities).
 set -euo pipefail
 # Xcode DerivedData cleanup with project count and size reporting.
-# Fully regenerated on next build — safe to remove.
+# Fully regenerated on next build, safe to remove.
 clean_xcode_derived_data() {
     local dd_dir="$HOME/Library/Developer/Xcode/DerivedData"
 
@@ -10,7 +10,8 @@ clean_xcode_derived_data() {
 
     # Skip while Xcode is running to avoid build failures.
     if pgrep -x "Xcode" > /dev/null 2>&1; then
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Xcode is running, skipping DerivedData cleanup"
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Xcode DerivedData · skipped (Xcode running)"
+        note_activity
         return 0
     fi
 
@@ -25,7 +26,7 @@ clean_xcode_derived_data() {
 
     # Calculate total size.
     local size_kb=0
-    size_kb=$(du -skP "$dd_dir" 2> /dev/null | awk '{print $1}') || size_kb=0
+    size_kb=$(run_with_timeout "$MOLE_TIMEOUT_DISK_VERIFY_SEC" du -skP "$dd_dir" 2> /dev/null | awk '{print $1}') || size_kb=0
     local size_human
     size_human=$(bytes_to_human "$((size_kb * 1024))")
 
@@ -72,50 +73,9 @@ clean_xcode_tools() {
         safe_clean ~/Library/Developer/CoreSimulator/Caches/* "Simulator cache"
         safe_clean ~/Library/Developer/CoreSimulator/Devices/*/data/tmp/* "Simulator temp files"
         safe_clean ~/Library/Logs/CoreSimulator/* "CoreSimulator logs"
-        # Remove unavailable simulator devices (not supported by the current Xcode SDK).
-        # run_with_timeout guards against xcrun blocking when only CLT is installed
-        # (can launch an invisible install dialog or wait on CoreSimulator XPC indefinitely).
-        if command -v xcrun > /dev/null 2>&1; then
-            local unavail_count
-            local unavailable_devices_output=""
-
-            # Tests may mock xcrun as a shell function. Timeout wrappers execute
-            # in a separate process and cannot reliably invoke exported functions.
-            # Prefer direct function invocation in that case.
-            if declare -F xcrun > /dev/null 2>&1; then
-                unavailable_devices_output=$(xcrun simctl list devices unavailable 2> /dev/null || true)
-            else
-                unavailable_devices_output=$(run_with_timeout "$MOLE_TIMEOUT_QUICK_DETECT_SEC" xcrun simctl list devices unavailable 2> /dev/null || true)
-                if [[ -z "$unavailable_devices_output" ]]; then
-                    unavailable_devices_output=$(xcrun simctl list devices unavailable 2> /dev/null || true)
-                fi
-            fi
-            unavail_count=$(printf '%s\n' "$unavailable_devices_output" | command awk '/\([0-9A-F-]{36}\)/ { count++ } END { print count+0 }')
-            [[ "$unavail_count" =~ ^[0-9]+$ ]] || unavail_count=0
-            if [[ "$unavail_count" -gt 0 ]]; then
-                if [[ "${DRY_RUN:-false}" == "true" ]]; then
-                    echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Unavailable simulators · would delete ${unavail_count} devices"
-                else
-                    # Capture exit code so a timeout (124) or simctl error
-                    # is reported instead of falsely echoing SUCCESS.
-                    local _delete_rc=0
-                    if declare -F xcrun > /dev/null 2>&1; then
-                        xcrun simctl delete unavailable > /dev/null 2>&1 || _delete_rc=$?
-                    else
-                        run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" xcrun simctl delete unavailable > /dev/null 2>&1 || _delete_rc=$?
-                    fi
-                    if [[ $_delete_rc -eq 0 ]]; then
-                        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Unavailable simulators · deleted ${unavail_count} devices"
-                    else
-                        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Unavailable simulators · simctl delete failed (exit=${_delete_rc})"
-                        debug_log "xcrun simctl delete unavailable returned $_delete_rc"
-                    fi
-                fi
-                note_activity
-            fi
-        fi
     else
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Simulator is running, skipping Simulator cache/temp/log cleanup"
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Simulator caches · skipped (Simulator running)"
+        note_activity
     fi
     safe_clean ~/Library/Caches/com.apple.dt.Xcode/* "Xcode cache"
     safe_clean ~/Library/Developer/Xcode/iOS\ Device\ Logs/* "iOS device logs"
@@ -126,7 +86,8 @@ clean_xcode_tools() {
         safe_clean ~/Library/Developer/Xcode/DocumentationCache/* "Xcode documentation cache"
         safe_clean ~/Library/Developer/Xcode/DocumentationIndex/* "Xcode documentation index"
     else
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Xcode is running, skipping DerivedData/Documentation cleanup"
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Xcode DerivedData/Documentation · skipped (Xcode running)"
+        note_activity
     fi
 }
 # Remove extension directories that VS Code / Cursor have marked obsolete.
@@ -164,10 +125,31 @@ clean_code_editors() {
     safe_clean ~/Library/Application\ Support/Code/Cache/* "VS Code cache"
     safe_clean ~/Library/Application\ Support/Code/CachedExtensions/* "VS Code extension cache"
     safe_clean ~/Library/Application\ Support/Code/CachedData/* "VS Code data cache"
+    safe_clean ~/Library/Application\ Support/Code/WebStorage/*/CacheStorage/* "VS Code webview cache"
     safe_clean ~/Library/Caches/com.sublimetext.*/* "Sublime Text cache"
     safe_clean ~/Library/Caches/Zed/* "Zed cache"
+    # Zed npm caches: node/cache (system-node scratch) and node/node-v*/cache
+    # (per-version managed runtime, see #88); keep editor state under db/ untouched.
+    safe_clean ~/Library/Application\ Support/Zed/node/cache/* "Zed npm cache"
+    safe_clean ~/Library/Application\ Support/Zed/node/node-v*/cache/* "Zed npm cache"
     safe_clean ~/Library/Logs/Zed/* "Zed logs"
     clean_editor_obsolete_extensions
+    # CodeBuddy Extension (VS Code fork, Electron)
+    if [[ -d ~/Library/Application\ Support/CodeBuddyExtension ]]; then
+        safe_clean ~/Library/Application\ Support/CodeBuddyExtension/Cache/* "CodeBuddy Extension cache"
+        safe_clean ~/Library/Application\ Support/CodeBuddyExtension/logs/* "CodeBuddy Extension logs"
+    fi
+    # CodeBuddy CN (VS Code fork, Electron)
+    if [[ -d ~/Library/Application\ Support/CodeBuddy\ CN ]]; then
+        safe_clean ~/Library/Application\ Support/CodeBuddy\ CN/Cache/* "CodeBuddy CN cache"
+        safe_clean ~/Library/Application\ Support/CodeBuddy\ CN/CachedData/* "CodeBuddy CN cached data"
+        safe_clean ~/Library/Application\ Support/CodeBuddy\ CN/CachedExtensionVSIXs/* "CodeBuddy CN extension cache"
+        safe_clean ~/Library/Application\ Support/CodeBuddy\ CN/Code\ Cache/* "CodeBuddy CN code cache"
+        safe_clean ~/Library/Application\ Support/CodeBuddy\ CN/GPUCache/* "CodeBuddy CN GPU cache"
+        safe_clean ~/Library/Application\ Support/CodeBuddy\ CN/DawnGraphiteCache/* "CodeBuddy CN Dawn cache"
+        safe_clean ~/Library/Application\ Support/CodeBuddy\ CN/DawnWebGPUCache/* "CodeBuddy CN WebGPU cache"
+        safe_clean ~/Library/Application\ Support/CodeBuddy\ CN/logs/* "CodeBuddy CN logs"
+    fi
 }
 # Communication apps.
 clean_communication_apps() {
@@ -183,6 +165,7 @@ clean_communication_apps() {
     safe_clean ~/Library/Caches/com.skype.skype/* "Skype cache"
     safe_clean ~/Library/Caches/com.tencent.meeting/* "Tencent Meeting cache"
     safe_clean ~/Library/Caches/com.tencent.WeWorkMac/* "WeCom cache"
+    safe_clean ~/Library/Caches/com.tencent.qq/* "QQ cache"
     safe_clean ~/Library/Caches/com.feishu.*/* "Feishu cache"
     if [[ -d ~/Library/Application\ Support/Microsoft/Teams ]]; then
         safe_clean ~/Library/Application\ Support/Microsoft/Teams/Cache/* "Microsoft Teams legacy cache"
@@ -207,14 +190,16 @@ clean_ai_apps() {
     safe_clean ~/Library/Caches/com.openai.chat/* "ChatGPT cache"
     safe_clean ~/Library/Caches/com.anthropic.claudefordesktop/* "Claude desktop cache"
     safe_clean ~/Library/Logs/Claude/* "Claude logs"
-    safe_clean ~/Library/Logs/com.openai.codex/* "Codex CLI logs"
-    # Codex (OpenAI, Electron)
-    if [[ -d ~/Library/Application\ Support/Codex ]]; then
-        safe_clean ~/Library/Application\ Support/Codex/Cache/* "Codex cache"
-        safe_clean ~/Library/Application\ Support/Codex/Code\ Cache/* "Codex code cache"
-        safe_clean ~/Library/Application\ Support/Codex/GPUCache/* "Codex GPU cache"
-        safe_clean ~/Library/Application\ Support/Codex/DawnGraphiteCache/* "Codex Dawn cache"
-        safe_clean ~/Library/Application\ Support/Codex/DawnWebGPUCache/* "Codex WebGPU cache"
+    safe_clean ~/Library/Caches/com.lmstudio.lmstudio/* "LM Studio cache"
+    # LM Studio <=0.3.5 used ~/.cache/lm-studio as its complete home directory,
+    # including models, presets, chats, and runtime state. LM Studio moved new
+    # installs to ~/.lmstudio in 0.3.6, but existing data is not migrated, so
+    # never recursively clean the legacy root. The Library/Caches target above
+    # is the only path treated as an auto-rebuildable cache here.
+    safe_clean ~/Library/Caches/CCTClearcutLogger "Google Clearcut logs"
+    if [[ -d "$HOME/Library/Application Support/Codex" || -d "$HOME/Library/Logs/com.openai.codex" ]]; then
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Codex Desktop state · preserved (sessions, credentials)"
+        note_activity
     fi
 }
 # Design and creative tools.
@@ -305,7 +290,7 @@ find_final_cut_pro_generated_cache_targets() {
 
 clean_final_cut_pro_generated_caches() {
     if final_cut_pro_is_running; then
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Final Cut Pro is running, skipping generated cache cleanup"
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Final Cut Pro generated caches · skipped (Final Cut Pro running)"
         note_activity
         return 0
     fi
@@ -331,6 +316,97 @@ clean_final_cut_pro_generated_caches() {
     safe_clean "${fcp_cache_targets[@]}" "Final Cut Pro generated cache"
 }
 
+jianying_pro_is_running() {
+    command -v pgrep > /dev/null 2>&1 || return 2
+
+    # Match the main editor process only. Narrow the -f pattern to the primary
+    # executable path so the always-resident menu-bar agent
+    # (.../Frameworks/VideoFusion-macOSTrayHelper.app/.../VideoFusion-macOSTrayHelper)
+    # does not read as "editor running" and permanently skip cleanup.
+    local probe_rc=0
+    if pgrep -x "VideoFusion-macOS" > /dev/null 2>&1; then
+        return 0
+    else
+        probe_rc=$?
+        [[ $probe_rc -eq 1 ]] || return 2
+    fi
+    if pgrep -f "/VideoFusion-macOS.app/Contents/MacOS/VideoFusion-macOS" > /dev/null 2>&1; then
+        return 0
+    else
+        probe_rc=$?
+        [[ $probe_rc -eq 1 ]] || return 2
+    fi
+    return 1
+}
+
+clean_jianying_pro_generated_caches() {
+    local cache_root="$HOME/Movies/JianyingPro/User Data/Cache"
+    [[ -d "$cache_root" && ! -L "$cache_root" ]] || return 0
+
+    local process_state=0
+    jianying_pro_is_running || process_state=$?
+    if [[ $process_state -ne 1 ]]; then
+        local skip_reason="JianyingPro running"
+        [[ $process_state -eq 2 ]] && skip_reason="process state unknown"
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} JianyingPro generated caches · skipped ($skip_reason)"
+        note_activity
+        return 0
+    fi
+
+    # JianyingPro (剪映专业版 / CapCut CN, com.lemon.lvpro) generated cache
+    # cleanup (issue #1277). Same shape as Final Cut Pro (#843): the editor
+    # keeps heavy generated caches under ~/Movies/JianyingPro/User Data/Cache/
+    # instead of ~/Library/Caches, so standard cleanup never reaches them.
+    #
+    # Safety scope for the first pass:
+    # - only the default cache root under ~/Movies; never User Data/Projects
+    #   (the user's editable drafts) or any sibling of Cache;
+    # - only remove an explicit whitelist of regenerable subdirectories:
+    #   subtitle-recognition PCM scratch, frame thumbnails, audio waveforms,
+    #   algorithm scratch, and prerender/remux temp;
+    # - never touch draft-referenced or downloaded assets (effect,
+    #   onlineMaterial, artistEffect, music, AITextTemplate, template,
+    #   local_models, AigcMaterailCache, agencycache); plaintext draft configs
+    #   reference effect 8000+ times, so anything not on this list is preserved.
+    #
+    # image/ and importcache3/ are deliberately excluded: both hold copies of
+    # material the user imported, draft_info.json is encrypted so no plaintext
+    # reference check can prove they are unreferenced, and mo clean deletes
+    # permanently. If the user has since moved or deleted the source file, the
+    # cached copy is the only remaining one. Revisit only with evidence that
+    # the editor re-imports from the original on demand.
+    #
+    # Verified on a real machine (macOS 15.7 Intel, JianyingPro 11.1.0):
+    # removing this set reclaimed ~70GB, 2025-era projects reopened cleanly, and
+    # the app recreated the scratch directories on next launch.
+    local -a regenerable_subdirs=(
+        recognize
+        frameThumbnail
+        audioWave
+        AlgorithmCache
+        ILASDKDB
+        RemuxCache
+        prerender
+        segmentPrerenderCache
+        MotionBlurCache
+        ttsTemp
+        tmp
+    )
+
+    local -a targets=()
+    local subdir path
+    for subdir in "${regenerable_subdirs[@]}"; do
+        path="$cache_root/$subdir"
+        if [[ -d "$path" && ! -L "$path" ]]; then
+            targets+=("$path")
+        fi
+    done
+
+    [[ ${#targets[@]} -gt 0 ]] || return 0
+
+    safe_clean "${targets[@]}" "JianyingPro generated cache"
+}
+
 clean_video_tools() {
     safe_clean ~/Library/Caches/net.telestream.screenflow10/* "ScreenFlow cache"
     safe_clean ~/Library/Caches/com.apple.FinalCut/* "Final Cut Pro cache"
@@ -338,6 +414,7 @@ clean_video_tools() {
     safe_clean ~/Library/Caches/com.blackmagic-design.DaVinciResolve/* "DaVinci Resolve cache"
     safe_clean ~/Movies/CacheClip/* "DaVinci Resolve CacheClip"
     safe_clean ~/Library/Caches/com.adobe.PremierePro.*/* "Premiere Pro cache"
+    clean_jianying_pro_generated_caches
 }
 # 3D and CAD tools.
 clean_3d_tools() {
@@ -358,6 +435,8 @@ clean_productivity_apps() {
     safe_clean ~/Library/Containers/com.ranchero.NetNewsWire-Evergreen/Data/Library/Caches/* "NetNewsWire cache"
     safe_clean ~/Library/Containers/com.ideasoncanvas.mindnode/Data/Library/Caches/* "MindNode cache"
     safe_clean ~/.cache/kaku/* "Kaku cache"
+    safe_clean ~/Library/Application\ Support/spacedrive/thumbnails/* "Spacedrive thumbnail cache"
+    safe_clean ~/Library/Containers/is.follow/Data/Library/Application\ Support/Folo/Cache/Cache_Data/* "Folo cache"
 }
 # Music/media players (protect Spotify offline music).
 clean_media_players() {
@@ -390,6 +469,16 @@ clean_media_players() {
     safe_clean ~/Library/Caches/tv.plex.player.desktop "Plex cache"
     safe_clean ~/Library/Caches/com.netease.163music "NetEase Music cache"
     safe_clean ~/Library/Caches/com.tencent.QQMusic/* "QQ Music cache"
+    safe_clean ~/Library/Caches/com.tencent.QQMusicMac/* "QQ Music Mac cache"
+    # QQ Music Mac sandboxed container caches (protect offline downloads in iDownloadProxy).
+    local _qqmusic_container="$HOME/Library/Containers/com.tencent.QQMusicMac/Data/Library/Application Support/QQMusicMac"
+    if [[ -d "$_qqmusic_container" ]]; then
+        safe_clean "$_qqmusic_container/iRRCache"/* "QQ Music streaming cache"
+        safe_clean "$_qqmusic_container/iLog"/* "QQ Music logs"
+        safe_clean "$_qqmusic_container/iCache"/* "QQ Music cache"
+        safe_clean "$_qqmusic_container/iTemp"/* "QQ Music temp files"
+    fi
+    safe_clean ~/Library/Containers/com.tencent.QQMusicMac/Data/Library/Caches/* "QQ Music container cache"
     safe_clean ~/Library/Caches/com.kugou.mac/* "Kugou Music cache"
     safe_clean ~/Library/Caches/com.kuwo.mac/* "Kuwo Music cache"
 }
@@ -400,9 +489,17 @@ clean_video_players() {
     safe_clean ~/Library/Caches/io.mpv "MPV cache"
     safe_clean ~/Library/Caches/com.iqiyi.player "iQIYI cache"
     safe_clean ~/Library/Caches/com.tencent.tenvideo "Tencent Video cache"
+    # Tencent Video sandboxed container caches.
+    local _tenvideo_as="$HOME/Library/Containers/com.tencent.tenvideo/Data/Library/Application Support"
+    if [[ -d "$_tenvideo_as" ]]; then
+        safe_clean "$_tenvideo_as/Upgrade"/* "Tencent Video old installer"
+        safe_clean "$_tenvideo_as/VideoNative"/* "Tencent Video native cache"
+        safe_clean "$_tenvideo_as/documentCache"/* "Tencent Video document cache"
+    fi
     safe_clean ~/Library/Caches/tv.danmaku.bili/* "Bilibili cache"
     safe_clean ~/Library/Caches/com.douyu.*/* "Douyu cache"
     safe_clean ~/Library/Caches/com.huya.*/* "Huya cache"
+    safe_clean ~/Library/Containers/com.wuziqi.SenPlayer/Data/tmp/videoCache/* "SenPlayer video cache"
     safe_clean ~/Library/Caches/smart.stremio*/* "Stremio cache"
     if [[ -d ~/Library/Application\ Support/stremio ]]; then
         safe_clean ~/Library/Application\ Support/stremio/stremio-server/stremio-cache/* "Stremio server cache"
@@ -416,6 +513,72 @@ clean_download_managers() {
     safe_clean ~/Library/Caches/com.downie.Downie-* "Downie cache"
     safe_clean ~/Library/Caches/com.folx.*/* "Folx cache"
     safe_clean ~/Library/Caches/com.charlessoft.pacifist/* "Pacifist cache"
+    clean_neatdm_stale_segments
+}
+# Neat Download Manager: clean stale incomplete download segments.
+# History database (NeatDB.db) is never touched; only numbered segment
+# directories whose seg.x0 file is older than MOLE_ORPHAN_AGE_DAYS are removed.
+# Download URLs expire within hours/days so 30-day-old segments cannot be resumed.
+clean_neatdm_stale_segments() {
+    local neatdm_dir="$HOME/Library/Application Support/com.NeatDownloadManager"
+    [[ -d "$neatdm_dir" ]] || return 0
+
+    local stale_count=0
+    local stale_kb=0
+    local current_epoch
+    current_epoch=$(get_epoch_seconds)
+
+    local -a stale_dirs=()
+    local seg_dir
+    for seg_dir in "$neatdm_dir"/*/; do
+        [[ -d "$seg_dir" ]] || continue
+        local seg_name
+        seg_name=$(basename "${seg_dir%/}")
+        [[ "$seg_name" =~ ^[0-9]+$ ]] || continue
+        [[ -f "$seg_dir/seg.x0" ]] || continue
+
+        local seg_mtime
+        seg_mtime=$(get_file_mtime "$seg_dir/seg.x0")
+        local age_days=$(((current_epoch - seg_mtime) / 86400))
+
+        if [[ $age_days -ge ${MOLE_ORPHAN_AGE_DAYS:-30} ]]; then
+            stale_dirs+=("$seg_dir")
+        fi
+    done
+
+    [[ ${#stale_dirs[@]} -eq 0 ]] && return 0
+
+    for seg_dir in "${stale_dirs[@]}"; do
+        local size_kb
+        size_kb=$(get_path_size_kb "$seg_dir")
+        [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
+
+        if [[ "$DRY_RUN" != "true" ]]; then
+            if safe_remove "$seg_dir" true; then
+                stale_count=$((stale_count + 1))
+                stale_kb=$((stale_kb + size_kb))
+            fi
+        else
+            stale_count=$((stale_count + 1))
+            stale_kb=$((stale_kb + size_kb))
+        fi
+    done
+
+    if [[ $stale_count -gt 0 ]]; then
+        local size_human
+        size_human=$(bytes_to_human "$((stale_kb * 1024))")
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} NeatDM stale downloads · ${stale_count} items, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+        else
+            local line_color
+            line_color=$(cleanup_result_color_kb "$stale_kb")
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} NeatDM stale downloads · ${stale_count} items, ${line_color}${size_human}${NC}"
+        fi
+        files_cleaned=$((files_cleaned + stale_count))
+        total_size_cleaned=$((total_size_cleaned + stale_kb))
+        total_items=$((total_items + 1))
+        note_activity
+    fi
 }
 # Gaming platforms.
 clean_gaming_platforms() {
@@ -525,9 +688,6 @@ clean_note_apps() {
 clean_launcher_apps() {
     safe_clean ~/Library/Caches/com.runningwithcrayons.Alfred/* "Alfred cache"
     safe_clean ~/Library/Caches/cx.c3.theunarchiver/* "The Unarchiver cache"
-    # Raycast: only clean network and FS caches; Clipboard subfolder contains user's clipboard history.
-    safe_clean ~/Library/Caches/com.raycast.macos/urlcache/* "Raycast URL cache"
-    safe_clean ~/Library/Caches/com.raycast.macos/fsCachedData/* "Raycast FS cache"
 }
 # Remote desktop tools.
 clean_remote_desktop() {

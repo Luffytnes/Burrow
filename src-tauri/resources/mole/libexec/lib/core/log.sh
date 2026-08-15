@@ -92,9 +92,22 @@ get_timestamp() {
     date '+%Y-%m-%d %H:%M:%S'
 }
 
+# Any log row printed inside a section counts as section activity; without
+# this, a section whose rows come only from log_* helpers is misdetected as
+# idle and end_section/start_section reclaim lines that hold real output.
+_log_mark_section_activity() {
+    # Purge deliberately gives note_activity a different export side effect.
+    # Update the stable section state directly so logging never dispatches to
+    # a source-order-selected command implementation.
+    if [[ "${TRACK_SECTION:-0}" == "1" ]]; then
+        SECTION_ACTIVITY=1
+    fi
+}
+
 # Log informational message
 log_info() {
     echo -e "${BLUE}$1${NC}"
+    _log_mark_section_activity
     local timestamp
     timestamp=$(get_timestamp)
     append_log_line "$LOG_FILE" "[$timestamp] INFO: $1"
@@ -106,6 +119,7 @@ log_info() {
 # Log success message
 log_success() {
     echo -e "  ${GREEN}${ICON_SUCCESS}${NC} $1"
+    _log_mark_section_activity
     local timestamp
     timestamp=$(get_timestamp)
     append_log_line "$LOG_FILE" "[$timestamp] SUCCESS: $1"
@@ -117,6 +131,7 @@ log_success() {
 # shellcheck disable=SC2329
 log_warning() {
     echo -e "${YELLOW}$1${NC}"
+    _log_mark_section_activity
     local timestamp
     timestamp=$(get_timestamp)
     append_log_line "$LOG_FILE" "[$timestamp] WARNING: $1"
@@ -128,6 +143,7 @@ log_warning() {
 # shellcheck disable=SC2329
 log_error() {
     echo -e "${YELLOW}${ICON_ERROR}${NC} $1" >&2
+    _log_mark_section_activity
     local timestamp
     timestamp=$(get_timestamp)
     append_log_line "$LOG_FILE" "[$timestamp] ERROR: $1"
@@ -365,33 +381,6 @@ log_system_info() {
 
     # Notification to stderr
     echo -e "${GRAY}[DEBUG] Debug logging enabled. Session log: $DEBUG_LOG_FILE${NC}" >&2
-}
-
-# ============================================================================
-# Command Execution Wrappers
-# ============================================================================
-
-# Run command silently (ignore errors)
-run_silent() {
-    "$@" > /dev/null 2>&1 || true
-}
-
-# Run command with error logging
-run_logged() {
-    local cmd="$1"
-    # Log to main file, and also to debug file if enabled
-    if [[ "${MO_DEBUG:-}" == "1" ]]; then
-        if ! "$@" 2>&1 | tee -a "$LOG_FILE" | tee -a "$DEBUG_LOG_FILE" > /dev/null; then
-            log_warning "Command failed: $cmd"
-            return 1
-        fi
-    else
-        if ! "$@" 2>&1 | tee -a "$LOG_FILE" > /dev/null; then
-            log_warning "Command failed: $cmd"
-            return 1
-        fi
-    fi
-    return 0
 }
 
 # ============================================================================

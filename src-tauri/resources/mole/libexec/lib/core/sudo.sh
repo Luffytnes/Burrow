@@ -95,9 +95,16 @@ request_sudo_access() {
         # Clear sudo cache before attempting authentication
         sudo -k 2> /dev/null
 
-        # Display native macOS password dialog
+        # Display native macOS password dialog. prompt_msg can carry on-disk
+        # app display names (batch uninstall builds it from ${sudo_apps[*]}),
+        # so escape backslashes and double quotes before embedding it in the
+        # AppleScript string literal, or an app named with an embedded quote
+        # could break out and run `do shell script`. Same escaping as
+        # force_kill_app and remove_login_item.
+        local escaped_msg="${prompt_msg//\\/\\\\}"
+        escaped_msg="${escaped_msg//\"/\\\"}"
         local password
-        password=$(osascript -e "display dialog \"$prompt_msg\" default answer \"\" with title \"Mole\" with icon caution with hidden answer" -e 'text returned of result' 2> /dev/null)
+        password=$(osascript -e "display dialog \"$escaped_msg\" default answer \"\" with title \"Mole\" with icon caution with hidden answer" -e 'text returned of result' 2> /dev/null)
 
         if [[ -z "$password" ]]; then
             # User cancelled the dialog
@@ -198,6 +205,31 @@ request_sudo_access() {
     return 1
 }
 
+request_sudo_access_with_password() {
+    local password="$1"
+    local prompt_msg="${2:-Admin access required}"
+
+    # Tests must never trigger real password or Touch ID prompts.
+    if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
+        return 1
+    fi
+
+    if [[ -z "$password" ]]; then
+        request_sudo_access "$prompt_msg"
+        return $?
+    fi
+
+    sudo -k 2> /dev/null
+
+    if printf '%s\n' "$password" | sudo -S -p "" -v > /dev/null 2>&1; then
+        unset password
+        return 0
+    fi
+
+    unset password
+    return 1
+}
+
 # ============================================================================
 # Sudo Session Management
 # ============================================================================
@@ -253,6 +285,36 @@ has_sudo_session() {
     sudo -n true 2> /dev/null
 }
 
+adopt_sudo_session() {
+    if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
+        MOLE_SUDO_ESTABLISHED="false"
+        return 1
+    fi
+
+    if [[ "$MOLE_SUDO_ESTABLISHED" == "true" && -n "$MOLE_SUDO_KEEPALIVE_PID" ]]; then
+        if has_sudo_session; then
+            return 0
+        fi
+        _stop_sudo_keepalive "$MOLE_SUDO_KEEPALIVE_PID"
+        MOLE_SUDO_KEEPALIVE_PID=""
+        MOLE_SUDO_ESTABLISHED="false"
+    fi
+
+    if ! sudo -n -v 2> /dev/null; then
+        MOLE_SUDO_ESTABLISHED="false"
+        return 1
+    fi
+
+    if [[ -n "$MOLE_SUDO_KEEPALIVE_PID" ]]; then
+        _stop_sudo_keepalive "$MOLE_SUDO_KEEPALIVE_PID"
+        MOLE_SUDO_KEEPALIVE_PID=""
+    fi
+
+    MOLE_SUDO_KEEPALIVE_PID=$(_start_sudo_keepalive)
+    MOLE_SUDO_ESTABLISHED="true"
+    return 0
+}
+
 # Request administrative access
 request_sudo() {
     local prompt_msg="${1:-Admin access required}"
@@ -302,6 +364,44 @@ ensure_sudo_session() {
     return 0
 }
 
+ensure_sudo_session_with_password() {
+    local password="$1"
+    local prompt="${2:-Admin access required}"
+
+    # Check if already established
+    if has_sudo_session && [[ "$MOLE_SUDO_ESTABLISHED" == "true" ]]; then
+        unset password
+        return 0
+    fi
+
+    if [[ "${MOLE_TEST_MODE:-0}" == "1" || "${MOLE_TEST_NO_AUTH:-0}" == "1" ]]; then
+        MOLE_SUDO_ESTABLISHED="false"
+        unset password
+        return 1
+    fi
+
+    # Stop old keepalive if exists
+    if [[ -n "$MOLE_SUDO_KEEPALIVE_PID" ]]; then
+        _stop_sudo_keepalive "$MOLE_SUDO_KEEPALIVE_PID"
+        MOLE_SUDO_KEEPALIVE_PID=""
+    fi
+
+    # Request sudo access
+    if ! request_sudo_access_with_password "$password" "$prompt"; then
+        MOLE_SUDO_ESTABLISHED="false"
+        unset password
+        return 1
+    fi
+
+    unset password
+
+    # Start keepalive
+    MOLE_SUDO_KEEPALIVE_PID=$(_start_sudo_keepalive)
+
+    MOLE_SUDO_ESTABLISHED="true"
+    return 0
+}
+
 # Stop sudo session and cleanup
 stop_sudo_session() {
     if [[ -n "$MOLE_SUDO_KEEPALIVE_PID" ]]; then
@@ -309,22 +409,4 @@ stop_sudo_session() {
         MOLE_SUDO_KEEPALIVE_PID=""
     fi
     MOLE_SUDO_ESTABLISHED="false"
-}
-
-# Register cleanup on script exit
-register_sudo_cleanup() {
-    trap stop_sudo_session EXIT INT TERM
-}
-
-# Predict if operation requires administrative access
-will_need_sudo() {
-    local -a operations=("$@")
-    for op in "${operations[@]}"; do
-        case "$op" in
-            system_update | appstore_update | macos_update | firewall | touchid | rosetta | system_fix)
-                return 0
-                ;;
-        esac
-    done
-    return 1
 }

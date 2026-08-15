@@ -33,6 +33,10 @@ clean_ds_store_tree() {
     while IFS= read -r -d '' ds_file; do
         local size
         size=$(get_file_size "$ds_file")
+        if [[ "$DRY_RUN" == "true" ]] && declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+            local preview_size_kb=$(((size + 1023) / 1024))
+            record_dry_run_cleanup_target "$ds_file" "$preview_size_kb" 1 true || continue
+        fi
         total_bytes=$((total_bytes + size))
         file_count=$((file_count + 1))
         if [[ "$DRY_RUN" != "true" ]]; then
@@ -50,11 +54,11 @@ clean_ds_store_tree() {
         size_human=$(bytes_to_human "$total_bytes")
         local size_kb=$(((total_bytes + 1023) / 1024))
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} $label${NC}, ${YELLOW}$file_count files, $size_human dry${NC}"
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} $label${NC} · ${YELLOW}$file_count files, $size_human dry${NC}"
         else
             local line_color
             line_color=$(cleanup_result_color_kb "$size_kb")
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} $label${NC}, ${line_color}$file_count files, $size_human${NC}"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} $label${NC} · ${line_color}$file_count files, $size_human${NC}"
         fi
         files_cleaned=$((files_cleaned + file_count))
         total_size_cleaned=$((total_size_cleaned + size_kb))
@@ -134,13 +138,13 @@ scan_installed_apps() {
         if command -v lsappinfo > /dev/null 2>&1; then
             run_with_timeout "$MOLE_TIMEOUT_SHORT_QUERY_SEC" lsappinfo list 2> /dev/null | grep -o '"CFBundleIdentifier"="[^"]*"' | cut -d'"' -f4 >> "$scan_tmp_dir/running.txt" 2> /dev/null || true
         fi
-    ) &
+    ) < /dev/null &
     pids+=($!)
     (
         run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" find ~/Library/LaunchAgents /Library/LaunchAgents \
             -name "*.plist" -type f 2> /dev/null |
             xargs -I {} basename {} .plist > "$scan_tmp_dir/agents.txt" 2> /dev/null || true
-    ) &
+    ) < /dev/null &
     pids+=($!)
     debug_log "Waiting for ${#pids[@]} background processes: ${pids[*]}"
     if [[ ${#pids[@]} -gt 0 ]]; then
@@ -171,8 +175,34 @@ readonly ORPHAN_NEVER_DELETE_PATTERNS=(
     "com.apple.keychain*"
 )
 
-# Cache file for mdfind results (Bash 3.2 compatible, no associative arrays)
-ORPHAN_MDFIND_CACHE_FILE=""
+# In-memory mdfind result cache (Bash 3.2 compatible, no associative arrays).
+# Newline-delimited strings checked via case glob, no subprocess per lookup.
+_MOLE_MDFIND_FOUND=""
+_MOLE_MDFIND_NOTFOUND=""
+
+_mdfind_cache_check() {
+    local bundle_id="$1"
+    local _nl=$'\n'
+    case "${_nl}${_MOLE_MDFIND_FOUND}${_nl}" in
+        *"${_nl}${bundle_id}${_nl}"*) return 0 ;;
+    esac
+    case "${_nl}${_MOLE_MDFIND_NOTFOUND}${_nl}" in
+        *"${_nl}${bundle_id}${_nl}"*) return 1 ;;
+    esac
+    return 2
+}
+
+_mdfind_cache_store() {
+    local bundle_id="$1"
+    local found="$2"
+    if [[ "$found" == "true" ]]; then
+        _MOLE_MDFIND_FOUND="${_MOLE_MDFIND_FOUND:+${_MOLE_MDFIND_FOUND}
+}${bundle_id}"
+    else
+        _MOLE_MDFIND_NOTFOUND="${_MOLE_MDFIND_NOTFOUND:+${_MOLE_MDFIND_NOTFOUND}
+}${bundle_id}"
+    fi
+}
 
 # Usage: is_bundle_orphaned "bundle_id" "directory_path" "installed_bundles_file"
 is_bundle_orphaned() {
@@ -218,32 +248,28 @@ is_bundle_orphaned() {
         fi
     fi
 
-    # 6. Slow path: mdfind fallback with file-based caching (Bash 3.2 compatible)
+    # 6. Slow path: mdfind fallback with in-memory caching (Bash 3.2 compatible)
     # This catches apps installed in non-standard locations
     if mole_is_reverse_dns_bundle_id "$bundle_id"; then
-        # Initialize cache file if needed
-        if [[ -z "$ORPHAN_MDFIND_CACHE_FILE" ]]; then
-            ensure_mole_temp_root
-            ORPHAN_MDFIND_CACHE_FILE=$(mktemp "$MOLE_RESOLVED_TMPDIR/mole_mdfind_cache.XXXXXX")
-            register_temp_file "$ORPHAN_MDFIND_CACHE_FILE"
-        fi
-
-        # Check cache first (grep is fast for small files)
-        if grep -Fxq "FOUND:$bundle_id" "$ORPHAN_MDFIND_CACHE_FILE" 2> /dev/null; then
+        local _cache_rc=0
+        _mdfind_cache_check "$bundle_id" || _cache_rc=$?
+        if [[ $_cache_rc -eq 0 ]]; then
             return 1
-        fi
-        if grep -Fxq "NOTFOUND:$bundle_id" "$ORPHAN_MDFIND_CACHE_FILE" 2> /dev/null; then
-            # Already checked, not found - continue to return 0
-            :
-        else
-            # Query mdfind with strict timeout (2 seconds max)
-            local app_exists
-            app_exists=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" mdfind "kMDItemCFBundleIdentifier == '$bundle_id'" 2> /dev/null | head -1 || echo "")
-            if [[ -n "$app_exists" ]]; then
-                echo "FOUND:$bundle_id" >> "$ORPHAN_MDFIND_CACHE_FILE"
+        elif [[ $_cache_rc -eq 2 ]]; then
+            # Capture mdfind's own exit code, not head's: on timeout (124)
+            # the piped form yielded empty output and was cached as "not
+            # installed", so a transient Spotlight stall marked a live app as
+            # an orphan and deleted its data. On timeout/error, keep the app
+            # and do not poison the cache.
+            local app_exists _mdfind_rc=0
+            app_exists=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" mdfind "kMDItemCFBundleIdentifier == '$bundle_id'" 2> /dev/null) || _mdfind_rc=$?
+            if [[ $_mdfind_rc -ne 0 ]]; then
+                return 1
+            elif [[ -n "$app_exists" ]]; then
+                _mdfind_cache_store "$bundle_id" "true"
                 return 1
             else
-                echo "NOTFOUND:$bundle_id" >> "$ORPHAN_MDFIND_CACHE_FILE"
+                _mdfind_cache_store "$bundle_id" "false"
             fi
         fi
     fi
@@ -279,23 +305,21 @@ is_claude_vm_bundle_orphaned() {
         fi
     fi
 
-    if [[ -z "$ORPHAN_MDFIND_CACHE_FILE" ]]; then
-        ensure_mole_temp_root
-        ORPHAN_MDFIND_CACHE_FILE=$(mktemp "$MOLE_RESOLVED_TMPDIR/mole_mdfind_cache.XXXXXX")
-        register_temp_file "$ORPHAN_MDFIND_CACHE_FILE"
-    fi
-
-    if grep -Fxq "FOUND:$claude_bundle_id" "$ORPHAN_MDFIND_CACHE_FILE" 2> /dev/null; then
+    local _cache_rc=0
+    _mdfind_cache_check "$claude_bundle_id" || _cache_rc=$?
+    if [[ $_cache_rc -eq 0 ]]; then
         return 1
-    fi
-    if ! grep -Fxq "NOTFOUND:$claude_bundle_id" "$ORPHAN_MDFIND_CACHE_FILE" 2> /dev/null; then
-        local app_exists
-        app_exists=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" mdfind "kMDItemCFBundleIdentifier == '$claude_bundle_id'" 2> /dev/null | head -1 || echo "")
-        if [[ -n "$app_exists" ]]; then
-            echo "FOUND:$claude_bundle_id" >> "$ORPHAN_MDFIND_CACHE_FILE"
+    elif [[ $_cache_rc -eq 2 ]]; then
+        # On mdfind timeout/error keep the app (see is_bundle_orphaned).
+        local app_exists _mdfind_rc=0
+        app_exists=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" mdfind "kMDItemCFBundleIdentifier == '$claude_bundle_id'" 2> /dev/null) || _mdfind_rc=$?
+        if [[ $_mdfind_rc -ne 0 ]]; then
+            return 1
+        elif [[ -n "$app_exists" ]]; then
+            _mdfind_cache_store "$claude_bundle_id" "true"
             return 1
         fi
-        echo "NOTFOUND:$claude_bundle_id" >> "$ORPHAN_MDFIND_CACHE_FILE"
+        _mdfind_cache_store "$claude_bundle_id" "false"
     fi
 
     return 0
@@ -306,6 +330,7 @@ clean_orphaned_app_data() {
     if ! ls "$HOME/Library/Caches" > /dev/null 2>&1; then
         stop_section_spinner
         echo -e "  ${GRAY}${ICON_WARNING}${NC} Skipped: No permission to access Library folders"
+        note_activity
         return 0
     fi
     start_section_spinner "Scanning installed apps..."
@@ -313,7 +338,7 @@ clean_orphaned_app_data() {
     scan_installed_apps "$installed_bundles"
     stop_section_spinner
     local app_count=$(wc -l < "$installed_bundles" 2> /dev/null | tr -d ' ')
-    echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Found $app_count active/installed apps"
+    debug_log "Found $app_count active/installed apps"
     local orphaned_count=0
     local total_orphaned_kb=0
     start_section_spinner "Scanning orphaned app resources..."
@@ -410,10 +435,35 @@ clean_orphaned_app_data() {
     stop_section_spinner
     if [[ $orphaned_count -gt 0 ]]; then
         local orphaned_mb=$(echo "$total_orphaned_kb" | awk '{printf "%.1f", $1/1024}')
-        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Cleaned $orphaned_count items, about ${orphaned_mb}MB"
+        if [[ "${DRY_RUN:-false}" == "true" ]]; then
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Would clean $orphaned_count items, about ${orphaned_mb}MB"
+        else
+            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Cleaned $orphaned_count items, about ${orphaned_mb}MB"
+        fi
         note_activity
     fi
     rm -f "$installed_bundles"
+}
+
+_privileged_helper_bundle_id_from_binary() {
+    local binary="$1"
+    local helper_bundle_id=""
+
+    case "$binary" in
+        /Library/PrivilegedHelperTools/*.bundle/Contents/MacOS/*)
+            local helper_bundle_dir info_plist
+            helper_bundle_dir="${binary%/Contents/MacOS/*}"
+            info_plist="$helper_bundle_dir/Contents/Info.plist"
+            helper_bundle_id=$(plutil -extract CFBundleIdentifier raw "$info_plist" 2> /dev/null || true)
+            [[ -n "$helper_bundle_id" ]] || helper_bundle_id=$(basename "$helper_bundle_dir" .bundle)
+            ;;
+        *)
+            helper_bundle_id=$(basename "$binary")
+            helper_bundle_id="${helper_bundle_id%.plist}"
+            ;;
+    esac
+
+    printf '%s\n' "$helper_bundle_id"
 }
 
 # Clean orphaned system-level services (LaunchDaemons, LaunchAgents, PrivilegedHelperTools)
@@ -456,11 +506,14 @@ clean_orphaned_system_services() {
         "com.docker.*:/Applications/Docker.app"
         # NetBird / Wiretrustee – CLI-managed daemon (binary in /usr/local/bin)
         "netbird:/usr/local/bin/netbird"
+        # Intego (One, VirusBarrier, NetBarrier) – self-protecting AV whose
+        # /Library/Intego tree is root-only readable; never treat its services
+        # as orphans while any Intego install evidence exists. See #1188.
+        "com.intego.*:/Library/Intego|/Applications/Intego|/Library/Application Support/Intego"
         # Homebrew-managed services (managed by brew services, not .app bundles)
         "homebrew.mxcl.*:"
     )
 
-    local mdfind_cache_file=""
     # Returns 0 (found/protected) when any app backing a system service is installed.
     # app_path may be a pipe-separated list of candidate .app paths; any match = protected.
     # An empty app_path always returns 0 (unconditionally protected).
@@ -498,44 +551,60 @@ clean_orphaned_system_services() {
         done
 
         if mole_is_reverse_dns_bundle_id "$bundle_id"; then
-            if [[ -z "$mdfind_cache_file" ]]; then
-                ensure_mole_temp_root
-                mdfind_cache_file=$(mktemp "$MOLE_RESOLVED_TMPDIR/mole_mdfind_cache.XXXXXX")
-                register_temp_file "$mdfind_cache_file"
-            fi
-
-            if grep -Fxq "FOUND:$bundle_id" "$mdfind_cache_file" 2> /dev/null; then
+            local _cache_rc=0
+            _mdfind_cache_check "$bundle_id" || _cache_rc=$?
+            if [[ $_cache_rc -eq 0 ]]; then
                 return 0
-            fi
-            if ! grep -Fxq "NOTFOUND:$bundle_id" "$mdfind_cache_file" 2> /dev/null; then
-                local app_found
-                app_found=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" mdfind "kMDItemCFBundleIdentifier == '$bundle_id'" 2> /dev/null | head -1 || echo "")
-                if [[ -n "$app_found" ]]; then
-                    echo "FOUND:$bundle_id" >> "$mdfind_cache_file"
+            elif [[ $_cache_rc -eq 2 ]]; then
+                # On mdfind timeout/error assume the app exists (return 0 =
+                # installed here) so a transient Spotlight stall never flags a
+                # live app's service/container as an orphan; do not cache.
+                local app_found _mdfind_rc=0
+                app_found=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" mdfind "kMDItemCFBundleIdentifier == '$bundle_id'" 2> /dev/null) || _mdfind_rc=$?
+                if [[ $_mdfind_rc -ne 0 ]]; then
+                    return 0
+                elif [[ -n "$app_found" ]]; then
+                    _mdfind_cache_store "$bundle_id" "true"
                     return 0
                 fi
-                echo "NOTFOUND:$bundle_id" >> "$mdfind_cache_file"
+                _mdfind_cache_store "$bundle_id" "false"
             fi
         fi
 
         return 1
     }
 
+    # Read a launchd program path from a system plist.
+    # The plist itself was discovered with sudo, so read it with sudo too (the
+    # caller already cleared a `sudo -n true` probe, so keep it non-interactive):
+    # unreadable root-owned plists make PlistBuddy print a non-path "File Doesn't
+    # Exist, Will Create..." message on stdout, which must never be treated as a
+    # missing binary path.
+    _plist_program_value() {
+        local plist="$1"
+        local key="$2"
+        local value=""
+        value=$(sudo -n /usr/libexec/PlistBuddy -c "Print :$key" "$plist" 2> /dev/null || true)
+
+        [[ -z "$value" ]] && return 1
+        [[ "$value" != /* ]] && return 1
+
+        printf '%s\n' "$value"
+    }
+
     # Read the program binary from a plist (Program or ProgramArguments[0]).
-    # Prints the path; returns 1 if no Program key found.
+    # Prints the path; returns 1 if no usable absolute Program key found.
     _plist_binary_path() {
         local plist="$1"
         local binary=""
-        binary=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$plist" 2> /dev/null || true)
-        if [[ -z "$binary" ]]; then
-            binary=$(/usr/libexec/PlistBuddy -c "Print :Program" "$plist" 2> /dev/null || true)
-        fi
+        binary=$(_plist_program_value "$plist" "ProgramArguments:0" || true)
+        [[ -z "$binary" ]] && binary=$(_plist_program_value "$plist" "Program" || true)
         [[ -z "$binary" ]] && return 1
         printf '%s\n' "$binary"
     }
 
     # Returns 0 if the binary path is managed by a package manager or lives in a
-    # system directory — these should never be treated as orphans even when missing.
+    # system directory; these should never be treated as orphans even when missing.
     _is_package_managed_binary() {
         local binary="$1"
         case "$binary" in
@@ -563,8 +632,33 @@ clean_orphaned_system_services() {
         local binary
         binary=$(_plist_binary_path "$plist") || return 1 # no Program key → skip
 
-        # If the binary still exists, the service is healthy.
-        [[ -e "$binary" ]] && return 1
+        # Self-protecting software (Intego and similar antivirus / endpoint
+        # agents) makes its install directories root-only readable, so an
+        # unprivileged -e probe reports the daemon binary missing even though
+        # it exists. The plist was discovered with sudo; re-probe the binary
+        # with sudo before treating it as missing. See #1188.
+        local binary_exists=false
+        if [[ -e "$binary" ]]; then
+            binary_exists=true
+        elif sudo -n test -e "$binary" 2> /dev/null; then
+            binary_exists=true
+        fi
+
+        # If the binary still exists, check if it's in PrivilegedHelperTools.
+        # If so, verify the parent app is still installed. If the parent app
+        # is gone, the binary itself is orphaned, so this plist is too. See #1082.
+        if [[ "$binary_exists" == "true" ]]; then
+            if [[ "$binary" == /Library/PrivilegedHelperTools/* ]]; then
+                local helper_bundle_id
+                helper_bundle_id=$(_privileged_helper_bundle_id_from_binary "$binary")
+                if bundle_has_installed_app "$helper_bundle_id"; then
+                    return 1 # Parent app still installed, plist is healthy
+                fi
+                # Parent app is gone, binary is orphaned, so plist is orphaned
+                return 0
+            fi
+            return 1 # Binary exists and not in PrivilegedHelperTools, plist is healthy
+        fi
 
         # If the binary is in a package-manager / system path, skip.
         _is_package_managed_binary "$binary" && return 1
@@ -601,7 +695,7 @@ clean_orphaned_system_services() {
                 orphaned_files+=("$plist")
                 orphaned_count=$((orphaned_count + 1))
             fi
-        done < <(sudo find /Library/LaunchDaemons -maxdepth 1 -name "*.plist" -print0 2> /dev/null)
+        done < <(sudo -n find /Library/LaunchDaemons -maxdepth 1 -name "*.plist" -print0 2> /dev/null)
     fi
 
     # Scan system LaunchAgents
@@ -620,7 +714,7 @@ clean_orphaned_system_services() {
                 orphaned_files+=("$plist")
                 orphaned_count=$((orphaned_count + 1))
             fi
-        done < <(sudo find /Library/LaunchAgents -maxdepth 1 -name "*.plist" -print0 2> /dev/null)
+        done < <(sudo -n find /Library/LaunchAgents -maxdepth 1 -name "*.plist" -print0 2> /dev/null)
     fi
 
     # Scan PrivilegedHelperTools
@@ -672,7 +766,7 @@ clean_orphaned_system_services() {
                     orphaned_count=$((orphaned_count + 1))
                 fi
             fi
-        done < <(sudo find /Library/PrivilegedHelperTools -maxdepth 1 -type f -print0 2> /dev/null)
+        done < <(sudo -n find /Library/PrivilegedHelperTools -maxdepth 1 -type f -print0 2> /dev/null)
     fi
 
     stop_section_spinner
@@ -688,12 +782,20 @@ clean_orphaned_system_services() {
             kept_files+=("$orphan_file")
         done
         orphaned_count=${#kept_files[@]}
-        orphaned_files=("${kept_files[@]}")
+        # Guard the empty-array expansion: macOS /bin/bash is 3.2, which treats
+        # "${empty[@]}" as an unbound variable under `set -u`. When every orphan
+        # is whitelisted kept_files is empty, so a bare expansion would abort the
+        # whole clean run. See #1127.
+        if ((orphaned_count > 0)); then
+            orphaned_files=("${kept_files[@]}")
+        else
+            orphaned_files=()
+        fi
     fi
 
     # Report and clean
     if [[ $orphaned_count -gt 0 ]]; then
-        echo -e "  ${GRAY}${ICON_WARNING}${NC} Found $orphaned_count orphaned system services"
+        debug_log "Found $orphaned_count orphaned system services"
 
         local removed_count=0
         local skipped_protected_count=0
@@ -701,25 +803,44 @@ clean_orphaned_system_services() {
         local removed_kb=0
 
         for orphan_file in "${orphaned_files[@]}"; do
-            if should_protect_path "$orphan_file"; then
+            # Orphans were already verified to have no installed parent app, so
+            # bypass the data-protection filename check (which would otherwise block
+            # legitimately orphaned files like Docker helpers) for this single call.
+            # MOLE_UNINSTALL_MODE is scoped to the call and never leaks to later
+            # cleanup sections; SYSTEM_CRITICAL_BUNDLES stay protected. See #1082.
+            if MOLE_UNINSTALL_MODE=1 should_protect_path "$orphan_file"; then
                 debug_log "Skipping protected orphaned service: $orphan_file"
                 skipped_protected_count=$((skipped_protected_count + 1))
                 continue
             fi
             if [[ "$DRY_RUN" == "true" ]]; then
                 debug_log "[DRY RUN] Would remove orphaned service: $orphan_file"
+                local orphan_size_kb
+                orphan_size_kb=$(run_with_timeout "$MOLE_TIMEOUT_DISK_VERIFY_SEC" sudo -n du -skP "$orphan_file" 2> /dev/null | awk '{print $1}' || echo "0")
+                [[ -n "$orphan_size_kb" ]] || orphan_size_kb=0
+                if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                    record_dry_run_cleanup_target "$orphan_file" "$orphan_size_kb" 1 true || continue
+                elif [[ -n "${EXPORT_LIST_FILE:-}" && -f "$EXPORT_LIST_FILE" ]]; then
+                    # Standalone module tests do not prepare the clean ledger.
+                    echo "$orphan_file  # $(bytes_to_human "$((orphan_size_kb * 1024))")" >> "$EXPORT_LIST_FILE"
+                fi
             else
                 local file_size_kb
-                file_size_kb=$(sudo du -skP "$orphan_file" 2> /dev/null | awk '{print $1}' || echo "0")
+                file_size_kb=$(run_with_timeout "$MOLE_TIMEOUT_DISK_VERIFY_SEC" sudo -n du -skP "$orphan_file" 2> /dev/null | awk '{print $1}' || echo "0")
 
                 # Unload if it's a LaunchDaemon/LaunchAgent
                 if [[ "$orphan_file" == *.plist ]]; then
-                    sudo launchctl unload "$orphan_file" 2> /dev/null || true
+                    sudo -n launchctl unload "$orphan_file" 2> /dev/null || true
                 fi
-                if safe_sudo_remove "$orphan_file"; then
+                local remove_rc=0
+                safe_sudo_remove "$orphan_file" || remove_rc=$?
+                if [[ $remove_rc -eq 0 ]]; then
                     debug_log "Removed orphaned service: $orphan_file"
                     removed_count=$((removed_count + 1))
                     removed_kb=$((removed_kb + file_size_kb))
+                elif [[ $remove_rc -eq $MOLE_ERR_PROTECTED_PATH ]]; then
+                    debug_log "Skipping protected orphaned service: $orphan_file"
+                    skipped_protected_count=$((skipped_protected_count + 1))
                 else
                     debug_log "Failed to remove orphaned service: $orphan_file"
                     failed_count=$((failed_count + 1))
@@ -727,17 +848,14 @@ clean_orphaned_system_services() {
             fi
         done
 
-        local orphaned_kb_display
-        if [[ $removed_kb -gt 1024 ]]; then
-            orphaned_kb_display=$(echo "$removed_kb" | awk '{printf "%.1fMB", $1/1024}')
-        else
-            orphaned_kb_display="${removed_kb}KB"
-        fi
-        if [[ "${DRY_RUN:-false}" != "true" ]]; then
-            if [[ $removed_count -gt 0 ]]; then
-                echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Cleaned $removed_count orphaned services, about $orphaned_kb_display"
-                note_activity
-            fi
+        if [[ "${DRY_RUN:-false}" == "true" ]]; then
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Orphaned services · ${YELLOW}${orphaned_count} found dry${NC}"
+            note_activity
+        elif [[ $removed_count -gt 0 ]]; then
+            local orphaned_kb_display
+            orphaned_kb_display=$(bytes_to_human "$((removed_kb * 1024))")
+            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Orphaned services · cleaned ${removed_count}, ${orphaned_kb_display}"
+            note_activity
         fi
         # Surface protected/failed counts in BOTH dry-run and real-clean so the
         # two modes agree on what gets touched. Before #886, dry-run silently
@@ -745,21 +863,22 @@ clean_orphaned_system_services() {
         # skipped them, leaving the user confused about which files actually
         # disappeared.
         if [[ $skipped_protected_count -gt 0 || $failed_count -gt 0 ]]; then
-            echo -e "  ${GRAY}${ICON_WARNING}${NC} Orphaned services skipped $skipped_protected_count protected, failed $failed_count"
+            local issue_note=""
+            if [[ $skipped_protected_count -gt 0 ]]; then
+                issue_note="skipped ${skipped_protected_count} protected"
+            fi
+            if [[ $failed_count -gt 0 ]]; then
+                issue_note+="${issue_note:+, }${failed_count} failed"
+            fi
+            echo -e "  ${GRAY}${ICON_WARNING}${NC} Orphaned services · ${issue_note}"
+            note_activity
         fi
     fi
 
 }
 
-# ============================================================================
-# User LaunchAgents
-# ============================================================================
-
-# User-level LaunchAgents are user-owned automation/configuration, not generic
-# cleanup targets. `mo clean` must not delete them automatically.
-clean_orphaned_launch_agents() {
-    return 0
-}
+# Policy: mo clean does NOT touch user LaunchAgents (~/Library/LaunchAgents),
+# they are user-owned automation and not generic cleanup targets.
 
 # ============================================================================
 # Orphaned container stubs
@@ -767,11 +886,43 @@ clean_orphaned_launch_agents() {
 
 # Remove stub-only ~/Library/Containers directories left by uninstalled apps.
 # A stub container contains only .com.apple.containermanagerd.metadata.plist
-# with no Data/ subdirectory — it holds no user data and is safe to remove.
+# with no Data/ subdirectory, it holds no user data and is safe to remove.
 # Only targets a hardcoded allowlist of apps known to leave such stubs.
+_remove_verified_container_stub() {
+    local container_dir="$1"
+    local metadata_plist="$2"
+
+    [[ -d "$container_dir" ]] || return 1
+    [[ ! -L "$container_dir" ]] || return 1
+    [[ "$metadata_plist" == "$container_dir/.com.apple.containermanagerd.metadata.plist" ]] || return 1
+    [[ -f "$metadata_plist" ]] || return 1
+
+    if find "$container_dir" -mindepth 1 -maxdepth 1 ! -name ".com.apple.containermanagerd.metadata.plist" -print -quit 2> /dev/null | grep -q .; then
+        return 1
+    fi
+
+    # SAFE: deliberate carve-out from safe_remove, do NOT "unify" this back
+    # into the shared helper. should_protect_path blankets ~/Library/Containers
+    # (container interiors are user data), so safe_remove refuses BOTH paths and
+    # routing through it silently disables this cleaner entirely (verified: both
+    # validate_path_for_deletion calls return 1). The removal stays narrow by
+    # construction instead: the caller matches a hardcoded app allowlist, and the
+    # guards above pin the target to a non-symlink directory whose ONLY entry is
+    # the exact containermanagerd metadata plist, i.e. a stub with no Data/ dir
+    # and no user content. rmdir (not rm -r) means a container that gains any
+    # file between the check and the removal survives untouched.
+    command rm -f -- "$metadata_plist" || return 1
+    command rmdir -- "$container_dir"
+}
+
 clean_orphaned_container_stubs() {
     local containers_dir="$HOME/Library/Containers"
     [[ -d "$containers_dir" ]] || return 0
+
+    # Keep the section spinner alive: the mdfind probes below can take
+    # seconds, and without a spinner the section looks hung after the
+    # previous step's output (per-step loading feedback).
+    start_section_spinner "Scanning orphaned containers..."
 
     # Format: "bundle_id_glob:app_path_to_check"
     # The app_path_to_check is the canonical .app location; the stub is removed
@@ -806,9 +957,24 @@ clean_orphaned_container_stubs() {
         esac
 
         if mole_is_reverse_dns_bundle_id "$bundle_id"; then
-            local app_found
-            app_found=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" mdfind "kMDItemCFBundleIdentifier == '$bundle_id'" 2> /dev/null | head -1 || echo "")
-            [[ -n "$app_found" ]] && return 0
+            local _cache_rc=0
+            _mdfind_cache_check "$bundle_id" || _cache_rc=$?
+            if [[ $_cache_rc -eq 0 ]]; then
+                return 0
+            elif [[ $_cache_rc -eq 2 ]]; then
+                # On mdfind timeout/error assume the app exists (return 0 =
+                # installed here) so a transient Spotlight stall never flags a
+                # live app's service/container as an orphan; do not cache.
+                local app_found _mdfind_rc=0
+                app_found=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" mdfind "kMDItemCFBundleIdentifier == '$bundle_id'" 2> /dev/null) || _mdfind_rc=$?
+                if [[ $_mdfind_rc -ne 0 ]]; then
+                    return 0
+                elif [[ -n "$app_found" ]]; then
+                    _mdfind_cache_store "$bundle_id" "true"
+                    return 0
+                fi
+                _mdfind_cache_store "$bundle_id" "false"
+            fi
         fi
 
         return 1
@@ -841,11 +1007,9 @@ clean_orphaned_container_stubs() {
 
             if [[ "$DRY_RUN" != "true" ]]; then
                 # These directories have already passed the narrow stub-only
-                # checks above. Use direct removal so broad app-protection rules
-                # for the parent vendor bundle do not keep empty metadata stubs.
-                # safe_remove cannot be used here: it runs should_protect_path
-                # which intentionally vetos vendor-bundle paths we just verified.
-                if command rm -rf -- "$container_dir" > /dev/null 2>&1; then # SAFE: verified stub-only container
+                # checks above. Remove only the exact metadata file, then rmdir,
+                # so any new content that appears before deletion is preserved.
+                if _remove_verified_container_stub "$container_dir" "$metadata_plist" > /dev/null 2>&1; then
                     removed_count=$((removed_count + 1))
                     log_operation "${MOLE_CURRENT_COMMAND:-clean}" "REMOVED" "$container_dir" "stub-container"
                 else
@@ -854,6 +1018,12 @@ clean_orphaned_container_stubs() {
                     log_operation "${MOLE_CURRENT_COMMAND:-clean}" "FAILED" "$container_dir" "stub-container"
                 fi
             else
+                if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                    local stub_size_kb
+                    stub_size_kb=$(get_path_size_kb "$container_dir" 2> /dev/null || echo "0")
+                    [[ "$stub_size_kb" =~ ^[0-9]+$ ]] || stub_size_kb=0
+                    record_dry_run_cleanup_target "$container_dir" "$stub_size_kb" 1 true || continue
+                fi
                 removed_count=$((removed_count + 1))
                 log_operation "${MOLE_CURRENT_COMMAND:-clean}" "SKIPPED" "$container_dir" "dry-run stub-container"
             fi
@@ -863,6 +1033,7 @@ clean_orphaned_container_stubs() {
     # eval: restore shopt state captured by $(shopt -p)
     eval "$_ng_state"
 
+    stop_section_spinner
     if [[ $removed_count -gt 0 ]]; then
         if [[ "$DRY_RUN" == "true" ]]; then
             echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Orphaned app container stubs, ${YELLOW}${removed_count} stubs dry${NC}"
@@ -875,5 +1046,7 @@ clean_orphaned_container_stubs() {
     fi
     if [[ $failed_count -gt 0 ]]; then
         echo -e "  ${GRAY}${ICON_WARNING}${NC} Orphaned container stubs: $failed_count could not be removed"
+        # Keep the warning visible past the idle-section erase.
+        note_activity
     fi
 }

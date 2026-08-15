@@ -219,7 +219,8 @@ jobs:
           set -euo pipefail
           APP_DIR="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Burrow.app"
           DMG_DIR="src-tauri/target/aarch64-apple-darwin/release/bundle/dmg"
-          SOURCE_ARCHIVE="third_party/sources/clamav-1.5.4.tar.gz"
+          CLAMAV_SOURCE_ARCHIVE="third_party/sources/clamav-1.5.4.tar.gz"
+          MOLE_SOURCE_ARCHIVE="third_party/sources/mole-1.48.1.tar.gz"
           DIST="release-dist"
           mkdir -p "$DIST"
 
@@ -231,7 +232,8 @@ jobs:
             "$APP_DIR" "$DIST/Burrow_${VERSION}_aarch64.app.zip"
           cp src-tauri/burrow.cdx.json "$DIST/burrow-cargo.cdx.json"
           cp npm.cdx.json "$DIST/burrow-npm.cdx.json"
-          cp "$SOURCE_ARCHIVE" "$DIST/clamav-1.5.4.tar.gz"
+          cp "$CLAMAV_SOURCE_ARCHIVE" "$DIST/clamav-1.5.4.tar.gz"
+          cp "$MOLE_SOURCE_ARCHIVE" "$DIST/mole-1.48.1.tar.gz"
 
           (
             cd "$DIST"

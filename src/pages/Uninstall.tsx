@@ -84,6 +84,7 @@ interface AppStoreResult {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const sizeCache = new Map<string, number>();
+const RESIDUAL_PREVIEW_TTL_MS = 9 * 60 * 1000;
 const residualCache = new Map<string, FileEntry[]>();
 
 function formatBytes(b: number): string {
@@ -283,6 +284,7 @@ function UninstallTab({
   const [loadingSizes, setLoadingSizes] = useState<Set<string>>(new Set());
   const [residuals, setResiduals] = useState<Map<string, FileEntry[]>>(new Map());
   const [loadingResiduals, setLoadingResiduals] = useState<Set<string>>(new Set());
+  const [previewErrors, setPreviewErrors] = useState<Map<string, string>>(new Map());
   const [sortKey, setSortKey] = useState<SortKey>("name");
 
   const loadApps = useCallback(() => {
@@ -319,15 +321,25 @@ function UninstallTab({
           })
         );
     }
-    if (!residualCache.has(p)) {
+    const cachedResiduals = residualCache.get(p);
+    if (cachedResiduals) {
+      setResiduals((prev) => new Map(prev).set(p, cachedResiduals));
+    } else {
+      residualCache.delete(p);
       setLoadingResiduals((prev) => new Set(prev).add(p));
+      setPreviewErrors((prev) => {
+        const next = new Map(prev);
+        next.delete(p);
+        return next;
+      });
       invoke<FileEntry[]>("find_app_residuals", { appName: app.name, appPath: app.path })
         .then((files) => {
           residualCache.set(p, files);
+          window.setTimeout(() => residualCache.delete(p), RESIDUAL_PREVIEW_TTL_MS);
           setResiduals((prev) => new Map(prev).set(p, files));
         })
-        .catch(() => {
-          residualCache.set(p, []);
+        .catch((error) => {
+          setPreviewErrors((prev) => new Map(prev).set(p, String(error)));
         })
         .finally(() =>
           setLoadingResiduals((prev) => {
@@ -344,6 +356,12 @@ function UninstallTab({
     setExpanded(null);
     mo.reset();
     const code = await mo.uninstall(app.name, app.path);
+    residualCache.delete(app.path);
+    setResiduals((prev) => {
+      const next = new Map(prev);
+      next.delete(app.path);
+      return next;
+    });
     if (code === 0) {
       setApps((prev) => prev.filter((a) => a.path !== app.path));
       onUninstalled(app.name);
@@ -500,13 +518,17 @@ function UninstallTab({
                             <Loader2 size={10} className="animate-spin" />{" "}
                             {t.uninstall_searching_residuals}
                           </div>
+                        ) : previewErrors.has(app.path) ? (
+                          <div className="text-[10px]" style={{ color: "var(--danger)" }}>
+                            Aperçu Mole indisponible — {previewErrors.get(app.path)}
+                          </div>
                         ) : (residuals.get(app.path) ?? []).length > 0 ? (
                           <div className="flex flex-col gap-0.5">
                             <div
                               className="text-[9px] uppercase tracking-widest"
                               style={{ color: "var(--text-3)" }}
                             >
-                              {t.uninstall_residuals_title}
+                              {t.uninstall_residuals_title} · Mole
                             </div>
                             {(residuals.get(app.path) ?? []).map((f) => (
                               <div key={f.path} className="flex items-center gap-2 text-[10px]">
@@ -514,7 +536,7 @@ function UninstallTab({
                                   className="flex-1 truncate font-mono"
                                   style={{ color: "var(--text-2)" }}
                                 >
-                                  {f.name}
+                                  {f.path.replace(/^\/Users\/[^/]+/, "~")}
                                 </span>
                                 <span style={{ color: "var(--text-3)" }}>
                                   {formatBytes(f.size_bytes)}
@@ -529,7 +551,12 @@ function UninstallTab({
                         )}
                         <button
                           onClick={() => handleUninstall(app)}
-                          disabled={isRunning}
+                          disabled={
+                            isRunning ||
+                            loadingResiduals.has(app.path) ||
+                            !residuals.has(app.path) ||
+                            previewErrors.has(app.path)
+                          }
                           className="btn-primary flex items-center justify-center gap-1.5 py-1.5 text-xs disabled:opacity-50"
                         >
                           <Trash2 size={11} />

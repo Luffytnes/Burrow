@@ -40,13 +40,34 @@ gpu_cache_dir_is_stale() {
     [[ -z "$recent_file" ]]
 }
 
+# Fail-closed Software Update probe for macOS installer cleanup. Returns 0
+# (treat as pending) when recommended updates are queued, and also when the
+# plist is unreadable, plutil fails, or the key is missing: removing staged
+# update payloads on a wrong "no updates" answer left a Mac unbootable on a
+# macOS 27 beta, so an unknown state must block cleanup.
+software_update_pending_or_unknown() {
+    local plist="${1:-/Library/Preferences/com.apple.SoftwareUpdate.plist}"
+    [[ -f "$plist" ]] || return 0
+    local recommended=""
+    if ! recommended=$(plutil -extract RecommendedUpdates json -o - "$plist" 2> /dev/null); then
+        return 0
+    fi
+    recommended=$(printf '%s' "$recommended" | tr -d '[:space:]')
+    # Only a readable, explicitly empty RecommendedUpdates array means "no
+    # pending updates"; anything else stays fail-closed.
+    if [[ "$recommended" == "[]" ]]; then
+        return 1
+    fi
+    return 0
+}
+
 # System caches, logs, and temp files.
 clean_deep_system() {
     stop_section_spinner
     local cache_cleaned=0
     start_section_spinner "Cleaning system caches..."
     # Optimized: Single pass for /Library/Caches (3 patterns in 1 scan)
-    if sudo test -d "/Library/Caches" 2> /dev/null; then
+    if sudo -n test -d "/Library/Caches" 2> /dev/null; then
         while IFS= read -r -d '' file; do
             if should_protect_path "$file"; then
                 continue
@@ -54,7 +75,7 @@ clean_deep_system() {
             if safe_sudo_remove "$file"; then
                 cache_cleaned=1
             fi
-        done < <(sudo find "/Library/Caches" -maxdepth 5 -type f \( \
+        done < <(sudo -n find "/Library/Caches" -maxdepth 5 -type f \( \
             \( -name "*.cache" -mtime "+$MOLE_TEMP_FILE_AGE_DAYS" \) -o \
             \( -name "*.tmp" -mtime "+$MOLE_TEMP_FILE_AGE_DAYS" \) -o \
             \( -name "*.log" -mtime "+$MOLE_LOG_AGE_DAYS" \) \
@@ -66,7 +87,7 @@ clean_deep_system() {
     local tmp_cleaned=0
     local -a sys_temp_dirs=("/private/tmp" "/private/var/tmp")
     for tmp_dir in "${sys_temp_dirs[@]}"; do
-        if sudo find "$tmp_dir" -maxdepth 1 -type f -mtime "+${MOLE_TEMP_FILE_AGE_DAYS}" -print -quit 2> /dev/null | grep -q .; then
+        if sudo -n find "$tmp_dir" -maxdepth 1 -type f -mtime "+${MOLE_TEMP_FILE_AGE_DAYS}" -print -quit 2> /dev/null | grep -q .; then
             if safe_sudo_find_delete "$tmp_dir" "*" "${MOLE_TEMP_FILE_AGE_DAYS}" "f"; then
                 tmp_cleaned=1
             fi
@@ -75,13 +96,13 @@ clean_deep_system() {
     stop_section_spinner
     [[ $tmp_cleaned -eq 1 ]] && log_success "System temp files"
     start_section_spinner "Cleaning system crash reports..."
-    if sudo find "/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -mtime "+$MOLE_CRASH_REPORT_AGE_DAYS" -print -quit 2> /dev/null | grep -q .; then
+    if sudo -n find "/Library/Logs/DiagnosticReports" -maxdepth 1 -type f -mtime "+$MOLE_CRASH_REPORT_AGE_DAYS" -print -quit 2> /dev/null | grep -q .; then
         safe_sudo_find_delete "/Library/Logs/DiagnosticReports" "*" "$MOLE_CRASH_REPORT_AGE_DAYS" "f" || true
     fi
     stop_section_spinner
     log_success "System crash reports"
     start_section_spinner "Cleaning system logs..."
-    if sudo find "/private/var/log" -maxdepth 3 -type f \( -name "*.log" -o -name "*.gz" -o -name "*.asl" \) -mtime "+$MOLE_LOG_AGE_DAYS" -print -quit 2> /dev/null | grep -q .; then
+    if sudo -n find "/private/var/log" -maxdepth 3 -type f \( -name "*.log" -o -name "*.gz" -o -name "*.asl" \) -mtime "+$MOLE_LOG_AGE_DAYS" -print -quit 2> /dev/null | grep -q .; then
         safe_sudo_find_delete "/private/var/log" "*.log" "$MOLE_LOG_AGE_DAYS" "f" || true
         safe_sudo_find_delete "/private/var/log" "*.gz" "$MOLE_LOG_AGE_DAYS" "f" || true
         safe_sudo_find_delete "/private/var/log" "*.asl" "$MOLE_LOG_AGE_DAYS" "f" || true
@@ -96,64 +117,28 @@ clean_deep_system() {
     local third_party_logs_cleaned=0
     local third_party_log_dir=""
     for third_party_log_dir in "${third_party_log_dirs[@]}"; do
-        if sudo test -d "$third_party_log_dir" 2> /dev/null; then
-            if sudo find "$third_party_log_dir" -maxdepth 5 -type f -mtime "+$MOLE_LOG_AGE_DAYS" -print -quit 2> /dev/null | grep -q .; then
+        if sudo -n test -d "$third_party_log_dir" 2> /dev/null; then
+            if sudo -n find "$third_party_log_dir" -maxdepth 5 -type f -mtime "+$MOLE_LOG_AGE_DAYS" -print -quit 2> /dev/null | grep -q .; then
                 if safe_sudo_find_delete "$third_party_log_dir" "*" "$MOLE_LOG_AGE_DAYS" "f"; then
                     third_party_logs_cleaned=1
                 fi
             fi
         fi
     done
-    if sudo find "/Library/Logs" -maxdepth 1 -type f -name "adobegc.log" -mtime "+$MOLE_LOG_AGE_DAYS" -print -quit 2> /dev/null | grep -q .; then
+    if sudo -n find "/Library/Logs" -maxdepth 1 -type f -name "adobegc.log" -mtime "+$MOLE_LOG_AGE_DAYS" -print -quit 2> /dev/null | grep -q .; then
         if safe_sudo_remove "/Library/Logs/adobegc.log"; then
             third_party_logs_cleaned=1
         fi
     fi
     stop_section_spinner
     [[ $third_party_logs_cleaned -eq 1 ]] && log_success "Third-party system logs"
-    start_section_spinner "Scanning system library updates..."
-    if [[ -d "/Library/Updates" && ! -L "/Library/Updates" ]]; then
-        local updates_cleaned=0
-        while IFS= read -r -d '' item; do
-            if [[ -z "$item" ]] || [[ ! "$item" =~ ^/Library/Updates/[^/]+$ ]]; then
-                debug_log "Skipping malformed path: $item"
-                continue
-            fi
-            local item_flags
-            item_flags=$($STAT_BSD -f%Sf "$item" 2> /dev/null || echo "")
-            if [[ "$item_flags" == *"restricted"* ]]; then
-                continue
-            fi
-            if safe_sudo_remove "$item"; then
-                updates_cleaned=$((updates_cleaned + 1))
-            fi
-        done < <(find /Library/Updates -mindepth 1 -maxdepth 1 -print0 2> /dev/null || true)
-        stop_section_spinner
-        [[ $updates_cleaned -gt 0 ]] && log_success "System library updates"
-    else
-        stop_section_spinner
-    fi
+    # Software Update owns /Library/Updates and /macOS Install Data. Age,
+    # process, and plist probes cannot prove those staging trees are inactive
+    # across the full scan-to-delete window, so clean never removes them.
+    [[ -d "/Library/Updates" ]] && debug_log "Keeping /Library/Updates: managed by Software Update"
+    [[ -d "/macOS Install Data" ]] && debug_log "Keeping macOS Install Data: managed by Software Update"
+
     start_section_spinner "Scanning macOS installer files..."
-    if [[ -d "/macOS Install Data" ]]; then
-        local mtime
-        mtime=$(get_file_mtime "/macOS Install Data")
-        local age_days=$((($(get_epoch_seconds) - mtime) / 86400))
-        debug_log "Found macOS Install Data, age ${age_days} days"
-        if [[ $age_days -ge 14 ]]; then
-            local size_kb
-            size_kb=$(get_path_size_kb "/macOS Install Data")
-            if [[ -n "$size_kb" && "$size_kb" -gt 0 ]]; then
-                local size_human
-                size_human=$(bytes_to_human "$((size_kb * 1024))")
-                debug_log "Cleaning macOS Install Data: $size_human, ${age_days} days old"
-                if safe_sudo_remove "/macOS Install Data"; then
-                    log_success "macOS Install Data, $size_human"
-                fi
-            fi
-        else
-            debug_log "Keeping macOS Install Data, only ${age_days} days old, needs 14+"
-        fi
-    fi
     # Clean macOS installer apps (e.g., "Install macOS Sequoia.app")
     # Only remove installers older than 14 days, not currently running,
     # and not matching the currently installed macOS version (recovery safety).
@@ -162,6 +147,12 @@ clean_deep_system() {
     current_macos_version=$(sw_vers -productVersion 2> /dev/null | cut -d. -f1 || true)
     for installer_app in /Applications/Install\ macOS*.app; do
         [[ -d "$installer_app" ]] || continue
+        # Same fail-closed gate as /macOS Install Data: a queued Software
+        # Update may be about to use this installer.
+        if software_update_pending_or_unknown; then
+            debug_log "Skipping macOS installer app cleanup: Software Update pending or state unknown"
+            break
+        fi
         local app_name
         app_name=$(basename "$installer_app")
         # Skip if installer is currently running
@@ -207,6 +198,11 @@ clean_deep_system() {
     start_section_spinner "Scanning browser code signature caches..."
     local code_sign_cleaned=0
     while IFS= read -r -d '' cache_dir; do
+        # Never delete an EDR agent's code-signature clone -- same sensor-tamper
+        # risk as its caches below. Browsers are the intended target here.
+        if is_endpoint_security_cache_path "$cache_dir"; then
+            continue
+        fi
         if safe_sudo_remove "$cache_dir"; then
             code_sign_cleaned=$((code_sign_cleaned + 1))
         fi
@@ -221,7 +217,7 @@ clean_deep_system() {
     )
     local rebuildable_cache_dir=""
     for rebuildable_cache_dir in "${rebuildable_cache_dirs[@]}"; do
-        if sudo test -e "$rebuildable_cache_dir" 2> /dev/null; then
+        if sudo -n test -e "$rebuildable_cache_dir" 2> /dev/null; then
             if safe_sudo_remove "$rebuildable_cache_dir"; then
                 rebuildable_cache_cleaned=$((rebuildable_cache_cleaned + 1))
             fi
@@ -239,6 +235,17 @@ clean_deep_system() {
     local gpu_cache_dir=""
     while IFS= read -r -d '' gpu_cache_dir; do
         is_rebuildable_gpu_cache_dir "$gpu_cache_dir" || continue
+        # Endpoint-security/EDR agents (CrowdStrike Falcon, SentinelOne, ...)
+        # tamper-protect their cache container, so deleting even a rebuildable
+        # Metal shader cache inside it raises a sensor-tamper alert reported as
+        # malware. Skip only those; every other app's GPU cache stays cleanable.
+        # Use the dedicated EDR predicate here, not should_protect_path(): this
+        # loop targets com.apple.metal* dirs, and should_protect_path() can treat
+        # those rebuildable cache names as protected (via should_protect_data),
+        # which would suppress the whole sweep.
+        if is_endpoint_security_cache_path "$gpu_cache_dir"; then
+            continue
+        fi
         gpu_cache_dir_is_stale "$gpu_cache_dir" "$MOLE_GPU_CACHE_AGE_DAYS" || continue
         if safe_sudo_remove "$gpu_cache_dir"; then
             gpu_cache_cleaned=$((gpu_cache_cleaned + 1))
@@ -255,6 +262,32 @@ clean_deep_system() {
         log_success "Accessible rebuildable GPU caches, $gpu_cache_cleaned $gpu_cache_label"
     fi
 
+    # Aborted Aerial / dynamic-wallpaper downloads. com.apple.idleassetsd runs
+    # as root, so its per-user Darwin temp dir sits under root's
+    # /private/var/folders tree (mode 700) and is invisible to an unprivileged
+    # scan: macOS buries the bytes in the opaque "System Data" bucket, and a
+    # stuck (re)download can leave hundreds of GB of ~1GB CFNetworkDownload_*.tmp
+    # files behind (#1253). Scope the removal to the idleassetsd temp dir and to
+    # that exact aborted-download name, older than the temp-file retention
+    # window, so an in-progress download (recent mtime) is never touched. macOS
+    # re-fetches assets on demand, so the removal is non-destructive. The locator
+    # needs sudo because the whole tree is root-owned; safe_sudo_find_delete then
+    # re-applies the shared protection and whitelist gates per file.
+    start_section_spinner "Scanning stale wallpaper downloads..."
+    local idle_tmp_cleaned=0
+    local idle_tmp_dir=""
+    while IFS= read -r -d '' idle_tmp_dir; do
+        # Only act when a stale aborted download actually exists, so the summary
+        # line stays truthful and the delete is skipped otherwise.
+        if sudo -n find "$idle_tmp_dir" -maxdepth 5 -type f -name "CFNetworkDownload_*.tmp" -mtime "+$MOLE_TEMP_FILE_AGE_DAYS" -print -quit 2> /dev/null | grep -q .; then
+            if safe_sudo_find_delete "$idle_tmp_dir" "CFNetworkDownload_*.tmp" "$MOLE_TEMP_FILE_AGE_DAYS" "f"; then
+                idle_tmp_cleaned=$((idle_tmp_cleaned + 1))
+            fi
+        fi
+    done < <(run_with_timeout 8 sudo -n find /private/var/folders -maxdepth 5 -type d -name "com.apple.idleassetsd" -path "*/T/*" -print0 2> /dev/null || true) # 8s: deep root-owned /private/var/folders walk
+    stop_section_spinner
+    [[ $idle_tmp_cleaned -gt 0 ]] && log_success "Stale wallpaper downloads"
+
     local diag_base="/private/var/db/diagnostics"
     start_section_spinner "Cleaning system diagnostic logs..."
     safe_sudo_find_delete "$diag_base" "*" "$MOLE_LOG_AGE_DAYS" "f" || true
@@ -270,13 +303,13 @@ clean_deep_system() {
     start_section_spinner "Cleaning memory exception reports..."
     local mem_reports_dir="/private/var/db/reportmemoryexception/MemoryLimitViolations"
     local mem_cleaned=0
-    if sudo test -d "$mem_reports_dir" 2> /dev/null; then
+    if sudo -n test -d "$mem_reports_dir" 2> /dev/null; then
         # Count and size old files before deletion
         local file_count=0
         local total_size_kb=0
         local total_bytes=0
         local stats_out
-        stats_out=$(sudo find "$mem_reports_dir" -type f -mtime +30 -exec stat -f "%z" {} + 2> /dev/null | awk '{c++; s+=$1} END {print c+0, s+0}' || true)
+        stats_out=$(sudo -n find "$mem_reports_dir" -type f -mtime +30 -exec stat -f "%z" {} + 2> /dev/null | awk '{c++; s+=$1} END {print c+0, s+0}' || true)
         if [[ -n "$stats_out" ]]; then
             read -r file_count total_bytes <<< "$stats_out"
             total_size_kb=$((total_bytes / 1024))
@@ -294,6 +327,7 @@ clean_deep_system() {
                     log_operation "clean" "REMOVED" "$mem_reports_dir" "$file_count files, $size_human"
                 fi
             else
+                safe_sudo_find_delete "$mem_reports_dir" "*" "30" "f" || true
                 log_info "[DRY-RUN] Would remove $file_count old memory exception reports ($total_size_kb KB)"
             fi
         fi
@@ -308,12 +342,12 @@ clean_deep_system() {
 clean_time_machine_failed_backups() {
     local tm_cleaned=0
     if ! command -v tmutil > /dev/null 2>&1; then
-        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} No incomplete backups found"
+        debug_log "Time Machine: no incomplete backups found"
         return 0
     fi
     # Fast pre-check: skip entirely if Time Machine is not configured (no tmutil needed)
     if ! defaults read /Library/Preferences/com.apple.TimeMachine AutoBackup 2> /dev/null | grep -qE '^[01]$'; then
-        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} No incomplete backups found"
+        debug_log "Time Machine: no incomplete backups found"
         return 0
     fi
     start_section_spinner "Checking Time Machine configuration..."
@@ -324,21 +358,34 @@ clean_time_machine_failed_backups() {
         if [[ "$spinner_active" == "true" ]]; then
             stop_section_spinner
         fi
-        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} No incomplete backups found"
+        debug_log "Time Machine: no incomplete backups found"
         return 0
     fi
     if [[ ! -d "/Volumes" ]]; then
         if [[ "$spinner_active" == "true" ]]; then
             stop_section_spinner
         fi
-        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} No incomplete backups found"
+        debug_log "Time Machine: no incomplete backups found"
         return 0
     fi
-    if tm_is_running; then
+    # tm_is_running is tri-state: 0 running, 1 idle, 2 status-unknown. Treat
+    # both running and unknown as "do not touch backups", the same idiom
+    # clean_local_snapshots uses. A bare `if tm_is_running` would let a
+    # transient tmutil error (rc 2) fall through and delete an in-progress
+    # backup.
+    local rc_tm_running=0
+    tm_is_running || rc_tm_running=$?
+    if [[ $rc_tm_running -eq 0 || $rc_tm_running -eq 2 ]]; then
         if [[ "$spinner_active" == "true" ]]; then
             stop_section_spinner
         fi
-        echo -e "  ${YELLOW}!${NC} Time Machine backup in progress, skipping cleanup"
+        if [[ $rc_tm_running -eq 2 ]]; then
+            echo -e "  ${YELLOW}!${NC} Time Machine cleanup · skipped (status unknown)"
+            note_activity
+        else
+            echo -e "  ${YELLOW}!${NC} Time Machine cleanup · skipped (backup in progress)"
+            note_activity
+        fi
         return 0
     fi
     if [[ "$spinner_active" == "true" ]]; then
@@ -358,7 +405,7 @@ clean_time_machine_failed_backups() {
         if [[ "$spinner_active" == "true" ]]; then
             stop_section_spinner
         fi
-        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} No incomplete backups found"
+        debug_log "Time Machine: no incomplete backups found"
         return 0
     fi
     if [[ "$spinner_active" == "true" ]]; then
@@ -377,6 +424,10 @@ clean_time_machine_failed_backups() {
                 # Only delete old incomplete backups (safety window).
                 local file_mtime
                 file_mtime=$(get_file_mtime "$inprogress_file")
+                # get_file_mtime returns 0 when stat fails. A 0 here would make
+                # the backup look ancient and clear the safety window, so treat
+                # "cannot read mtime" as "too recent to touch" and keep it.
+                [[ "$file_mtime" =~ ^[0-9]+$ && "$file_mtime" -gt 0 ]] || continue
                 local current_time
                 current_time=$(get_epoch_seconds)
                 local hours_old=$(((current_time - file_mtime) / 3600))
@@ -395,19 +446,23 @@ clean_time_machine_failed_backups() {
                 local size_human
                 size_human=$(bytes_to_human "$((size_kb * 1024))")
                 if [[ "$DRY_RUN" == "true" ]]; then
-                    echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Incomplete backup: $backup_name${NC}, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+                    if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                        record_dry_run_cleanup_target "$inprogress_file" "$size_kb" 1 true || continue
+                    fi
+                    echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Incomplete backup: $backup_name${NC} · $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
                     tm_cleaned=$((tm_cleaned + 1))
                     note_activity
                     continue
                 fi
                 if ! command -v tmutil > /dev/null 2>&1; then
-                    echo -e "  ${YELLOW}!${NC} tmutil not available, skipping: $backup_name"
+                    echo -e "  ${YELLOW}!${NC} Incomplete backup: $backup_name · skipped (tmutil unavailable)"
+                    note_activity
                     continue
                 fi
                 if tmutil delete "$inprogress_file" 2> /dev/null; then
                     local line_color
                     line_color=$(cleanup_result_color_kb "$size_kb")
-                    echo -e "  ${line_color}${ICON_SUCCESS}${NC} Incomplete backup: $backup_name${NC}, ${line_color}$size_human${NC}"
+                    echo -e "  ${line_color}${ICON_SUCCESS}${NC} Incomplete backup: $backup_name${NC} · ${line_color}$size_human${NC}"
                     tm_cleaned=$((tm_cleaned + 1))
                     files_cleaned=$((files_cleaned + 1))
                     total_size_cleaned=$((total_size_cleaned + size_kb))
@@ -415,6 +470,9 @@ clean_time_machine_failed_backups() {
                     note_activity
                 else
                     echo -e "  ${YELLOW}!${NC} Could not delete: $backup_name · try manually with sudo"
+                    # Mark activity so the idle-section erase in end_section
+                    # never wipes this failure warning off the terminal.
+                    note_activity
                 fi
             done < <(run_with_timeout 15 find "$backupdb_dir" -maxdepth 3 -type d \( -name "*.inProgress" -o -name "*.inprogress" \) 2> /dev/null || true) # 15s: Time Machine backupdb find, see lib/core/timeouts.sh
         fi
@@ -431,6 +489,8 @@ clean_time_machine_failed_backups() {
                     [[ -d "$inprogress_file" ]] || continue
                     local file_mtime
                     file_mtime=$(get_file_mtime "$inprogress_file")
+                    # Keep the backup if its mtime cannot be read (see above).
+                    [[ "$file_mtime" =~ ^[0-9]+$ && "$file_mtime" -gt 0 ]] || continue
                     local current_time
                     current_time=$(get_epoch_seconds)
                     local hours_old=$(((current_time - file_mtime) / 3600))
@@ -449,7 +509,10 @@ clean_time_machine_failed_backups() {
                     local size_human
                     size_human=$(bytes_to_human "$((size_kb * 1024))")
                     if [[ "$DRY_RUN" == "true" ]]; then
-                        echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Incomplete APFS backup in $bundle_name: $backup_name${NC}, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+                        if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                            record_dry_run_cleanup_target "$inprogress_file" "$size_kb" 1 true || continue
+                        fi
+                        echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Incomplete APFS backup in $bundle_name: $backup_name${NC} · $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
                         tm_cleaned=$((tm_cleaned + 1))
                         note_activity
                         continue
@@ -460,7 +523,7 @@ clean_time_machine_failed_backups() {
                     if tmutil delete "$inprogress_file" 2> /dev/null; then
                         local line_color
                         line_color=$(cleanup_result_color_kb "$size_kb")
-                        echo -e "  ${line_color}${ICON_SUCCESS}${NC} Incomplete APFS backup in $bundle_name: $backup_name${NC}, ${line_color}$size_human${NC}"
+                        echo -e "  ${line_color}${ICON_SUCCESS}${NC} Incomplete APFS backup in $bundle_name: $backup_name${NC} · ${line_color}$size_human${NC}"
                         tm_cleaned=$((tm_cleaned + 1))
                         files_cleaned=$((files_cleaned + 1))
                         total_size_cleaned=$((total_size_cleaned + size_kb))
@@ -468,6 +531,8 @@ clean_time_machine_failed_backups() {
                         note_activity
                     else
                         echo -e "  ${YELLOW}!${NC} Could not delete from bundle: $backup_name"
+                        # Keep the warning visible past the idle-section erase.
+                        note_activity
                     fi
                 done < <(run_with_timeout 15 find "$mounted_path" -maxdepth 3 -type d \( -name "*.inProgress" -o -name "*.inprogress" \) 2> /dev/null || true) # 15s: TM sparsebundle inner find, see lib/core/timeouts.sh
             fi
@@ -477,7 +542,7 @@ clean_time_machine_failed_backups() {
         stop_section_spinner
     fi
     if [[ $tm_cleaned -eq 0 ]]; then
-        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} No incomplete backups found"
+        debug_log "Time Machine: no incomplete backups found"
     fi
 }
 # Returns 0 if a backup is actively running.
@@ -512,13 +577,15 @@ clean_local_snapshots() {
 
     if [[ $rc_running -eq 2 ]]; then
         stop_section_spinner
-        echo -e "  ${YELLOW}!${NC} Could not determine Time Machine status; skipping snapshot check"
+        echo -e "  ${YELLOW}!${NC} Snapshot check · skipped (Time Machine status unknown)"
+        note_activity
         return 0
     fi
 
     if [[ $rc_running -eq 0 ]]; then
         stop_section_spinner
-        echo -e "  ${YELLOW}!${NC} Time Machine is active; skipping snapshot check"
+        echo -e "  ${YELLOW}!${NC} Snapshot check · skipped (backup in progress)"
+        note_activity
         return 0
     fi
 
@@ -531,8 +598,7 @@ clean_local_snapshots() {
     local snapshot_count
     snapshot_count=$(echo "$snapshot_list" | { grep -Eo 'com\.apple\.TimeMachine\.[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}' || true; } | wc -l | awk '{print $1}')
     if [[ "$snapshot_count" =~ ^[0-9]+$ && "$snapshot_count" -gt 0 ]]; then
-        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Time Machine local snapshots: ${GREEN}${snapshot_count}${NC}"
-        echo -e "  ${GRAY}${ICON_REVIEW}${NC} ${GRAY}Review: tmutil listlocalsnapshots /${NC}"
+        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Time Machine local snapshots · ${GREEN}${snapshot_count}${NC} ${GRAY}(review: tmutil listlocalsnapshots /)${NC}"
         note_activity
     fi
 }

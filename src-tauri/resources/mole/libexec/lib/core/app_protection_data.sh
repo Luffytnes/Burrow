@@ -12,51 +12,7 @@ readonly MOLE_APP_PROTECTION_DATA_LOADED=1
 
 # Application Management
 
-# ============================================================================
-# Performance Note:
-# - SYSTEM_CRITICAL_BUNDLES_FAST: Fast wildcard patterns for cleanup operations
-# - SYSTEM_CRITICAL_BUNDLES: Detailed list for uninstall protection (lazy-loaded)
-# ============================================================================
-
-# Fast patterns for cleanup operations (used by should_protect_data)
-# These wildcards provide adequate protection with minimal performance impact
-readonly SYSTEM_CRITICAL_BUNDLES_FAST=(
-    "com.apple.*"
-    "loginwindow"
-    "dock"
-    "systempreferences"
-    "finder"
-    "safari"
-    "backgroundtaskmanagement*"
-    "keychain*"
-    "security*"
-    "bluetooth*"
-    "wifi*"
-    "network*"
-    "tcc"
-    "notification*"
-    "accessibility*"
-    "universalaccess*"
-    "HIToolbox*"
-    "textinput*"
-    "TextInput*"
-    "keyboard*"
-    "Keyboard*"
-    "inputsource*"
-    "InputSource*"
-    "keylayout*"
-    "KeyLayout*"
-    "GlobalPreferences"
-    ".GlobalPreferences"
-    "org.pqrs.Karabiner*"
-    # CUPS printing subsystem ships with macOS; there is no parent .app to
-    # anchor it, so org.cups.* prefs always look "orphaned" to bundle-ID
-    # matching. Deleting them wipes the default printer and recent-printer
-    # list, which users see as lost saved printers. See #731.
-    "org.cups.*"
-)
-
-# Detailed list for uninstall protection
+# Detailed list for uninstall protection (lazy-loaded into SYSTEM_CRITICAL_REGEX).
 # Critical system components protected from uninstallation
 # Note: We explicitly list system components instead of using "com.apple.*" wildcard
 # to allow uninstallation of user-installed Apple apps (Xcode, Final Cut Pro, etc.)
@@ -165,7 +121,6 @@ readonly SYSTEM_CRITICAL_BUNDLES=(
     "KeyLayout*"
     "GlobalPreferences"
     ".GlobalPreferences"
-    "org.pqrs.Karabiner*"
 )
 
 # Apple apps that CAN be uninstalled (from App Store or developer.apple.com)
@@ -181,6 +136,35 @@ readonly APPLE_UNINSTALLABLE_APPS=(
     "com.apple.MainStage*"
     "com.apple.server.*"    # macOS Server
     "com.apple.Playgrounds" # Swift Playgrounds
+)
+
+# Vendor-managed security / MDM apps must use their official uninstallers.
+# Shape: vendor|bundle-prefixes-comma-separated|name-fragments-comma-separated
+readonly OFFICIAL_UNINSTALLER_RULES=(
+    "ESET|com.eset.|eset management agent,eset remote administrator agent,eset endpoint security,eset endpoint antivirus"
+    "Jamf|com.jamf.,com.jamfsoftware.|jamf connect,jamf protect,jamf self service"
+    "CrowdStrike|com.crowdstrike.|crowdstrike,falcon"
+    "SentinelOne|com.sentinelone.,com.sentinel-labs.|sentinelone,sentinel agent"
+    "GlobalProtect|com.paloaltonetworks.|globalprotect"
+    "Cisco|com.cisco.anyconnect,com.cisco.secureclient|cisco secure client,cisco anyconnect"
+)
+
+# Endpoint-security / EDR / MDM agent bundle-id prefixes. Their per-user Darwin
+# caches under /private/var/folders must never be deleted: removing anything
+# inside a sensor's container trips tamper detection (e.g. CrowdStrike
+# "MacFalconSensorTamper", MITRE T1562.001) that corporate security reports as
+# malware. Keep in sync with the vendors in OFFICIAL_UNINSTALLER_RULES above.
+# Consumed by is_endpoint_security_cache_path() in app_protection.sh.
+readonly ENDPOINT_SECURITY_BUNDLE_PREFIXES=(
+    "com.crowdstrike."
+    "com.sentinelone."
+    "com.sentinel-labs."
+    "com.eset."
+    "com.jamf."
+    "com.jamfsoftware."
+    "com.paloaltonetworks."
+    "com.cisco.anyconnect"
+    "com.cisco.secureclient"
 )
 
 # Applications with sensitive data; protected during cleanup but removable
@@ -371,6 +355,9 @@ readonly DATA_PROTECTED_BUNDLES=(
 
     # Docker & Virtualization
     "com.docker.docker"
+    "dev.orbstack.OrbStack"
+    "dev.orbstack.*"
+    "dev.kdrag0n.MacVirt"
     "com.getutm.UTM"
     "com.vmware.fusion"
     "com.parallels.desktop.*"
@@ -407,7 +394,8 @@ readonly DATA_PROTECTED_BUNDLES=(
 
     # Launcher & Automation
     "com.runningwithcrayons.Alfred"
-    "com.raycast.macos"
+    "com.raycast.*"
+    "com.raycast-x.*"
     "com.blacktree.Quicksilver"
     "com.stairways.keyboardmaestro.*"
     "com.manytricks.Butler"
@@ -593,3 +581,11 @@ readonly DATA_PROTECTED_BUNDLES=(
     "com.devmate.*"
     "org.sparkle-project.Sparkle*"
 )
+
+# Generic app-name words that collide with many unrelated LaunchAgents/Daemons.
+# When an app's display name is exactly one of these, name-based plist matching
+# is skipped (bundle-id matching still applies) so we never delete third-party or
+# system agents that merely share the word. Shared by find_app_files() (user
+# LaunchAgents) and find_app_system_files() (system LaunchAgents/Daemons) so the
+# two scans stay symmetric.
+readonly LAUNCH_AGENT_NAME_COMMON_WORDS="Music|Notes|Photos|Finder|Safari|Preview|Calendar|Contacts|Messages|Reminders|Clock|Weather|Stocks|Books|News|Podcasts|Voice|Files|Store|System|Helper|Agent|Daemon|Service|Update|Sync|Backup|Cloud|Manager|Monitor|Server|Client|Worker|Runner|Launcher|Driver|Plugin|Extension|Widget|Utility"

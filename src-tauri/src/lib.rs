@@ -9,7 +9,7 @@ extern crate libc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -149,6 +149,54 @@ fn require_path_grant(path: &str, purpose: PathGrantPurpose) -> Result<PathBuf, 
         .ok_or_else(|| "Chemin non autorisé : relancez l'analyse avant cette action".to_string())?;
     let _ = grant;
     Ok(canonical)
+}
+
+struct MolePreviewGrant {
+    name: String,
+    bundle_id: String,
+    paths: Vec<PathBuf>,
+    issued_at: Instant,
+}
+
+fn mole_preview_grants() -> &'static Mutex<HashMap<PathBuf, MolePreviewGrant>> {
+    static GRANTS: OnceLock<Mutex<HashMap<PathBuf, MolePreviewGrant>>> = OnceLock::new();
+    GRANTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn grant_mole_preview(path: &Path, name: &str, bundle_id: &str, paths: &[PathBuf]) {
+    if let Ok(mut grants) = mole_preview_grants().lock() {
+        grants.retain(|_, grant| grant.issued_at.elapsed() < Duration::from_secs(10 * 60));
+        grants.insert(
+            path.to_path_buf(),
+            MolePreviewGrant {
+                name: name.to_string(),
+                bundle_id: bundle_id.to_string(),
+                paths: paths.to_vec(),
+                issued_at: Instant::now(),
+            },
+        );
+    }
+}
+
+fn consume_mole_preview(path: &Path, name: &str, bundle_id: &str) -> Result<Vec<PathBuf>, String> {
+    let mut grants = mole_preview_grants()
+        .lock()
+        .map_err(|_| "Registre d'aperçus Mole indisponible".to_string())?;
+    grants.retain(|_, grant| grant.issued_at.elapsed() < Duration::from_secs(10 * 60));
+    let valid = grants
+        .get(path)
+        .filter(|grant| grant.name == name && grant.bundle_id == bundle_id)
+        .is_some();
+    if !valid {
+        return Err(
+            "Aperçu Mole expiré : ouvrez à nouveau l'application avant de la désinstaller"
+                .to_string(),
+        );
+    }
+    Ok(grants
+        .remove(path)
+        .expect("validated Mole preview grant")
+        .paths)
 }
 
 // ── App info ──────────────────────────────────────────────────────────────────
@@ -357,6 +405,120 @@ fn which_mo() -> Result<String, String> {
         }
     }
     Err("mo not found".to_string())
+}
+
+const MOLE_RESTRICTED_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+fn bundled_mo_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|error| error.to_string())?;
+    let mole_root = resource_dir.join("mole");
+    let mo_path = mole_root.join("bin").join("mo");
+    let canonical_root = fs::canonicalize(&mole_root)
+        .map_err(|error| format!("Ressources Mole introuvables : {error}"))?;
+    let canonical_mo = fs::canonicalize(&mo_path)
+        .map_err(|error| format!("CLI Mole embarqué introuvable : {error}"))?;
+    if !canonical_mo.starts_with(&canonical_root) || !canonical_mo.is_file() {
+        return Err("Chemin du CLI Mole embarqué invalide".to_string());
+    }
+    Ok(canonical_mo)
+}
+
+fn validate_mole_app_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.len() > 255
+        || name.starts_with('-')
+        || name.chars().any(|character| character.is_control())
+    {
+        return Err("Nom d'application incompatible avec la désinstallation Mole".to_string());
+    }
+    Ok(())
+}
+
+fn mole_uninstall_command(mo_path: &Path, dry_run: bool, name: &str) -> Command {
+    let mut command = Command::new(mo_path);
+    command
+        .env("PATH", MOLE_RESTRICTED_PATH)
+        // Burrow garantit une politique récupérable. Masquer Homebrew empêche
+        // Mole d'emprunter `brew uninstall --zap`, qui peut supprimer des
+        // fichiers au lieu de les déplacer dans la Corbeille.
+        .env("MOLE_DELETE_MODE", "trash")
+        // Burrow centralise l'historique dans son propre journal d'activité.
+        // Mole conserve ses diagnostics ordinaires mais ne duplique pas le
+        // journal détaillé des chemins manipulés.
+        .env("MO_NO_OPLOG", "1")
+        .env_remove("MOLE_DRY_RUN")
+        .env_remove("MOLE_TEST_MODE")
+        .env_remove("MOLE_TEST_NO_AUTH")
+        .arg("uninstall");
+    if dry_run {
+        command.arg("--dry-run");
+    }
+    command.arg(name);
+    command
+}
+
+fn run_mole_uninstall(mo_path: &Path, name: &str, dry_run: bool) -> Result<String, String> {
+    validate_mole_app_name(name)?;
+    let mut child = mole_uninstall_command(mo_path, dry_run, name)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Impossible de lancer Mole : {error}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        // Le clic de confirmation Burrow + Touch ID remplacent la première
+        // confirmation interactive du CLI. Mole effectue ensuite son propre
+        // aperçu et accepte EOF comme validation de ce plan.
+        stdin
+            .write_all(b"y\n")
+            .map_err(|error| format!("Impossible de confirmer Mole : {error}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("Impossible d'attendre Mole : {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if output.status.success() {
+        Ok(format!("{stdout}\n{stderr}"))
+    } else {
+        let details = [stdout.trim(), stderr.trim()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Err(if details.is_empty() {
+            format!("Mole a échoué avec le code {:?}", output.status.code())
+        } else {
+            details
+        })
+    }
+}
+
+fn strip_terminal_sequences(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for sequence_character in chars.by_ref() {
+                    if ('@'..='~').contains(&sequence_character) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if character != '\r' {
+            result.push(character);
+        }
+    }
+    result
 }
 
 fn du_mb(path: &Path) -> u64 {
@@ -868,8 +1030,8 @@ fn get_system_metrics(app: tauri::AppHandle) -> Result<SystemMetrics, String> {
     cached.ok_or_else(|| "loading".to_string())
 }
 
-/// Désinstalle une application .app de façon typée.
-/// Accepte uniquement le nom d'affichage et le chemin validé — aucun argument libre.
+/// Désinstalle une application et ses fichiers associés avec le CLI Mole
+/// embarqué. Le nom et le chemin restent typés et liés à un aperçu backend.
 #[tauri::command]
 fn uninstall_app(app: tauri::AppHandle, name: String, app_path: String) -> Result<(), String> {
     if app_path.is_empty() {
@@ -883,6 +1045,11 @@ fn uninstall_app(app: tauri::AppHandle, name: String, app_path: String) -> Resul
     if expected_name != Some(name.as_str()) {
         return Err("Le nom ne correspond pas à l'application analysée".to_string());
     }
+    validate_mole_app_name(&name)?;
+    let bundle_id = app_bundle_id(&canonical);
+    let expected_paths = consume_mole_preview(&canonical, &name, &bundle_id)?;
+    let mo_path = bundled_mo_path(&app)?;
+    let home = home_dir();
 
     // La préférence de protection est détenue et appliquée par le backend.
     // Un frontend compromis ne peut donc pas contourner Touch ID.
@@ -893,15 +1060,55 @@ fn uninstall_app(app: tauri::AppHandle, name: String, app_path: String) -> Resul
     std::thread::spawn(move || {
         let _ = app.emit(
             "mo-output",
-            format!("→ Déplacement de {} dans la Corbeille…", name),
+            format!(
+                "→ Mole analyse et désinstalle {} de façon récupérable…",
+                name
+            ),
         );
         let size = du_bytes(&canonical);
-        match move_path_to_trash(&canonical) {
-            Ok(()) => {
+        let fresh_preview = run_mole_uninstall(&mo_path, &name, true).and_then(|output| {
+            let mut paths = parse_mole_preview_paths(&output, &home);
+            paths.sort();
+            if paths == expected_paths {
+                Ok(())
+            } else {
+                Err(
+                    "Le contenu associé à l'application a changé depuis l'aperçu. Ouvrez-la à nouveau et contrôlez la nouvelle liste avant de confirmer."
+                        .to_string(),
+                )
+            }
+        });
+        if let Err(error) = fresh_preview {
+            let message = strip_terminal_sequences(&error).trim().to_string();
+            let _ = app.emit("mo-error", message.clone());
+            let _ = app.emit(
+                "mo-output",
+                format!("✗ Aperçu Mole devenu obsolète : {message}"),
+            );
+            activity::record(
+                "applications",
+                "Désinstallation récupérable Mole",
+                "error",
+                &name,
+                Some(size),
+                true,
+            );
+            let _ = app.emit("mo-done", 1i32);
+            return;
+        }
+        match run_mole_uninstall(&mo_path, &name, false) {
+            Ok(output) if !canonical.exists() => {
+                for line in strip_terminal_sequences(&output)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                {
+                    let _ = app.emit("mo-output", line.to_string());
+                }
                 let _ = app.emit(
                     "mo-output",
                     format!(
-                        "✓ {} déplacé dans la Corbeille — restauration possible",
+                        "✓ {} et ses fichiers associés ont été placés dans la Corbeille",
                         name
                     ),
                 );
@@ -915,11 +1122,34 @@ fn uninstall_app(app: tauri::AppHandle, name: String, app_path: String) -> Resul
                 );
                 let _ = app.emit("mo-done", 0i32);
             }
-            Err(e) => {
-                let _ = app.emit("mo-output", format!("✗ Échec : {}", e));
+            Ok(output) => {
+                let clean_output = strip_terminal_sequences(&output);
+                let message = if clean_output.trim().is_empty() {
+                    "Mole n'a pas retiré l'application sélectionnée".to_string()
+                } else {
+                    format!(
+                        "Mole n'a pas retiré l'application sélectionnée : {}",
+                        clean_output.trim()
+                    )
+                };
+                let _ = app.emit("mo-error", message.clone());
                 activity::record(
                     "applications",
-                    "Désinstallation récupérable",
+                    "Désinstallation récupérable Mole",
+                    "error",
+                    &name,
+                    Some(size),
+                    true,
+                );
+                let _ = app.emit("mo-done", 1i32);
+            }
+            Err(error) => {
+                let message = strip_terminal_sequences(&error).trim().to_string();
+                let _ = app.emit("mo-error", message.clone());
+                let _ = app.emit("mo-output", format!("✗ Échec Mole : {message}"));
+                activity::record(
+                    "applications",
+                    "Désinstallation récupérable Mole",
                     "error",
                     &name,
                     Some(size),
@@ -1216,32 +1446,19 @@ fn move_to_trash(path: String) -> Result<(), String> {
     result
 }
 
-/// Déplace un chemin dans la Corbeille via Finder. Le chemin est transmis en
-/// argument AppleScript, jamais interpolé dans le code exécuté.
+/// Déplace un chemin dans la Corbeille avec l'API native de macOS. L'appel
+/// provient ainsi de Burrow lui-même (TCC/FDA), sans automatiser Finder.
 fn move_path_to_trash(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
-    let path = path.to_string_lossy().into_owned();
-    // Pass the path as an argv value. Never interpolate a frontend-controlled path
-    // into AppleScript source: macOS filenames may legally contain quotes/newlines.
-    let script = r#"on run argv
-tell application "Finder" to delete POSIX file (item 1 of argv)
-end run"#;
-    let out = Command::new("/usr/bin/osascript")
-        .args(["-e", script, "--", &path])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr).to_string();
-        Err(if err.is_empty() {
-            "Failed to move to trash".to_string()
-        } else {
-            err
-        })
-    }
+    use trash::macos::{DeleteMethod, TrashContextExtMacos};
+
+    let mut context = trash::TrashContext::new();
+    context.set_delete_method(DeleteMethod::NsFileManager);
+    context
+        .delete(path)
+        .map_err(|error| format!("Impossible de déplacer l'élément dans la Corbeille : {error}"))
 }
 
 fn move_directory_children_to_trash(directory: &Path) -> Result<u64, String> {
@@ -1816,7 +2033,19 @@ fn get_mo_version(app: tauri::AppHandle) -> Result<String, String> {
         .arg("--version")
         .output()
         .map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    if !out.status.success() {
+        return Err(
+            strip_terminal_sequences(&String::from_utf8_lossy(&out.stderr))
+                .trim()
+                .to_string(),
+        );
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "Mole n'a pas renvoyé de version".to_string())
 }
 
 // ── 8. Brew outdated casks ────────────────────────────────────────────────────
@@ -3710,140 +3939,6 @@ pub struct FileEntry {
 
 // ── iCloud / FileProvider safety guard ───────────────────────────────────────
 
-fn is_icloud_path(path: &Path) -> bool {
-    let s = path.to_string_lossy();
-    if s.contains("com~apple~") {
-        return true;
-    }
-    let icloud_roots = [
-        "Library/Mobile Documents",
-        "Library/CloudStorage",
-        "Library/Application Support/FileProvider",
-        "Library/Application Support/CloudDocs",
-        "Library/Daemon Containers",
-        "Library/Caches/CloudKit",
-        "Library/Caches/com.apple.bird",
-        "Library/Caches/com.apple.cloudkit",
-        "Library/Caches/com.apple.cloudd",
-        "Library/Caches/com.apple.FileProvider",
-    ];
-    icloud_roots.iter().any(|root| s.contains(root))
-}
-
-// ── SIP / immutability detection (lstat BSD flags) ────────────────────────────
-
-fn is_sip_protected(path: &Path) -> bool {
-    use std::ffi::CString;
-    let Ok(cpath) = CString::new(path.to_string_lossy().as_bytes()) else {
-        return false;
-    };
-    unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        if libc::lstat(cpath.as_ptr(), &mut st) != 0 {
-            return false;
-        }
-        const SF_RESTRICTED: u32 = 0x00080000;
-        const SF_IMMUTABLE: u32 = 0x00020000;
-        const UF_IMMUTABLE: u32 = 0x00000002;
-        (st.st_flags & (SF_RESTRICTED | SF_IMMUTABLE | UF_IMMUTABLE)) != 0
-    }
-}
-
-// ── Container UUID discovery ──────────────────────────────────────────────────
-
-fn container_bundle_id(container_path: &Path) -> Option<String> {
-    let meta = container_path.join(".com.apple.containermanagerd.metadata.plist");
-    if !meta.exists() {
-        return None;
-    }
-    let out = Command::new("/usr/libexec/PlistBuddy")
-        .args(["-c", "Print MCMMetadataIdentifier", &meta.to_string_lossy()])
-        .output()
-        .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() || s.starts_with("Print:") {
-        None
-    } else {
-        Some(s)
-    }
-}
-
-// ── Per-app match rules (26 entries, ported from PureMac Conditions.swift) ───
-
-fn app_condition_matches(fname: &str, bundle_id: &str, app_name_lower: &str) -> Option<bool> {
-    let f = fname.to_lowercase();
-    let b = bundle_id.to_lowercase();
-    let app = app_name_lower;
-
-    // Xcode vs Xcodes disambiguation
-    if app == "xcode" && (f.contains("xcodes") || b.contains("xcodes")) {
-        return Some(false);
-    }
-    if app == "xcodes" && (f.contains("/xcode/") || b == "com.apple.dt.xcode") {
-        return Some(false);
-    }
-
-    // Chrome / Chromium disambiguation
-    if app == "google chrome" && f.contains("chromium") {
-        return Some(false);
-    }
-    if app == "chromium" && (f.contains("googlechrome") || f.contains("google chrome")) {
-        return Some(false);
-    }
-
-    // VS Code / VS Code Insiders
-    if app == "visual studio code" && f.contains("insiders") {
-        return Some(false);
-    }
-    if app == "visual studio code - insiders" && !f.contains("insiders") && f.contains("code") {
-        return Some(false);
-    }
-
-    // Microsoft Teams vs generic "teams"
-    if app == "microsoft teams" && !f.contains("microsoft") && !b.contains("microsoft") {
-        return Some(false);
-    }
-
-    // Firefox / Firefox Developer Edition / Firefox Nightly
-    if app == "firefox"
-        && (f.contains("developer") || f.contains("nightly") || b.contains("nightly"))
-    {
-        return Some(false);
-    }
-
-    // Brave
-    if app == "brave browser" && !f.contains("brave") && !b.contains("brave") {
-        return Some(false);
-    }
-
-    // Arc — only match arc-specific paths
-    if app == "arc" && !f.contains("arc") && !b.contains("thebrowser") {
-        return Some(false);
-    }
-
-    // 1Password
-    if app == "1password 7" || app == "1password" {
-        if f.contains("1password") || b.contains("1password") || b.contains("agilebits") {
-            return Some(true);
-        }
-        return Some(false);
-    }
-
-    // Zoom
-    if app == "zoom" && (f.contains("zoomus") || b.contains("zoomus") || f.contains("zoom.us")) {
-        return Some(true);
-    }
-
-    // Stats (menu bar)
-    if app == "stats"
-        && (f.contains("stats") && !f.contains("istatistica") && !f.contains("system stats"))
-    {
-        return Some(true);
-    }
-
-    None // no override — use default matching
-}
-
 // ── APFS purgeable space ──────────────────────────────────────────────────────
 
 #[derive(Serialize, Clone)]
@@ -4275,146 +4370,201 @@ fn clean_dev_caches(ids: Vec<String>) -> Result<u64, String> {
 
 // ── Find residual files left by an app ───────────────────────────────────────
 
-#[tauri::command]
-fn find_app_residuals(app_name: String, app_path: String) -> Vec<FileEntry> {
-    let Ok(app_path) = require_path_grant(&app_path, PathGrantPurpose::Uninstall) else {
-        return Vec::new();
-    };
-    if guard::validate_app_uninstall_path(&app_path.to_string_lossy()).is_err()
-        || app_path.file_stem().and_then(|value| value.to_str()) != Some(app_name.as_str())
-    {
-        return Vec::new();
-    }
-    let home = home_dir();
-    let name_lower = app_name.to_lowercase();
+fn parse_mole_preview_paths(output: &str, home: &Path) -> Vec<PathBuf> {
+    let clean = strip_terminal_sequences(output);
+    let mut in_file_list = false;
+    let mut seen = std::collections::HashSet::new();
+    let mut paths = Vec::new();
 
-    // Build match patterns: name variants + bundle ID components
-    let mut patterns: Vec<String> = Vec::new();
-    patterns.push(name_lower.clone());
-    let normalized: String = name_lower.chars().filter(|c| c.is_alphanumeric()).collect();
-    if !normalized.is_empty() && normalized != name_lower {
-        patterns.push(normalized.clone());
-    }
-    let version_stripped: String = name_lower
-        .trim_end_matches(|c: char| c.is_numeric() || c == ' ' || c == '.')
-        .to_string();
-    if !version_stripped.is_empty() && version_stripped != name_lower {
-        patterns.push(version_stripped.clone());
-    }
-
-    let bundle_id = app_bundle_id(&app_path);
-    if !bundle_id.is_empty() {
-        patterns.push(bundle_id.to_lowercase());
-        let parts: Vec<&str> = bundle_id.split('.').collect();
-        if parts.len() >= 3 {
-            // "com.microsoft.VSCode" → "microsoft"
-            patterns.push(parts[1].to_lowercase());
-            // Last 2 components: "company.app"
-            patterns.push(parts[parts.len() - 2..].join(".").to_lowercase());
+    for line in clean.lines().map(str::trim) {
+        if line == "Files to be removed:" {
+            in_file_list = true;
+            continue;
         }
-        if let Some(last) = parts.last() {
-            let l = last.to_lowercase();
-            if l.len() > 3 {
-                patterns.push(l);
-            }
+        if !in_file_list {
+            continue;
         }
-    }
-    patterns.dedup();
-    // Drop tokens that are too short or too generic to match safely
-    patterns.retain(|p| {
-        p.len() >= 4 && p != "app" && p != "data" && p != "com" && p != "net" && p != "org"
-    });
-
-    let search_dirs: &[(&str, bool)] = &[
-        ("Library/Application Support", true),
-        ("Library/Caches", true),
-        ("Library/Preferences", false),
-        ("Library/Logs", true),
-        ("Library/Containers", true),
-        ("Library/Group Containers", true),
-        ("Library/Saved Application State", true),
-        ("Library/WebKit", true),
-        ("Library/HTTPStorages", true),
-        ("Library/Cookies", false),
-    ];
-
-    let mut results: Vec<FileEntry> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    for (rel, is_dir_search) in search_dirs {
-        let dir = home.join(rel);
-        let Ok(entries) = fs::read_dir(&dir) else {
+        if line.starts_with('➤') {
+            break;
+        }
+        if line.contains("Review only:") {
+            continue;
+        }
+        let Some(path_start) = line.find("~/").or_else(|| line.find('/')) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let Ok(metadata) = fs::symlink_metadata(&p) else {
-                continue;
-            };
-            if metadata.file_type().is_symlink() {
-                continue;
-            }
-            let Ok(canonical) = fs::canonicalize(&p) else {
-                continue;
-            };
-            if guard::is_forbidden_for_readonly(&canonical) {
-                continue;
-            }
-            // Skip iCloud paths
-            if is_icloud_path(&p) {
-                continue;
-            }
-            // Skip SIP-protected paths
-            if is_sip_protected(&p) {
-                continue;
-            }
-
-            let path_str = p.to_string_lossy().into_owned();
-            if seen.contains(&path_str) {
-                continue;
-            }
-
-            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let fname_lower = fname.to_lowercase();
-
-            // For UUID-named containers, look up the real bundle ID
-            let resolved_name =
-                if *rel == "Library/Containers" || *rel == "Library/Group Containers" {
-                    container_bundle_id(&p)
-                        .unwrap_or_else(|| fname.to_string())
-                        .to_lowercase()
-                } else {
-                    fname_lower.clone()
-                };
-
-            // Per-app condition overrides
-            let bid = bundle_id.to_lowercase();
-            let include = match app_condition_matches(&resolved_name, &bid, &name_lower) {
-                Some(v) => v,
-                None => patterns
-                    .iter()
-                    .any(|pat| resolved_name.contains(pat.as_str())),
-            };
-
-            if include && !resolved_name.starts_with("com.apple.") {
-                seen.insert(path_str.clone());
-                let size_bytes = if p.is_dir() {
-                    du_bytes(&p)
-                } else {
-                    fs::metadata(&p).map(|m| m.len()).unwrap_or(0)
-                };
-                results.push(FileEntry {
-                    name: fname.to_string(),
-                    path: path_str,
-                    size_bytes,
-                    is_dir: *is_dir_search && p.is_dir(),
-                });
+        let mut displayed_path = &line[path_start..];
+        if let Some((path_part, size_part)) = displayed_path.rsplit_once(" , ") {
+            if ["B", "KB", "MB", "GB", "TB"]
+                .iter()
+                .any(|suffix| size_part.ends_with(suffix))
+            {
+                displayed_path = path_part;
             }
         }
+        let lexical = displayed_path
+            .strip_prefix("~/")
+            .map(|relative| home.join(relative))
+            .unwrap_or_else(|| PathBuf::from(displayed_path));
+        let Ok(canonical) = fs::canonicalize(&lexical) else {
+            continue;
+        };
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        paths.push(canonical);
+    }
+    paths
+}
+
+fn validate_mole_preview_paths(
+    paths: &[PathBuf],
+    selected_app: &Path,
+    home: &Path,
+) -> Result<(), String> {
+    const ALLOWED_SYSTEM_RESIDUAL_ROOTS: &[&str] = &[
+        "/Library/Application Support",
+        "/Library/Caches",
+        "/Library/Preferences",
+        "/Library/Logs",
+        "/Library/LaunchAgents",
+        "/Library/LaunchDaemons",
+        "/Library/PrivilegedHelperTools",
+        "/Library/Extensions",
+        "/Library/Audio/Plug-Ins",
+        "/Library/Internet Plug-Ins",
+        "/Library/Input Methods",
+        "/Library/Screen Savers",
+    ];
+
+    for path in paths {
+        let is_other_application = path.extension().and_then(|extension| extension.to_str())
+            == Some("app")
+            && path != selected_app;
+        let allowed = !is_other_application
+            && (path == selected_app
+                || (path.starts_with(home) && !guard::is_forbidden_for_readonly(path))
+                || ALLOWED_SYSTEM_RESIDUAL_ROOTS
+                    .iter()
+                    .any(|root| path.starts_with(root)));
+        if !allowed {
+            return Err(format!(
+                "Mole propose un chemin hors des zones de désinstallation autorisées : {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod mole_uninstall_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_application_names_but_rejects_cli_options_and_controls() {
+        assert!(validate_mole_app_name("Ollama").is_ok());
+        assert!(validate_mole_app_name("Visual Studio Code").is_ok());
+        assert!(validate_mole_app_name("--permanent").is_err());
+        assert!(validate_mole_app_name("Signal\n--permanent").is_err());
     }
 
-    results.sort_by_key(|k| std::cmp::Reverse(k.size_bytes));
-    results
+    #[test]
+    fn parses_only_existing_paths_from_the_mole_removal_section() {
+        let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("temporary home");
+        let home = temp.path();
+        let app = home.join("Applications/Ollama.app");
+        let residual = home.join("Library/Application Support/Ollama");
+        fs::create_dir_all(&app).expect("application fixture");
+        fs::create_dir_all(&residual).expect("residual fixture");
+
+        let output = format!(
+            "\u{1b}[1mFiles to be removed:\u{1b}[0m\n  ✓ {} , 12 MB\n  ✓ ~/Library/Application Support/Ollama , 4 KB\n  ✓ ~/missing , 1 KB\n  Review only: /tmp/example\n➤ Continue?",
+            app.display()
+        );
+        let paths = parse_mole_preview_paths(&output, home);
+
+        assert_eq!(paths, vec![app, residual]);
+    }
+
+    #[test]
+    fn rejects_another_application_or_an_unrelated_system_path() {
+        let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("temporary home");
+        let home = temp.path();
+        let selected = home.join("Applications/Ollama.app");
+        let other = home.join("Applications/Other.app");
+        let residual = home.join("Library/Application Support/Ollama");
+
+        assert!(
+            validate_mole_preview_paths(&[selected.clone(), residual], &selected, home).is_ok()
+        );
+        assert!(validate_mole_preview_paths(&[selected.clone(), other], &selected, home).is_err());
+        assert!(validate_mole_preview_paths(
+            &[selected.clone(), PathBuf::from("/etc/hosts")],
+            &selected,
+            home
+        )
+        .is_err());
+    }
+}
+
+#[tauri::command]
+async fn find_app_residuals(
+    app: tauri::AppHandle,
+    app_name: String,
+    app_path: String,
+) -> Result<Vec<FileEntry>, String> {
+    let canonical = require_path_grant(&app_path, PathGrantPurpose::Uninstall)?;
+    guard::validate_app_uninstall_path(&canonical.to_string_lossy())?;
+    if canonical.file_stem().and_then(|value| value.to_str()) != Some(app_name.as_str()) {
+        return Err("Le nom ne correspond pas à l'application analysée".to_string());
+    }
+    validate_mole_app_name(&app_name)?;
+    let mo_path = bundled_mo_path(&app)?;
+    let bundle_id = app_bundle_id(&canonical);
+    let home = home_dir();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let output = run_mole_uninstall(&mo_path, &app_name, true)
+            .map_err(|error| strip_terminal_sequences(&error).trim().to_string())?;
+        let mut paths = parse_mole_preview_paths(&output, &home);
+        paths.sort();
+        validate_mole_preview_paths(&paths, &canonical, &home)?;
+        if !paths.iter().any(|path| path == &canonical) {
+            return Err(
+                "Mole n'a pas relié l'application sélectionnée à cet aperçu ; aucune désinstallation ne sera autorisée"
+                    .to_string(),
+            );
+        }
+
+        let mut results = paths
+            .iter()
+            .filter(|path| *path != &canonical)
+            .filter_map(|path| {
+                let metadata = fs::metadata(path).ok()?;
+                let size_bytes = if metadata.is_dir() {
+                    du_bytes(path)
+                } else {
+                    metadata.len()
+                };
+                Some(FileEntry {
+                    name: path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("Fichier associé")
+                        .to_string(),
+                    path: path.to_string_lossy().into_owned(),
+                    size_bytes,
+                    is_dir: metadata.is_dir(),
+                })
+            })
+            .collect::<Vec<_>>();
+        results.sort_by_key(|entry| std::cmp::Reverse(entry.size_bytes));
+        grant_mole_preview(&canonical, &app_name, &bundle_id, &paths);
+        Ok(results)
+    })
+    .await
+    .map_err(|error| format!("Erreur pendant l'aperçu Mole : {error}"))?
 }
 
 // ── 10. All processes (sysinfo-based, grouped by name) ────────────────────────
@@ -8077,7 +8227,7 @@ fn read_image_preview_from_home(path: &Path, home: &Path) -> Option<String> {
     }
 
     let mut bytes = Vec::with_capacity(metadata_before.len() as usize);
-    file.by_ref()
+    std::io::Read::by_ref(&mut file)
         .take(MAX_IMAGE_BYTES + 1)
         .read_to_end(&mut bytes)
         .ok()?;
@@ -8511,6 +8661,7 @@ pub struct ThinResult {
     pub bytes_saved: u64,
     pub binary_count: usize,
     pub original_in_trash: bool,
+    pub locally_resigned: bool,
 }
 
 fn is_fat_macho_candidate(path: &Path) -> bool {
@@ -8559,6 +8710,13 @@ fn app_bundle_id(app_path: &Path) -> String {
         .unwrap_or_default()
 }
 
+fn is_app_store_or_provisioned(app_path: &Path) -> bool {
+    app_path.join("Contents/_MASReceipt/receipt").is_file()
+        || app_path
+            .join("Contents/embedded.provisionprofile")
+            .is_file()
+}
+
 fn collect_universal_files(app_path: &Path) -> Vec<PathBuf> {
     const MAX_VISITED_FILES: usize = 100_000;
     let mut stack = vec![app_path.to_path_buf()];
@@ -8601,14 +8759,20 @@ fn scan_app_fatbinaries(app_path: &Path) -> Option<UniversalBinaryEntry> {
         .filter_map(|path| fs::metadata(path).ok())
         .map(|metadata| metadata.len())
         .sum::<u64>();
-    grant_path(app_path, PathGrantPurpose::Thin);
     let signature_error = verify_signed_code(app_path, true).err();
-    let thinning_unsafe = signature_error.is_some();
-    let thinning_warning = if thinning_unsafe {
+    let is_app_store_app = is_app_store_or_provisioned(app_path);
+    let thinning_unsafe = signature_error.is_some() || is_app_store_app;
+    if !thinning_unsafe {
+        grant_path(app_path, PathGrantPurpose::Thin);
+    }
+    let thinning_warning = if is_app_store_app {
+        "Application App Store ou provisionnée : l'identité de distribution est nécessaire à son fonctionnement. Amincissement refusé."
+            .to_string()
+    } else if thinning_unsafe {
         "Signature d’origine invalide ou absente. Réinstallez ou mettez à jour l’application avant de réessayer."
             .to_string()
     } else {
-        "Burrow amincit une copie sans remplacer la signature de l’éditeur, vérifie son intégrité, puis conserve l’original dans la Corbeille."
+        "Burrow amincit une copie, la resigne localement si son enveloppe a changé, vérifie son intégrité, puis conserve l’original de l’éditeur dans la Corbeille."
             .to_string()
     };
     Some(UniversalBinaryEntry {
@@ -8718,6 +8882,29 @@ fn verify_signed_code(path: &Path, deep: bool) -> Result<(), String> {
     }
 }
 
+fn resign_thinned_app(path: &Path) -> Result<(), String> {
+    let output = Command::new("/usr/bin/codesign")
+        .args([
+            "--force",
+            "--deep",
+            "--sign",
+            "-",
+            "--timestamp=none",
+            "--preserve-metadata=identifier,entitlements,flags,runtime",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("Impossible de resigner la copie allégée : {error}"))?;
+    if output.status.success() {
+        verify_signed_code(path, true)
+    } else {
+        Err(format!(
+            "La resignature locale a échoué : {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 #[cfg(test)]
 mod universal_binary_tests {
     use super::*;
@@ -8737,6 +8924,29 @@ mod universal_binary_tests {
         assert!(is_scannable_app_bundle(&real_app));
         assert!(!is_scannable_app_bundle(&linked_app));
         assert!(!is_scannable_app_bundle(&unrelated));
+    }
+
+    #[test]
+    fn recognizes_app_store_and_provisioned_bundles() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let app_store = directory.path().join("Store.app");
+        let provisioned = directory.path().join("Provisioned.app");
+        let direct = directory.path().join("Direct.app");
+        fs::create_dir_all(app_store.join("Contents/_MASReceipt"))
+            .expect("create receipt directory");
+        fs::write(app_store.join("Contents/_MASReceipt/receipt"), b"fixture")
+            .expect("write receipt");
+        fs::create_dir_all(provisioned.join("Contents")).expect("create provisioned app");
+        fs::write(
+            provisioned.join("Contents/embedded.provisionprofile"),
+            b"fixture",
+        )
+        .expect("write provisioning profile");
+        fs::create_dir_all(direct.join("Contents")).expect("create direct app");
+
+        assert!(is_app_store_or_provisioned(&app_store));
+        assert!(is_app_store_or_provisioned(&provisioned));
+        assert!(!is_app_store_or_provisioned(&direct));
     }
 
     fn build_universal(source: &Path, binary: &Path) {
@@ -8816,7 +9026,7 @@ mod universal_binary_tests {
     }
 
     #[test]
-    fn preserves_nested_application_signatures_while_thinning() {
+    fn keeps_a_nested_application_valid_after_thinning() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let app = directory.path().join("Fixture.app");
         let helper = app.join("Contents/Frameworks/Helper.app");
@@ -8859,7 +9069,10 @@ mod universal_binary_tests {
             thin_file_to_arm64(&binary).expect("thin nested fixture");
         }
 
-        verify_signed_code(&app, true).expect("verify thinned app with original signatures");
+        if verify_signed_code(&app, true).is_err() {
+            resign_thinned_app(&app).expect("resign thinned nested fixture");
+        }
+        verify_signed_code(&app, true).expect("verify thinned nested fixture");
     }
 }
 
@@ -8917,6 +9130,11 @@ async fn thin_universal_app(
     if canonical.file_stem().and_then(|value| value.to_str()) != Some(name.as_str()) {
         return Err("Le nom ne correspond pas à l'application analysée".to_string());
     }
+    if is_app_store_or_provisioned(&canonical) {
+        return Err(format!(
+            "{name} provient de l’App Store ou utilise un profil de distribution. L’amincissement est refusé pour préserver son identité et ses autorisations."
+        ));
+    }
     verify_signed_code(&canonical, true).map_err(|_| {
         format!(
             "{name} n’est pas compatible avec l’amincissement sûr : sa signature d’origine est invalide ou absente. Aucune modification n’a été effectuée."
@@ -8955,11 +9173,16 @@ async fn thin_universal_app(
         for binary in &binaries {
             thin_file_to_arm64(binary)?;
         }
-        verify_signed_code(&staged, true).map_err(|_| {
-            format!(
-                "{name} ne peut pas être aminci sans altérer la signature de son éditeur. Aucune modification n’a été effectuée."
-            )
-        })?;
+        let locally_resigned = if verify_signed_code(&staged, true).is_err() {
+            resign_thinned_app(&staged).map_err(|error| {
+                format!(
+                    "{name} n'a pas pu être resigné localement après l'amincissement : {error}. Aucune modification n'a été effectuée."
+                )
+            })?;
+            true
+        } else {
+            false
+        };
 
         let parent = canonical
             .parent()
@@ -9025,6 +9248,7 @@ async fn thin_universal_app(
             bytes_saved,
             binary_count: binaries.len(),
             original_in_trash: true,
+            locally_resigned,
         })
     })
     .await

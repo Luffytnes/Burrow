@@ -1,8 +1,8 @@
 # Third-party notices
 
-Burrow is released under the MIT License. The repository also contains the
-following independently licensed Apple Silicon components. Their licenses
-apply to those components and are not replaced by Burrow's MIT License.
+Burrow is released under the GNU General Public License version 3 only. The
+repository also contains the following independently licensed Apple Silicon
+components. Their licenses continue to apply to those components.
 
 ## ClamAV 1.5.4
 
@@ -26,26 +26,34 @@ Bundled ClamAV runtime dependencies:
 - json-c — MIT
 - OpenSSL — Apache License 2.0
 
-## Mole 1.39.1
+## Mole 1.48.1
 
 - Project: <https://github.com/tw93/Mole>
-- Source tag: <https://github.com/tw93/Mole/tree/V1.39.1>
-- License: MIT
-- Bundled files: `src-tauri/resources/mole/bin`
+- Source tag: <https://github.com/tw93/Mole/tree/V1.48.1>
+- Corresponding source archive: `third_party/sources/mole-1.48.1.tar.gz`
+- License: GNU General Public License version 3
+- Bundled files: `src-tauri/resources/mole/bin` and
+  `src-tauri/resources/mole/libexec`
+- Architecture: Apple Silicon (`arm64`)
 
 The upstream license is included at `src-tauri/resources/mole/LICENSE`.
+Burrow's `bin/mo` and `bin/mole` files are packaging wrappers which invoke the
+pinned upstream engine from the application resources. Burrow adds a typed
+Rust boundary in front of Mole: the frontend cannot provide arbitrary CLI
+arguments, and recoverable operations force Mole's Trash mode.
 
 ## Burrow helpers
 
 `burrow-smc` and `burrow-touchid` are Burrow components released under the
-repository's MIT License. Their sources are included alongside the resources.
+repository's GPL-3.0-only license. Their sources are included alongside the
+resources.
 
 ## DNS provider identifiers
 
 The provider artwork in `public/dns` is used solely to identify the respective
 DNS services in Burrow. Provider names, logos and trademarks remain the
-property of their respective owners and are not covered by Burrow's MIT
-License.
+property of their respective owners and are not covered by Burrow's GPL
+license.
 
 New provider artwork and official service information for 0.2.3:
 

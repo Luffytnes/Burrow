@@ -70,13 +70,16 @@ clean_service_worker_cache() {
         done
         # Service Worker cache dirs are keyed by origin hash, so they never
         # match PROTECTED_SW_DOMAINS even when the user added Chrome SW paths
-        # to their whitelist. Honor the whitelist explicitly — otherwise MV3
+        # to their whitelist. Honor the whitelist explicitly, otherwise MV3
         # extensions lose their registered workers mid-session. See #724.
         if [[ "$is_protected" == "false" ]] && is_path_whitelisted "$cache_dir"; then
             is_protected=true
             protected_count=$((protected_count + 1))
         fi
         if [[ "$is_protected" == "false" ]]; then
+            if [[ "$DRY_RUN" == "true" ]] && declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                record_dry_run_cleanup_target "$cache_dir" "$size" 1 true || continue
+            fi
             if [[ "$DRY_RUN" != "true" ]]; then
                 safe_remove "$cache_dir" true || true
             fi
@@ -89,17 +92,21 @@ clean_service_worker_cache() {
             stop_inline_spinner
             spinner_was_running=true
         fi
-        local cleaned_mb=$((cleaned_size / 1024))
+        # cleaned_size is in KB. Hand-rolled KB/1024 truncation reported any
+        # sub-megabyte cleanup as "0MB"; use the shared formatter like every
+        # other cleaner so amounts under 1MB render as KB.
+        local cleaned_human
+        cleaned_human=$(bytes_to_human "$((cleaned_size * 1024))")
         local line_color
         line_color=$(cleanup_result_color_kb "$cleaned_size")
         if [[ "$DRY_RUN" != "true" ]]; then
             if [[ $protected_count -gt 0 ]]; then
-                echo -e "  ${line_color}${ICON_SUCCESS}${NC} $browser_name Service Worker${NC}, ${line_color}${cleaned_mb}MB${NC}, ${protected_count} protected"
+                echo -e "  ${line_color}${ICON_SUCCESS}${NC} $browser_name Service Worker${NC} · ${line_color}${cleaned_human}${NC}, ${protected_count} protected"
             else
-                echo -e "  ${line_color}${ICON_SUCCESS}${NC} $browser_name Service Worker${NC}, ${line_color}${cleaned_mb}MB${NC}"
+                echo -e "  ${line_color}${ICON_SUCCESS}${NC} $browser_name Service Worker${NC} · ${line_color}${cleaned_human}${NC}"
             fi
         else
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} $browser_name Service Worker, would clean $(colorize_human_size "${cleaned_mb}MB"), ${protected_count} protected"
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} $browser_name Service Worker, would clean $(colorize_human_size "$cleaned_human"), ${protected_count} protected"
         fi
         note_activity
         if [[ "$spinner_was_running" == "true" ]]; then
@@ -169,7 +176,7 @@ discover_project_cache_roots() {
                 ;;
         esac
 
-        (project_cache_has_indicators "$dir" 5 && echo "$dir" >> "$_indicator_tmp") &
+        (project_cache_has_indicators "$dir" 5 && echo "$dir" >> "$_indicator_tmp") < /dev/null &
         _indicator_pids+=($!)
 
         if [[ ${#_indicator_pids[@]} -ge $_max_jobs ]]; then
@@ -177,9 +184,15 @@ discover_project_cache_roots() {
             _indicator_pids=("${_indicator_pids[@]:1}")
         fi
     done
-    for _pid in "${_indicator_pids[@]}"; do
-        wait "$_pid" 2> /dev/null || true
-    done
+    # bash 3.2 under nounset treats "${arr[@]}" on an empty array as unbound, and
+    # the loop above leaves the array empty whenever $HOME has no scannable
+    # project dir (every test home, and any real home whose top level is all
+    # Library/Applications/dot dirs).
+    if [[ ${#_indicator_pids[@]} -gt 0 ]]; then
+        for _pid in "${_indicator_pids[@]}"; do
+            wait "$_pid" 2> /dev/null || true
+        done
+    fi
 
     local _found_dir
     while IFS= read -r _found_dir; do
@@ -402,7 +415,9 @@ clean_python_bytecode_cache_group() {
         [[ "$size_kb" =~ ^[0-9]+$ ]] || size_kb=0
 
         if [[ "$DRY_RUN" == "true" ]]; then
-            if declare -f register_dry_run_cleanup_target > /dev/null 2>&1; then
+            if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
+                record_dry_run_cleanup_target "$cache_dir" "$size_kb" 1 true || continue
+            elif declare -f register_dry_run_cleanup_target > /dev/null 2>&1; then
                 register_dry_run_cleanup_target "$cache_dir" || continue
             fi
             dry_run_paths+=("$cache_dir")
@@ -425,7 +440,7 @@ clean_python_bytecode_cache_group() {
     size_human=$(bytes_to_human "$((total_size_kb * 1024))")
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        if [[ -n "${EXPORT_LIST_FILE:-}" ]]; then
+        if ! declare -f record_dry_run_cleanup_target > /dev/null 2>&1 && [[ -n "${EXPORT_LIST_FILE:-}" ]]; then
             ensure_user_file "$EXPORT_LIST_FILE"
             local i=0
             for ((i = 0; i < ${#dry_run_paths[@]}; i++)); do
@@ -438,17 +453,17 @@ clean_python_bytecode_cache_group() {
         fi
 
         if [[ $skipped_count -gt 0 ]]; then
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Python bytecode cache · ${display_root}${NC}, ${YELLOW}${removed_count} dirs, $(colorize_human_size "$size_human") ${YELLOW}dry, ${skipped_count} skipped${NC}"
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Python bytecode cache · ${display_root}${NC} · ${YELLOW}${removed_count} dirs, $(colorize_human_size "$size_human") ${YELLOW}dry, ${skipped_count} skipped${NC}"
         else
-            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Python bytecode cache · ${display_root}${NC}, ${YELLOW}${removed_count} dirs, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Python bytecode cache · ${display_root}${NC} · ${YELLOW}${removed_count} dirs, $(colorize_human_size "$size_human") ${YELLOW}dry${NC}"
         fi
     else
         local line_color
         line_color=$(cleanup_result_color_kb "$total_size_kb")
         if [[ $skipped_count -gt 0 ]]; then
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Python bytecode cache · ${display_root}${NC}, ${line_color}${removed_count} dirs, ${size_human}${NC}, ${skipped_count} skipped"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Python bytecode cache · ${display_root}${NC} · ${line_color}${removed_count} dirs, ${size_human}${NC}, ${skipped_count} skipped"
         else
-            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Python bytecode cache · ${display_root}${NC}, ${line_color}${removed_count} dirs, ${size_human}${NC}"
+            echo -e "  ${line_color}${ICON_SUCCESS}${NC} Python bytecode cache · ${display_root}${NC} · ${line_color}${removed_count} dirs, ${size_human}${NC}"
         fi
     fi
 

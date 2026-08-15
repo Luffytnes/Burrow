@@ -42,8 +42,10 @@ macOS visual bounds and writes both the reviewable PNG and bundled ICNS file.
 
 ## Licensing
 
-Contributions are accepted under the repository's MIT License. New third-party
-code or binaries must have a compatible, documented license. Update
+Contributions are accepted under the repository's GNU GPL version 3 license.
+By submitting a contribution, you agree that it may be distributed under
+`GPL-3.0-only`. New third-party code or binaries must have a compatible,
+documented license. Update
 `THIRD_PARTY_NOTICES.md` and include the exact license text, version and
 checksums when applicable.
 
